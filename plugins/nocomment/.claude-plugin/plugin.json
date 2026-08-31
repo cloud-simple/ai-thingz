@@ -1,0 +1,10 @@
+{
+  "name": "nocomment",
+  "description": "Code-only review branches: nocomment/<branch> with documentation files left out and comment changes undone, so the diff against the default branch shows code only",
+  "version": "0.1.0",
+  "author": {
+    "name": "mtilson"
+  },
+  "homepage": "https://github.com/cloud-simple/ai-thingz",
+  "repository": "https://github.com/cloud-simple/ai-thingz"
+}
