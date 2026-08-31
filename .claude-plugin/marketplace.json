@@ -1,0 +1,13 @@
+{
+  "name": "ai-thingz",
+  "owner": {
+    "name": "cloud-simple"
+  },
+  "plugins": [
+    {
+      "name": "nocomment",
+      "source": "./plugins/nocomment",
+      "description": "Code-only review branches - nocomment/<branch> with documentation files left out and comment changes undone"
+    }
+  ]
+}
