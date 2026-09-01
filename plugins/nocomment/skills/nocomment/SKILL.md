@@ -33,7 +33,8 @@ Script: `${CLAUDE_PLUGIN_ROOT}/skills/nocomment/scripts/nocomment.py` (Python 3.
    (`//`, `/* */`), TOML, SQL, Lua, XML/HTML, INI/Dockerfile/Makefile (whole-line comments only).
    Binary files, symlinks and unknown languages are copied verbatim and flagged.
 4. Writes the result into a temp worktree, commits with `--no-verify`, removes the worktree, and
-   prints a per-file table (`+code`, `-cmnt`, `trail`, `rest`) plus a self-check: any comment line
+   prints a per-file table (`code_added`, `comments_removed`, `trailing_removed`,
+   `comments_restored`) plus a self-check: any comment line
    still present in the resulting diff is reported as a WARNING.
 
 Exit codes: 0 done / dry run, 2 precondition failed (default branch checked out, detached HEAD,
@@ -67,4 +68,5 @@ target exists without `--force`, ...), 3 nothing to commit once comments are gon
   `--keep-directives`; shebangs and interpreter magic comments are always kept.
 - Uncommitted work is not included. `.nocomment.toml` is read from the repo root of the checkout.
 - Known limits: regex literals containing `//` in JS/TS, and `#` inside unusual YAML scalars, are
-  heuristics - the self-check warning and the `rest`/`trail` counts are there to notice surprises.
+  heuristics - the self-check warning and the `comments_restored`/`trailing_removed` counts are
+  there to notice surprises.
