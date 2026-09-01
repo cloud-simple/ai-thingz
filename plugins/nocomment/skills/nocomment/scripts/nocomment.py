@@ -773,7 +773,8 @@ def report(items: list, branch: str, target: str, base_ref: str, base_short: str
     print(f"CODE ({len(code)} file{'s' if len(code) != 1 else ''}) - included, comment changes removed")
     width = max((len(i.new) for i in code), default=10)
     if code:
-        print(f"  {'':2} {'path':<{width}}  {'language':<14} {'+code':>5} {'-cmnt':>5} {'trail':>5} {'rest':>4}  note")
+        print(f"  {'':2} {'path':<{width}}  {'language':<14} {'code_added':>10} {'comments_removed':>16} "
+              f"{'trailing_removed':>16} {'comments_restored':>17}  note")
     for it in code:
         st = it.stats
         note = ""
@@ -787,8 +788,8 @@ def report(items: list, branch: str, target: str, base_ref: str, base_short: str
             note = f"WARNING {it.residual} comment line(s) still differ"
         if it.status == "R":
             note = (note + "; " if note else "") + f"renamed from {it.old}"
-        print(f"  {it.status:2} {it.new:<{width}}  {lang_label(it):<14} {st.code_added:>5} "
-              f"{st.comments_dropped:>5} {st.trailing_stripped:>5} {st.restored:>4}  {note}")
+        print(f"  {it.status:2} {it.new:<{width}}  {lang_label(it):<14} {st.code_added:>10} "
+              f"{st.comments_dropped:>16} {st.trailing_stripped:>16} {st.restored:>17}  {note}")
     print()
     print(f"EXCLUDED ({len(docs)} file{'s' if len(docs) != 1 else ''}) - documentation, not on the new branch")
     for it in docs:

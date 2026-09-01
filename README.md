@@ -56,6 +56,15 @@ In Claude Code, on the feature branch: *"nocomment"*, *"make a code-only branch"
 comments and docs from this branch"*. The skill dry-runs first, shows what will be included and
 excluded, then creates the branch and reports.
 
+The report's CODE table shows, per file, what the transform did to the lines the branch touched:
+
+| column | meaning |
+|---|---|
+| `code_added` | added lines kept (the code the branch actually adds) |
+| `comments_removed` | added comment-only lines removed |
+| `trailing_removed` | added lines whose trailing comment was cut |
+| `comments_restored` | deleted comment-only lines restored from the base |
+
 Directly:
 
 ```bash
