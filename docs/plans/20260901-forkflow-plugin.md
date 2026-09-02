@@ -585,10 +585,10 @@ step-by-step document with its real branch names and SHAs with that project, not
 **Files:**
 - Modify: `plugins/forkflow/scripts/forkflow.py`
 
-- [ ] `backup(ctx, reason, from_ref)`: name `<backup_prefix><UTC YYYYMMDD-HHMMSS>-<reason>`, `git branch <name> <from_ref>`, `push()`, `git ls-remote --heads origin <name>` must list it else `Fail(..., 5)`; prints the rollback line `git reset --hard origin/<name>` and, for `pre-sync`, what the backup is for; `--dry-run` prints `would:`
-- [ ] `simulate_merge(ctx, target)`: git < 2.38 -> `None` + note; else `git_rc("merge-tree", "--write-tree", "--name-only", "origin/<trunk>", target)`: rc 0 -> clean; rc 1 with a 40-hex first stdout line -> conflicted paths = lines 2..first blank line; other rc 1 -> `Fail(stderr, 2)`
-- [ ] write tests: backup created, pushed and confirmed, rollback line printed; `pre-receive` hook rejecting `refs/heads/backup/*` -> 5 and no local backup left behind; hook accepts but the harness deletes the ref before confirmation -> 5; dry run creates nothing; `simulate_merge` clean, conflicting (paths parsed), bad ref -> 2, old-git note (simulated by patching `git_version`)
-- [ ] run tests - must pass before task 5
+- [x] `backup(ctx, reason, from_ref)`: name `<backup_prefix><UTC YYYYMMDD-HHMMSS>-<reason>`, `git branch <name> <from_ref>`, `push()`, `git ls-remote --heads origin <name>` must list it else `Fail(..., 5)`; prints the rollback line `git reset --hard origin/<name>` and, for `pre-sync`, what the backup is for; `--dry-run` prints `would:`
+- [x] `simulate_merge(ctx, target)`: git < 2.38 -> `None` + note; else `git_rc("merge-tree", "--write-tree", "--name-only", "origin/<trunk>", target)`: rc 0 -> clean; rc 1 with a 40-hex first stdout line -> conflicted paths = lines 2..first blank line; other rc 1 -> `Fail(stderr, 2)`
+- [x] write tests: backup created, pushed and confirmed, rollback line printed; `pre-receive` hook rejecting `refs/heads/backup/*` -> 5 and no local backup left behind; hook accepts but the harness deletes the ref before confirmation -> 5; dry run creates nothing; `simulate_merge` clean, conflicting (paths parsed), bad ref -> 2, old-git note (simulated by patching `git_version`)
+- [x] run tests - must pass before task 5
 
 ### Task 5: `sync` clean path
 

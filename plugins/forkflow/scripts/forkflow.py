@@ -48,6 +48,7 @@ present but cannot be read is exit 2 for every subcommand - it carries the branc
 from __future__ import annotations
 
 import argparse
+import datetime
 import os
 import re
 import subprocess
@@ -63,6 +64,15 @@ DEFAULT_SYNC_PREFIX = "sync/"
 DEFAULT_BACKUP_PREFIX = "backup/"
 README_POINTER = "See README, *Adopting forkflow in an existing fork*"
 GATE_TAIL = 12                       # lines of a failing gate command's output that are shown
+MERGE_TREE_GIT = (2, 38)             # `git merge-tree --write-tree` - older git skips the simulation
+
+# What each backup is for, printed with the rollback line so the restore point is understood.
+BACKUP_PURPOSE = {
+    "pre-sync": ("a restore point of the trunk from before this sync - it rewrites nothing; "
+                 "if the sync turns out wrong, revert it through a new branch and an MR, "
+                 "never by force-pushing the trunk"),
+    "pre-ship": "the feature branch as it was before the rebase and the squash",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -617,6 +627,93 @@ def bootstrap_trunk(ctx: Ctx, target: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# backups and the merge simulation
+# --------------------------------------------------------------------------- #
+
+def backup_name(ctx: Ctx, reason: str) -> str:
+    """`backup/<UTC YYYYMMDD-HHMMSS>-<reason>` - sortable, so `status` lists the newest first."""
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"{ctx.backup_prefix}{stamp}-{reason}"
+
+
+def backup(ctx: Ctx, reason: str, from_ref: str) -> str:
+    """Create a restore point and prove it reached origin before anything is rewritten.
+
+    Not confirmed by `ls-remote` means not a backup: the local branch is removed again and
+    the caller stops with exit 5 rather than rewriting on the strength of a failed push."""
+    name = backup_name(ctx, reason)
+    src = rev(ctx.root, from_ref)
+    if not src:
+        raise Fail(f"cannot back up `{from_ref}`: it does not resolve to a commit")
+    create = f"git branch {name} {from_ref}"
+    purpose = BACKUP_PURPOSE.get(reason, "")
+
+    if ctx.dry_run:
+        step("backup", create, f"would keep {short(src)} as {name}", dry=True)
+        print(f"    rollback: git reset --hard {ctx.origin}/{name}")
+        if purpose:
+            print(f"    {purpose}")
+        return name
+
+    existing = rev(ctx.root, f"refs/heads/{name}")
+    if existing and existing != src:
+        raise Fail(f"backup branch `{name}` already exists at {short(existing)}: "
+                   f"delete it, or retry in a second (the name carries a UTC timestamp)")
+    if not existing:
+        git("branch", name, from_ref, cwd=ctx.root)
+    step("backup", create, f"{name} at {short(src)}")
+
+    try:
+        push(ctx, name)
+    except Fail:
+        git("branch", "-D", name, cwd=ctx.root, check=False)   # a backup nobody has is noise
+        raise
+
+    confirm = f"git ls-remote --heads {ctx.origin} refs/heads/{name}"
+    rc, out, err = git_rc("ls-remote", "--heads", ctx.origin, f"refs/heads/{name}", cwd=ctx.root)
+    if rc != 0 or f"refs/heads/{name}" not in out:
+        step("backup", confirm, "NOT CONFIRMED")
+        git("branch", "-D", name, cwd=ctx.root, check=False)
+        raise Fail(f"backup `{name}` is not on {ctx.origin} after the push"
+                   f"{': ' + err.strip() if err.strip() else ''}: refusing to go on "
+                   f"without a confirmed restore point", 5)
+    step("backup", confirm, "confirmed on origin")
+    print(f"    rollback: git reset --hard {ctx.origin}/{name}")
+    if purpose:
+        print(f"    {purpose}")
+    return name
+
+
+def simulate_merge(ctx: Ctx, target: str) -> Optional[Tuple[bool, list]]:
+    """Predict the sync merge without touching the worktree: (clean, conflicting paths).
+
+    None when git is too old to simulate - the merge itself is then the first answer."""
+    cmd = f"git merge-tree --write-tree --name-only {ctx.origin}/{ctx.trunk} {short(target)}"
+    if git_version() < MERGE_TREE_GIT:
+        step("simulate", cmd, "simulation needs git 2.38+, skipping")
+        return None
+    rc, out, err = git_rc("merge-tree", "--write-tree", "--name-only",
+                          f"{ctx.origin}/{ctx.trunk}", target, cwd=ctx.root)
+    if rc == 0:
+        step("simulate", cmd, "merges clean")
+        return (True, [])
+    lines = out.splitlines()
+    # a conflict prints the merged tree's OID, the conflicting paths, a blank line, then messages;
+    # any other failure (a ref that does not resolve) prints no OID at all
+    if rc == 1 and lines and re.fullmatch(r"[0-9a-f]{40,64}", lines[0].strip()):
+        conflicts = []
+        for line in lines[1:]:
+            if not line.strip():
+                break
+            conflicts.append(line.strip())
+        step("simulate", cmd, f"{len(conflicts)} conflicting file(s)")
+        for f in conflicts:
+            print(f"    {f}")
+        return (False, conflicts)
+    raise Fail(f"merge simulation failed: {(err or out).strip()}")
+
+
+# --------------------------------------------------------------------------- #
 # subcommands
 # --------------------------------------------------------------------------- #
 
@@ -996,6 +1093,23 @@ def run_tests() -> None:
             fh.write(body)
         os.chmod(path, 0o755)
 
+    def delete_after_receive(tmp: str, pattern: str = "refs/heads/backup/*") -> None:
+        """A post-receive hook in the bare origin that drops the ref it has just accepted:
+        the push reports success, so only the ls-remote confirmation can catch it."""
+        hooks = os.path.join(tmp, "origin.git", "hooks")
+        os.makedirs(hooks, exist_ok=True)
+        body = ("#!/bin/sh\n"
+                "while read old new ref; do\n"
+                "  case \"$ref\" in %s) git update-ref -d \"$ref\" \"$new\";; esac\n"
+                "done\nexit 0\n" % pattern)
+        path = os.path.join(hooks, "post-receive")
+        with open(path, "w") as fh:
+            fh.write(body)
+        os.chmod(path, 0o755)
+
+    def local_branches(fork: str) -> str:
+        return sh("git", "for-each-ref", "--format=%(refname)", "refs/heads/", cwd=fork)
+
     def capture(fn, *a, **kw):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -1014,6 +1128,8 @@ def run_tests() -> None:
 
     has_tomllib = sys.version_info >= (3, 11)
     needs_tomllib = unittest.skipUnless(has_tomllib, "reading .forkflow.toml needs Python 3.11+")
+    needs_merge_tree = unittest.skipUnless(git_version() >= MERGE_TREE_GIT,
+                                           "the merge simulation needs git 2.38+")
 
     class Base(unittest.TestCase):
         def setUp(self):
@@ -1392,6 +1508,150 @@ def run_tests() -> None:
             self.assertIn("would:", out)
             self.assertEqual(rev(fork, "refs/heads/develop"), "")
             self.assertEqual(origin_sha(fork, "develop"), "")
+
+    # ------------------------------------------------------------------- #
+    # backups and the merge simulation
+    # ------------------------------------------------------------------- #
+
+    class TestBackup(Base):
+        def test_creates_pushes_and_confirms(self):
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            trunk_sha = rev(fork, "refs/remotes/origin/develop")
+            name, out, _ = capture(backup, ctx, "pre-sync", "origin/develop")
+            self.assertRegex(name, r"^backup/\d{8}-\d{6}-pre-sync$")
+            self.assertEqual(rev(fork, "refs/heads/" + name), trunk_sha)
+            self.assertEqual(origin_sha(fork, name), trunk_sha)
+            self.assertIn("confirmed on origin", out)
+            self.assertIn("rollback: git reset --hard origin/" + name, out)
+            self.assertIn("restore point", out)              # what a pre-sync backup is for
+
+        def test_from_head_on_a_feature_branch(self):
+            fork = make_fork(self.tmp)
+            sh("git", "switch", "-c", "feat/x", cwd=fork)
+            head = commit_fork(fork, "ours/new.txt", "one\n", "one")
+            ctx = ctx_for(fork)
+            name, out, _ = capture(backup, ctx, "pre-ship", "HEAD")
+            self.assertTrue(name.endswith("-pre-ship"), name)
+            self.assertEqual(origin_sha(fork, name), head)
+            self.assertIn("before the rebase", out)
+
+        def test_push_rejection_is_exit_5_and_leaves_no_local_branch(self):
+            fork = make_fork(self.tmp)
+            reject_pushes(self.tmp, "refs/heads/backup/*")
+            ctx = ctx_for(fork)
+            with self.assertRaises(Fail) as cm:
+                capture(backup, ctx, "pre-sync", "origin/develop")
+            self.assertEqual(cm.exception.code, 5)
+            self.assertIn("rejected", str(cm.exception))
+            self.assertNotIn("backup/", local_branches(fork))
+
+        def test_missing_on_origin_after_the_push_is_exit_5(self):
+            fork = make_fork(self.tmp)
+            delete_after_receive(self.tmp)
+            ctx = ctx_for(fork)
+            with self.assertRaises(Fail) as cm:
+                capture(backup, ctx, "pre-sync", "origin/develop")
+            self.assertEqual(cm.exception.code, 5)
+            self.assertIn("not on origin", str(cm.exception))
+            self.assertNotIn("backup/", local_branches(fork))
+
+        def test_dry_run_creates_nothing(self):
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork, dry_run=True)
+            name, out, _ = capture(backup, ctx, "pre-sync", "origin/develop")
+            self.assertIn("would:", out)
+            self.assertIn("rollback:", out)
+            self.assertEqual(rev(fork, "refs/heads/" + name), "")
+            self.assertEqual(origin_sha(fork, name), "")
+
+        def test_unresolvable_ref_is_exit_2(self):
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            with self.assertRaises(Fail) as cm:
+                capture(backup, ctx, "pre-sync", "origin/no-such-branch")
+            self.assertEqual(cm.exception.code, 2)
+            self.assertNotIn("backup/", local_branches(fork))
+
+        @needs_tomllib
+        def test_custom_backup_prefix(self):
+            fork = make_fork(self.tmp, config='backup_prefix = "safety/"\n')
+            ctx = ctx_for(fork)
+            name, _, _ = capture(backup, ctx, "pre-sync", "origin/develop")
+            self.assertTrue(name.startswith("safety/"), name)
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/remotes/origin/develop"))
+
+    @needs_merge_tree
+    class TestSimulateMerge(Base):
+        def test_clean(self):
+            fork = make_fork(self.tmp)
+            commit_fork(fork, "ours/new.txt", "ours\n", "ours", push=True)
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n")
+            sh("git", "fetch", "upstream", cwd=fork)
+            ctx = ctx_for(fork)
+            result, out, _ = capture(simulate_merge, ctx, rev(fork, ctx.up()))
+            self.assertEqual(result, (True, []))
+            self.assertIn("merges clean", out)
+
+        def test_conflicting_paths_are_parsed(self):
+            fork = make_fork(self.tmp)
+            commit_fork(fork, "shared.tf",
+                        'resource "null_resource" "a" {\n  count = 2\n}\n', "ours: shared",
+                        push=True)
+            commit_upstream(self.tmp, "shared.tf",
+                            'resource "null_resource" "a" {\n  count = 3\n}\n')
+            sh("git", "fetch", "upstream", cwd=fork)
+            ctx = ctx_for(fork)
+            result, out, _ = capture(simulate_merge, ctx, rev(fork, ctx.up()))
+            self.assertEqual(result, (False, ["shared.tf"]))
+            self.assertIn("1 conflicting file(s)", out)
+            self.assertIn("    shared.tf", out)
+
+        def test_two_conflicting_files(self):
+            fork = make_fork(self.tmp)
+            commit_fork(fork, "shared.tf",
+                        'resource "null_resource" "a" {\n  count = 2\n}\n', "ours: shared",
+                        push=True)
+            commit_fork(fork, "README.md", "# ours\n", "ours: readme", push=True)
+            commit_upstream(self.tmp, "shared.tf",
+                            'resource "null_resource" "a" {\n  count = 3\n}\n')
+            commit_upstream(self.tmp, "README.md", "# theirs\n")
+            sh("git", "fetch", "upstream", cwd=fork)
+            ctx = ctx_for(fork)
+            result, _, _ = capture(simulate_merge, ctx, rev(fork, ctx.up()))
+            self.assertFalse(result[0])
+            self.assertEqual(sorted(result[1]), ["README.md", "shared.tf"])
+
+        def test_bad_ref_is_exit_2(self):
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            with self.assertRaises(Fail) as cm:
+                capture(simulate_merge, ctx, "no-such-ref")
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("merge", str(cm.exception))
+
+        def test_nothing_is_written_and_the_worktree_is_untouched(self):
+            fork = make_fork(self.tmp)
+            commit_fork(fork, "shared.tf",
+                        'resource "null_resource" "a" {\n  count = 2\n}\n', "ours: shared",
+                        push=True)
+            commit_upstream(self.tmp, "shared.tf",
+                            'resource "null_resource" "a" {\n  count = 3\n}\n')
+            sh("git", "fetch", "upstream", cwd=fork)
+            ctx = ctx_for(fork)
+            before = sh("git", "for-each-ref", cwd=fork)
+            capture(simulate_merge, ctx, rev(fork, ctx.up()))
+            self.assertEqual(sh("git", "for-each-ref", cwd=fork), before)
+            self.assertEqual(sh("git", "status", "--porcelain", cwd=fork), "")
+
+    class TestSimulateMergeOldGit(Base):
+        def test_old_git_returns_none_with_a_note(self):
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            with mock.patch.object(sys.modules[__name__], "git_version", lambda: (2, 37)):
+                result, out, _ = capture(simulate_merge, ctx, rev(fork, ctx.up()))
+            self.assertIsNone(result)
+            self.assertIn("2.38+", out)
 
     # ------------------------------------------------------------------- #
     # status
@@ -1774,7 +2034,8 @@ def run_tests() -> None:
     suite = unittest.TestSuite()
     for case in (TestDetectPlatform, TestGitVersion, TestLoadConfig, TestResolveCtx,
                  TestCleanTree, TestPush, TestPushMirror, TestAdvanceMirror,
-                 TestBootstrapTrunk, TestStatus, TestCheck, TestParseArgs, TestMainWiring):
+                 TestBootstrapTrunk, TestBackup, TestSimulateMerge, TestSimulateMergeOldGit,
+                 TestStatus, TestCheck, TestParseArgs, TestMainWiring):
         suite.addTests(loader.loadTestsFromTestCase(case))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)
