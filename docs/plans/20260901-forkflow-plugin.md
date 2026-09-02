@@ -618,12 +618,15 @@ step-by-step document with its real branch names and SHAs with that project, not
 **Files:**
 - Modify: `plugins/forkflow/scripts/forkflow.py`
 
-- [ ] preflight: feature branch required (not trunk, not mirror, not `sync_prefix`, not `backup_prefix`), clean tree, not detached, no rebase in progress -> else 2
-- [ ] flow: fetch origin; "nothing to ship" -> 0 when HEAD is an ancestor of `origin/<trunk>`; backup from HEAD (`-pre-ship`), confirmed; `git rebase origin/<trunk>` via `git_rc` (conflict -> 4 with the `git rebase --continue` then `forkflow ship --continue` hint); post-rebase "nothing to ship" -> 0; `squash`: tree hash before, `reset --soft mb`, `commit -F` with the composed message (`--message-file` / single commit unchanged / "Squashed from n commits (oldest first)" body, oldest subject as subject), tree hash after must match else 5 with the rollback line; `cmd_check` (exit 3 -> rollback line printed); `push()` with lease when the branch is on origin, else plain; MR command with the commit message as body and the merge-button note
-- [ ] `ship --continue`: full preflight again + `origin/<trunk>` ancestor of HEAD (else 2, "the rebase did not complete; run `forkflow ship` again"); resume at squash
-- [ ] write tests: 3-commit feature branch on a stale base -> one commit on `origin/develop`'s tip, tree hash equal, message composed oldest-first, pushed, backup on origin, trunk unchanged, exit 0; branch already on origin -> pushed with `--force-with-lease`; single commit -> message unchanged; `--message-file` used verbatim; "nothing to ship" -> 0 and no backup created
-- [ ] write tests: on the trunk -> 2; on the mirror -> 2; on a `sync/` branch -> 2; dirty tree -> 2; mid-rebase -> 2; rebase conflict -> 4, then resolve + `git rebase --continue` + `ship --continue` -> 0; `ship --continue` on the trunk -> 2; `ship --continue` after `git rebase --abort` -> 2; stale lease (narrowed refspec + competing push from a second clone) -> 5 with trunk unchanged; gate failure after squash -> 3 with the rollback line and nothing pushed
-- [ ] run tests - must pass before task 8
+- [x] preflight: feature branch required (not trunk, not mirror, not `sync_prefix`, not `backup_prefix`), clean tree, not detached, no rebase in progress -> else 2
+- [x] flow: fetch origin; "nothing to ship" -> 0 when HEAD is an ancestor of `origin/<trunk>`; backup from HEAD (`-pre-ship`), confirmed; `git rebase origin/<trunk>` via `git_rc` (conflict -> 4 with the `git rebase --continue` then `forkflow ship --continue` hint); post-rebase "nothing to ship" -> 0; `squash`: tree hash before, `reset --soft mb`, `commit -F` with the composed message (`--message-file` / single commit unchanged / "Squashed from n commits (oldest first)" body, oldest subject as subject), tree hash after must match else 5 with the rollback line; `cmd_check` (exit 3 -> rollback line printed); `push()` with lease when the branch is on origin, else plain; MR command with the commit message as body and the merge-button note
+- [x] `ship --continue`: full preflight again + `origin/<trunk>` ancestor of HEAD (else 2, "the rebase did not complete; run `forkflow ship` again"); resume at squash
+- [x] write tests: 3-commit feature branch on a stale base -> one commit on `origin/develop`'s tip, tree hash equal, message composed oldest-first, pushed, backup on origin, trunk unchanged, exit 0; branch already on origin -> pushed with `--force-with-lease`; single commit -> message unchanged; `--message-file` used verbatim; "nothing to ship" -> 0 and no backup created
+- [x] write tests: on the trunk -> 2; on the mirror -> 2; on a `sync/` branch -> 2; dirty tree -> 2; mid-rebase -> 2; rebase conflict -> 4, then resolve + `git rebase --continue` + `ship --continue` -> 0; `ship --continue` on the trunk -> 2; `ship --continue` after `git rebase --abort` -> 2; stale lease (narrowed refspec + competing push from a second clone) -> 5 with trunk unchanged; gate failure after squash -> 3 with the rollback line and nothing pushed
+- [x] run tests - must pass before task 8
+- ➕ [x] `commit_records` reads the squash message through `git_rc`, not `git()`: Python's
+  `str.strip()` treats the `\x1f`/`\x1e` record separators as whitespace and silently dropped
+  the newest commit from every squash message
 
 ### Task 8: MR command and platform tools
 

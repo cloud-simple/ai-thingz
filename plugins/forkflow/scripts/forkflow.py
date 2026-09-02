@@ -1300,8 +1300,233 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return finish_sync(ctx, args, name, commits, rows, mirror_move, backup_ref)
 
 
+def rebase_in_progress(ctx: Ctx) -> bool:
+    """True while `git rebase` is stopped on a conflict or an edit."""
+    for name in ("rebase-merge", "rebase-apply"):
+        path = git("rev-parse", "--git-path", name, cwd=ctx.root, check=False)
+        if path and not os.path.isabs(path):
+            path = os.path.join(ctx.root, path)
+        if path and os.path.exists(path):
+            return True
+    return False
+
+
+def ship_preflight(ctx: Ctx) -> str:
+    """The branch `ship` may rewrite, or Fail(2). Everything else is refused by name:
+    ship rebases and squashes what it is on, and only a feature branch may be rewritten."""
+    if rebase_in_progress(ctx):
+        raise Fail("a rebase is in progress: finish it with `git rebase --continue` and then "
+                   "`forkflow ship --continue`, or start over with `git rebase --abort`")
+    branch = current_branch(ctx)
+    if not branch:
+        raise Fail("HEAD is detached: switch to the feature branch you want to ship")
+    if branch == ctx.trunk:
+        raise Fail(f"`{branch}` is the trunk: it is never rebased and never pushed - "
+                   f"switch to the feature branch you want to ship")
+    if branch == ctx.mirror:
+        raise Fail(f"`{branch}` is the mirror: it only ever copies `{ctx.up()}` - "
+                   f"switch to the feature branch you want to ship")
+    if branch.startswith(ctx.sync_prefix):
+        raise Fail(f"`{branch}` is a sync branch: finish it with `forkflow sync --continue`; "
+                   f"a sync is merged, never squashed")
+    if branch.startswith(ctx.backup_prefix):
+        raise Fail(f"`{branch}` is a backup branch: it is a restore point, not a feature branch")
+    if not clean_tree(ctx):
+        raise Fail("the working tree has uncommitted changes: commit or stash them first")
+    return branch
+
+
+def rebase_onto(ctx: Ctx, branch: str, trunk_ref: str) -> None:
+    """Rebase locally so the trunk can fast-forward: `rebase locally, merge globally`."""
+    cmd = f"git rebase {trunk_ref}"
+    tip = rev(ctx.root, trunk_ref)
+    if ctx.dry_run:
+        step("rebase", cmd, f"would replay `{branch}` onto {short(tip)}", dry=True)
+        return
+    rc, out, err = git_rc("rebase", trunk_ref, cwd=ctx.root)
+    if rc == 0:
+        step("rebase", cmd, f"`{branch}` now sits on {short(tip)}")
+        return
+    if not rebase_in_progress(ctx):
+        raise Fail(f"rebase of `{branch}` onto {trunk_ref} failed:\n{(err or out).strip()}")
+    unmerged = unmerged_paths(ctx)
+    step("rebase", cmd, f"{len(unmerged)} conflicting file(s)")
+    for f in unmerged:
+        print(f"    {f}")
+    raise Fail(f"resolve the conflicts, `git add` them, run `git rebase --continue`, "
+               f"then `forkflow ship --continue`", 4)
+
+
+def commit_records(ctx: Ctx, base: str, ref: str = "HEAD") -> list:
+    """(sha, subject, body) of `base..ref`, oldest first - what the squash message is built of.
+
+    Read through git_rc: the separators are ASCII whitespace to Python, so `git()`'s strip()
+    would eat the last record's field separator and lose that commit."""
+    rc, out, _ = git_rc("log", "--reverse", "--format=%H%x1f%s%x1f%b%x1e",
+                        f"{base}..{ref}", cwd=ctx.root)
+    if rc != 0:
+        return []
+    records = []
+    for chunk in out.split("\x1e"):
+        parts = chunk.split("\x1f")
+        if len(parts) < 2 or not parts[0].strip():
+            continue
+        body = parts[2] if len(parts) > 2 else ""
+        records.append((parts[0].strip(), parts[1].strip(), body.strip("\n")))
+    return records
+
+
+def squash_message(ctx: Ctx, records: Sequence[Tuple[str, str, str]],
+                   message_file: Optional[str] = None) -> str:
+    """--message-file verbatim; a single commit keeps its own message; otherwise the oldest
+    subject with every squashed commit listed under it, oldest first."""
+    if message_file:
+        try:
+            with open(message_file, "r") as fh:
+                text = fh.read()
+        except OSError as exc:
+            raise Fail(f"cannot read `{message_file}`: {exc}")
+        if not text.strip():
+            raise Fail(f"`{message_file}` is empty: the squashed commit needs a message")
+        return text if text.endswith("\n") else text + "\n"
+    if not records:
+        raise Fail("nothing to squash: no commits beyond the trunk")
+    if len(records) == 1:
+        return git("log", "-1", "--format=%B", "HEAD", cwd=ctx.root) + "\n"
+    lines = [records[0][1], "",
+             f"Squashed from {len(records)} commits (oldest first):", ""]
+    for _, subject, body in records:
+        lines.append(f"- {subject}")
+        for line in body.splitlines():
+            lines.append(f"  {line}" if line.strip() else "")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def squash(ctx: Ctx, base: str, message: str) -> str:
+    """One commit on `base` carrying exactly the tree that was there before.
+
+    The tree hash is the proof: `reset --soft` keeps the index, so a differing tree means
+    something was lost and nothing may be pushed."""
+    cmd = f"git reset --soft {short(base)} && git commit -F <message>"
+    if ctx.dry_run:
+        step("squash", cmd, "would replace the branch's commits with one", dry=True)
+        return ""
+    tree_before = git("rev-parse", "HEAD^{tree}", cwd=ctx.root)
+    head_before = rev(ctx.root, "HEAD")
+    path = write_temp(message, "commit-message")
+    try:
+        git("reset", "--soft", base, cwd=ctx.root)
+        rc, out, err = git_rc("commit", "--allow-empty", "-F", path, cwd=ctx.root)
+    finally:
+        os.unlink(path)
+    if rc != 0:
+        git("reset", "--soft", head_before, cwd=ctx.root)
+        step("squash", cmd, "FAILED")
+        raise Fail(f"cannot commit the squashed change:\n{(err or out).strip()}", 5)
+    tree_after = git("rev-parse", "HEAD^{tree}", cwd=ctx.root)
+    if tree_after != tree_before:
+        step("squash", cmd, "TREE MISMATCH")
+        raise Fail(f"the squashed commit's tree {short(tree_after)} differs from "
+                   f"{short(tree_before)}: refusing to push a squash that changed the result", 5)
+    head = rev(ctx.root, "HEAD")
+    step("squash", cmd, f"one commit {short(head)}, tree {short(tree_after)} unchanged")
+    return head
+
+
+def ship_body(ctx: Ctx, message: str, touched: Sequence[str]) -> str:
+    """The squashed commit message, the upstream-tracked warning, and the merge button."""
+    lines = [message.rstrip(), ""]
+    if touched:
+        lines += [f"Upstream-tracked files touched ({len(touched)}) - "
+                  f"every one of them is a permanent merge cost:", ""]
+        lines += [f"- `{f}`" for f in touched]
+        lines += [""]
+    lines += [f"Merge button: {merge_button(ctx, 'ship')}."]
+    return "\n".join(lines)
+
+
+def finish_ship(ctx: Ctx, args: argparse.Namespace, branch: str,
+                backup_ref: str, lease: str) -> int:
+    """squash -> check -> push -> merge request: the tail both `ship` and `ship --continue` run."""
+    trunk_ref = f"{ctx.origin}/{ctx.trunk}"
+    mb = git("merge-base", trunk_ref, "HEAD", cwd=ctx.root)
+    records = commit_records(ctx, mb)
+    step("commits", f"git log --oneline {trunk_ref}..HEAD",
+         f"{len(records)} commit(s) to squash into one")
+    for sha, subject, _ in records:
+        print(f"    {short(sha)} {subject}")
+
+    message = squash_message(ctx, records, getattr(args, "message_file", None))
+    squash(ctx, mb, message)
+
+    rollback = f"  rollback: git reset --hard {ctx.origin}/{backup_ref}" if backup_ref else ""
+    touched = upstream_tracked(ctx, branch_files(ctx))
+    if ctx.dry_run:
+        step("check", "forkflow check", "not run (dry run)", dry=True)
+    elif run_check(ctx) == 3:
+        if rollback:
+            print(rollback)
+        return 3
+
+    try:
+        push(ctx, branch, lease=lease or None)
+    except Fail as exc:
+        if exc.code == 5 and rollback:
+            print(rollback)
+        raise
+
+    title = (getattr(args, "title", None)
+             or (message.strip().splitlines() or [f"ship {branch}"])[0])
+    open_mr(ctx, branch, title, ship_body(ctx, message, touched),
+            bool(getattr(args, "mr", False)))
+    print(f"  after the MR is merged: git fetch {ctx.origin} && git switch {ctx.trunk} "
+          f"&& git merge --ff-only {ctx.origin}/{ctx.trunk}")
+    if ctx.platform == "github":
+        print(f"    then delete the local `{branch}`: "
+              f'"Rebase and merge" rewrites the commit, so the local branch is a stale copy')
+    return 0
+
+
 def cmd_ship(args: argparse.Namespace) -> int:
-    raise Fail("`ship` is not implemented yet")
+    ctx = resolve_ctx(args.dir, args, need_upstream=True, need_trunk=True, strict_mirror=True)
+    header(ctx, "ship")
+    branch = ship_preflight(ctx)
+    trunk_ref = f"{ctx.origin}/{ctx.trunk}"
+
+    if getattr(args, "cont", False):
+        cmd = f"git merge-base --is-ancestor {trunk_ref} HEAD"
+        rc, _, _ = git_rc("merge-base", "--is-ancestor", trunk_ref, "HEAD", cwd=ctx.root)
+        if rc != 0:
+            step("continue", cmd, f"`{branch}` is not on {trunk_ref}'s tip")
+            raise Fail("the rebase did not complete; run `forkflow ship` again")
+        step("continue", cmd, "the rebase completed - resuming at the squash")
+        return finish_ship(ctx, args, branch, last_backup(ctx, "pre-ship"),
+                           rev(ctx.root, f"refs/remotes/{ctx.origin}/{branch}"))
+
+    cmd = f"git fetch {ctx.origin}"
+    before = rev(ctx.root, trunk_ref)
+    rc, _, err = git_rc("fetch", ctx.origin, cwd=ctx.root)
+    if rc != 0:
+        step("fetch", cmd, "FAILED")
+        raise Fail(f"fetch failed: {err.strip()}")
+    now = rev(ctx.root, trunk_ref)
+    step("fetch", cmd, f"{trunk_ref} unchanged" if now == before
+         else f"{trunk_ref} {short(before)}..{short(now)}")
+
+    rc, _, _ = git_rc("merge-base", "--is-ancestor", "HEAD", trunk_ref, cwd=ctx.root)
+    if rc == 0:
+        print(f"  nothing to ship: `{branch}` has no commits beyond {trunk_ref}")
+        return 0
+
+    # the lease is what the fetch just saw; the rebase and the squash come after it
+    lease = rev(ctx.root, f"refs/remotes/{ctx.origin}/{branch}")
+    backup_ref = backup(ctx, "pre-ship", "HEAD")
+    rebase_onto(ctx, branch, trunk_ref)
+    if not ctx.dry_run and rev(ctx.root, "HEAD") == now:
+        print(f"  nothing to ship: every commit of `{branch}` is already on {trunk_ref} "
+              f"(the backup `{backup_ref}` still holds the branch as it was)")
+        return 0
+    return finish_ship(ctx, args, branch, backup_ref, lease)
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
@@ -2882,6 +3107,298 @@ def run_tests() -> None:
             self.assertIn("CHECK binary", self.row_for(out, "logo.bin"))
 
     # ------------------------------------------------------------------- #
+    # ship
+    # ------------------------------------------------------------------- #
+
+    class ShipBase(Base):
+        BASE_TF = 'resource "null_resource" "a" {\n  count = 1\n}\n'
+
+        def feature(self, fork: str, name: str = "feat/x", commits: int = 1,
+                    push: bool = False) -> str:
+            sh("git", "checkout", "-b", name, "develop", cwd=fork)
+            for i in range(commits):
+                commit_fork(fork, "ours/f%d.txt" % i, "line %d\n" % i,
+                            "ours: step %d" % i, push=push)
+            return name
+
+        def backup_branch(self, fork: str) -> str:
+            out = sh("git", "for-each-ref", "--format=%(refname:short)",
+                     "refs/heads/" + DEFAULT_BACKUP_PREFIX + "*", cwd=fork)
+            return out.splitlines()[0] if out else ""
+
+        def message_of(self, fork: str, ref: str = "HEAD") -> str:
+            return sh("git", "log", "-1", "--format=%B", ref, cwd=fork).strip()
+
+        def conflicting_ship(self) -> Tuple[str, str]:
+            """A feature branch and origin/develop that changed the same line."""
+            fork = make_fork(self.tmp)
+            name = self.feature(fork, commits=0)
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "ours: shared")
+            second_clone_commit(self.tmp, path="shared.tf",
+                                content=self.BASE_TF.replace("count = 1", "count = 9"))
+            return fork, name
+
+    class TestShip(ShipBase):
+        def test_three_commits_become_one_on_the_trunk_tip(self):
+            fork = make_fork(self.tmp)
+            name = self.feature(fork, commits=3)
+            second_clone_commit(self.tmp)                  # origin/develop moved underneath us
+            before_trunk = origin_sha(fork, "develop")
+
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+
+            self.assertEqual(rev(fork, "HEAD^"), before_trunk)          # on the trunk's tip
+            self.assertEqual(sh("git", "rev-list", "--count",
+                                before_trunk + "..HEAD", cwd=fork), "1")
+            self.assertEqual(origin_sha(fork, name), rev(fork, "HEAD"))
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)  # the trunk is never pushed
+            self.assertEqual(sorted(sh("git", "diff", "--name-only", before_trunk, "HEAD",
+                                       cwd=fork).splitlines()),
+                             ["ours/f0.txt", "ours/f1.txt", "ours/f2.txt"])
+            self.assertTrue(os.path.exists(os.path.join(fork, "ours", "other.txt")))
+
+            backup_ref = self.backup_branch(fork)
+            self.assertTrue(backup_ref)
+            self.assertEqual(origin_sha(fork, backup_ref), rev(fork, backup_ref))
+            # everything the branch contributed survived the rebase and the squash
+            self.assertEqual(sh("git", "diff", backup_ref, "HEAD", "--", "ours/f0.txt",
+                                "ours/f1.txt", "ours/f2.txt", cwd=fork), "")
+            self.assertIn("unchanged", out)
+
+            msg = self.message_of(fork)
+            self.assertTrue(msg.startswith("ours: step 0"), msg)        # oldest subject
+            self.assertIn("Squashed from 3 commits (oldest first):", msg)
+            self.assertLess(msg.index("- ours: step 0"), msg.index("- ours: step 2"))
+
+        def test_branch_already_on_origin_is_pushed_with_a_lease(self):
+            fork = make_fork(self.tmp)
+            name = self.feature(fork, commits=2, push=True)
+            second_clone_commit(self.tmp)
+            before = origin_sha(fork, name)
+
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("--force-with-lease=%s:%s" % (name, before), out)
+            self.assertNotIn("--force ", out)
+            self.assertEqual(origin_sha(fork, name), rev(fork, "HEAD"))
+
+        def test_single_commit_keeps_its_message(self):
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "-b", "feat/x", "develop", cwd=fork)
+            write(fork, "ours/a.txt", "a\n")
+            sh("git", "add", "-A", cwd=fork)
+            sh("git", "commit", "-m", "ours: only one\n\nwith a body line", cwd=fork)
+            second_clone_commit(self.tmp)
+
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(self.message_of(fork), "ours: only one\n\nwith a body line")
+            self.assertNotIn("Squashed from", self.message_of(fork))
+
+        def test_message_file_is_used_verbatim(self):
+            fork = make_fork(self.tmp)
+            self.feature(fork, commits=2)
+            second_clone_commit(self.tmp)
+            path = write(self.tmp, "msg.txt", "ship: a hand written subject\n\nand a body\n")
+
+            code, out, err = run("-C", fork, "ship", "--message-file", path)
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(self.message_of(fork), "ship: a hand written subject\n\nand a body")
+            self.assertIn("ship: a hand written subject", out)     # the MR title
+
+        def test_nothing_to_ship_creates_no_backup(self):
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "-b", "feat/x", "develop", cwd=fork)
+            before_trunk = origin_sha(fork, "develop")
+
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("nothing to ship", out)
+            self.assertNotIn(DEFAULT_BACKUP_PREFIX, local_branches(fork))
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+            self.assertEqual(origin_sha(fork, "feat/x"), "")
+
+        def test_already_upstream_commits_are_nothing_to_ship_after_the_rebase(self):
+            fork = make_fork(self.tmp)
+            name = self.feature(fork, commits=1, push=True)
+            # the same change reaches origin/develop by another route: the rebase drops it
+            sh("git", "push", os.path.join(self.tmp, "origin.git"),
+               "%s:refs/heads/develop" % name, cwd=fork)
+            sh("git", "fetch", "origin", cwd=fork)
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("nothing to ship", out)
+
+        def test_dry_run_changes_nothing(self):
+            fork = make_fork(self.tmp)
+            name = self.feature(fork, commits=2)
+            second_clone_commit(self.tmp)
+            before_head = rev(fork, "HEAD")
+            before_trunk = origin_sha(fork, "develop")
+
+            code, out, err = run("-C", fork, "ship", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("would:", out)
+            self.assertEqual(rev(fork, "HEAD"), before_head)
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+            self.assertEqual(origin_sha(fork, name), "")
+            self.assertNotIn(DEFAULT_BACKUP_PREFIX, local_branches(fork))
+
+        @needs_tomllib
+        def test_custom_trunk_name_is_the_rebase_target(self):
+            fork = make_fork(self.tmp, trunk="trunk", config='trunk = "trunk"\n')
+            sh("git", "checkout", "-b", "feat/x", "trunk", cwd=fork)
+            commit_fork(fork, "ours/a.txt", "a\n", "ours: first")
+            second_clone_commit(self.tmp, branch="trunk")
+            before_trunk = origin_sha(fork, "trunk")
+
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(fork, "HEAD^"), before_trunk)
+            self.assertEqual(origin_sha(fork, "trunk"), before_trunk)
+
+    class TestShipErrors(ShipBase):
+        def test_on_the_trunk_is_exit_2(self):
+            fork = make_fork(self.tmp)
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 2)
+            self.assertIn("is the trunk", err)
+
+        def test_on_the_mirror_is_exit_2(self):
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "main", cwd=fork)
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 2)
+            self.assertIn("is the mirror", err)
+
+        def test_on_a_sync_branch_is_exit_2(self):
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "-b", sync_branch_name(), "develop", cwd=fork)
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 2)
+            self.assertIn("sync branch", err)
+
+        def test_on_a_backup_branch_is_exit_2(self):
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "-b", DEFAULT_BACKUP_PREFIX + "20260101-000000-pre-ship",
+               "develop", cwd=fork)
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 2)
+            self.assertIn("backup branch", err)
+
+        def test_dirty_tree_is_exit_2(self):
+            fork = make_fork(self.tmp)
+            self.feature(fork)
+            write(fork, "README.md", "# dirty\n")
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 2)
+            self.assertIn("uncommitted changes", err)
+
+        def test_detached_head_is_exit_2(self):
+            fork = make_fork(self.tmp)
+            self.feature(fork)
+            sh("git", "checkout", "--detach", "HEAD", cwd=fork)
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 2)
+            self.assertIn("detached", err)
+
+        def test_rebase_conflict_then_continue(self):
+            fork, name = self.conflicting_ship()
+            before_trunk = origin_sha(fork, "develop")
+
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 4, err + out)
+            self.assertIn("git rebase --continue", err)
+            self.assertIn("forkflow ship --continue", err)
+            self.assertIn("shared.tf", out)
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+            self.assertEqual(origin_sha(fork, name), "")
+            self.assertTrue(self.backup_branch(fork))
+
+            # a second `ship` while the rebase is stopped refuses to do anything
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 2)
+            self.assertIn("rebase is in progress", err)
+
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"))
+            sh("git", "add", "shared.tf", cwd=fork)
+            sh("git", "rebase", "--continue", cwd=fork)
+
+            code, out, err = run("-C", fork, "ship", "--continue")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(fork, "HEAD^"), before_trunk)
+            self.assertEqual(origin_sha(fork, name), rev(fork, "HEAD"))
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+            self.assertIn("count = 2", sh("git", "show", "HEAD:shared.tf", cwd=fork))
+
+        def test_continue_on_the_trunk_is_exit_2(self):
+            fork = make_fork(self.tmp)
+            code, out, err = run("-C", fork, "ship", "--continue")
+            self.assertEqual(code, 2)
+            self.assertIn("is the trunk", err)
+
+        def test_continue_after_rebase_abort_is_exit_2(self):
+            fork, name = self.conflicting_ship()
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 4, err + out)
+            sh("git", "rebase", "--abort", cwd=fork)
+
+            code, out, err = run("-C", fork, "ship", "--continue")
+            self.assertEqual(code, 2)
+            self.assertIn("rebase did not complete", err)
+            self.assertEqual(origin_sha(fork, name), "")
+
+        def test_stale_lease_is_exit_5_with_the_trunk_unchanged(self):
+            fork = make_fork(self.tmp)
+            name = self.feature(fork, commits=1, push=True)
+            before_trunk = origin_sha(fork, "develop")
+            stale = origin_sha(fork, name)
+            # a narrowed refspec keeps `git fetch origin` from refreshing origin/<feature>,
+            # so the lease the push carries is the one this clone last saw
+            sh("git", "config", "remote.origin.fetch",
+               "+refs/heads/develop:refs/remotes/origin/develop", cwd=fork)
+            second_clone_commit(self.tmp, branch=name, path="ours/rival.txt", content="rival\n")
+
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 5, err + out)
+            self.assertEqual(rev(fork, "refs/remotes/origin/" + name), stale)
+            self.assertNotEqual(origin_sha(fork, name), rev(fork, "HEAD"))
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+            self.assertIn("rollback: git reset --hard origin/" + DEFAULT_BACKUP_PREFIX, out)
+
+        @needs_tomllib
+        def test_gate_failure_after_the_squash_is_exit_3_with_the_rollback_line(self):
+            fork = make_fork(self.tmp, config='gate = ["echo gate-said-no; exit 2"]\n')
+            name = self.feature(fork, commits=2)
+            second_clone_commit(self.tmp)
+            before_trunk = origin_sha(fork, "develop")
+
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 3, err + out)
+            self.assertIn("gate-said-no", out)
+            self.assertIn("rollback: git reset --hard origin/" + DEFAULT_BACKUP_PREFIX, out)
+            self.assertEqual(origin_sha(fork, name), "")           # nothing was pushed
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+            # the squash happened, so the rollback line is the way back
+            self.assertEqual(sh("git", "rev-list", "--count",
+                                "origin/develop..HEAD", cwd=fork), "1")
+
+        def test_push_rejection_is_exit_5_with_the_rollback_line(self):
+            fork = make_fork(self.tmp)
+            name = self.feature(fork, commits=2)
+            second_clone_commit(self.tmp)
+            reject_pushes(self.tmp, "refs/heads/feat/*")
+            before_trunk = origin_sha(fork, "develop")
+
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 5, err + out)
+            self.assertIn("rollback: git reset --hard origin/" + DEFAULT_BACKUP_PREFIX, out)
+            self.assertEqual(origin_sha(fork, name), "")
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+
+    # ------------------------------------------------------------------- #
     # argument parsing and main
     # ------------------------------------------------------------------- #
 
@@ -2937,6 +3454,7 @@ def run_tests() -> None:
                  TestCleanTree, TestPush, TestPushMirror, TestAdvanceMirror,
                  TestBootstrapTrunk, TestBackup, TestSimulateMerge, TestSimulateMergeOldGit,
                  TestStatus, TestCheck, TestSync, TestSyncConflicts,
+                 TestShip, TestShipErrors,
                  TestParseArgs, TestMainWiring):
         suite.addTests(loader.loadTestsFromTestCase(case))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
