@@ -62,6 +62,7 @@ DEFAULT_TRUNK = "develop"
 DEFAULT_SYNC_PREFIX = "sync/"
 DEFAULT_BACKUP_PREFIX = "backup/"
 README_POINTER = "See README, *Adopting forkflow in an existing fork*"
+GATE_TAIL = 12                       # lines of a failing gate command's output that are shown
 
 
 # --------------------------------------------------------------------------- #
@@ -94,6 +95,19 @@ def git_rc(*args: str, cwd: Optional[str] = None) -> Tuple[int, str, str]:
     return (p.returncode,
             p.stdout.decode("utf-8", "replace"),
             p.stderr.decode("utf-8", "replace"))
+
+
+def shell(cmd: str, cwd: str) -> Tuple[int, str]:
+    """Run a configured gate command with `sh -c`; output is stdout and stderr interleaved."""
+    p = subprocess.run(["sh", "-c", cmd], cwd=cwd,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return p.returncode, p.stdout.decode("utf-8", "replace")
+
+
+def tail_lines(text: str, count: int) -> list:
+    """The last `count` non-blank lines - what a failing gate command is judged by."""
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    return lines[-count:]
 
 
 def _parse_version(text: str) -> Tuple[int, int]:
@@ -334,6 +348,22 @@ def branch_files(ctx: Ctx, ref: str = "HEAD") -> list:
         out = git("diff", "--name-only", mb, ref, cwd=ctx.root, check=False)
         return [f for f in out.splitlines() if f]
     return []
+
+
+def current_branch(ctx: Ctx) -> str:
+    """Short name of the checked-out branch, "" when HEAD is detached."""
+    return git("symbolic-ref", "-q", "--short", "HEAD", cwd=ctx.root, check=False)
+
+
+def warn_upstream_tracked(ctx: Ctx) -> list:
+    """Print (and return) the upstream-tracked files this branch touches. Never a failure:
+    editing them is a permanent merge cost that is sometimes the right call."""
+    touched = upstream_tracked(ctx, branch_files(ctx))
+    if touched:
+        print(f"  touches upstream-tracked files (WARNING, {len(touched)}):")
+        for f in touched:
+            print(f"    {f}")
+    return touched
 
 
 def hooks_path(root: str) -> str:
@@ -604,7 +634,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     if fetch_result:
         step("fetch", f"git fetch --multiple {ctx.origin} {ctx.upstream}", fetch_result)
 
-    branch = git("symbolic-ref", "-q", "--short", "HEAD", cwd=ctx.root, check=False)
+    branch = current_branch(ctx)
     modified = [ln for ln in git("status", "--porcelain", "--untracked-files=no",
                                  cwd=ctx.root).splitlines() if ln]
     tree = "clean" if not modified else f"{len(modified)} modified"
@@ -619,11 +649,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             where = "not on origin"
         print(f"  branch   {branch}  {where}  tree: {tree}")
 
-    touched = upstream_tracked(ctx, branch_files(ctx))
-    if touched:
-        print(f"  touches upstream-tracked files (WARNING, {len(touched)}):")
-        for f in touched:
-            print(f"    {f}")
+    warn_upstream_tracked(ctx)
 
     found = backups(ctx)
     line = f"  backups  {len(found)} (refs/remotes/{ctx.origin}/{ctx.backup_prefix}*)"
@@ -653,8 +679,69 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def gate_commands(ctx: Ctx) -> list:
+    """`gate = [...]` from the config; a bare string is accepted as a single command."""
+    gate = ctx.cfg.get("gate") or []
+    if isinstance(gate, str):
+        gate = [gate]
+    if not isinstance(gate, list) or any(not isinstance(c, str) for c in gate):
+        raise Fail(f"{CONFIG_FILE}: `gate` must be a list of shell commands")
+    return [c for c in gate if c.strip()]
+
+
+def run_check(ctx: Ctx) -> int:
+    """The preflight `sync` and `ship` run, and what `status` surfaces for humans.
+
+    Read-only. 0 when every invariant holds, 3 when one does not; the upstream-tracked
+    warning is advisory and never changes the code."""
+    failures = []
+    warn_upstream_tracked(ctx)
+
+    gate = gate_commands(ctx)
+    if not gate:
+        step("gate", "-", f"none configured ({CONFIG_FILE} gate = [...])")
+    for cmd in gate:
+        shown = f"sh -c '{cmd}'"
+        if ctx.dry_run:                       # a gate is arbitrary shell: never run in a dry run
+            step("gate", shown, "not run (dry run)", dry=True)
+            continue
+        rc, out = shell(cmd, ctx.root)
+        if rc == 0:
+            step("gate", shown, "passed")
+            continue
+        step("gate", shown, f"FAILED (exit {rc})")
+        for line in tail_lines(out, GATE_TAIL):
+            print(f"      {line}")
+        failures.append(f"gate `{cmd}` exited {rc}")
+        break                                 # the first failure is the one to fix
+
+    trunk_ref = f"{ctx.origin}/{ctx.trunk}"
+    tip_cmd = f"git merge-base --is-ancestor {trunk_ref} HEAD"
+    if current_branch(ctx) == ctx.trunk:
+        step("tip", tip_cmd, f"skipped (on the trunk `{ctx.trunk}`)")
+    else:
+        rc, _, err = git_rc("merge-base", "--is-ancestor", trunk_ref, "HEAD", cwd=ctx.root)
+        if rc == 0:
+            step("tip", tip_cmd, f"on {trunk_ref}'s tip")
+        elif rc == 1:
+            ahead, behind = ahead_behind(ctx, "HEAD", trunk_ref)
+            where = f"behind by {behind}, ahead by {ahead}"
+            step("tip", tip_cmd, f"not on {trunk_ref}'s tip ({where})")
+            failures.append(f"not on {trunk_ref}'s tip ({where})")
+        else:
+            raise Fail(f"cannot compare HEAD with {trunk_ref}: {err.strip()}")
+
+    if failures:
+        print("  check    FAILED: " + "; ".join(failures))
+        return 3
+    print("  check    ok")
+    return 0
+
+
 def cmd_check(args: argparse.Namespace) -> int:
-    raise Fail("`check` is not implemented yet")
+    ctx = resolve_ctx(args.dir, args, need_upstream=True, need_trunk=True, strict_mirror=True)
+    header(ctx, "check")
+    return run_check(ctx)
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
@@ -1487,6 +1574,153 @@ def run_tests() -> None:
             self.assertIn("forkflow setup --upstream-url", err)
 
     # ------------------------------------------------------------------- #
+    # check
+    # ------------------------------------------------------------------- #
+
+    class TestCheck(Base):
+        def feature(self, fork: str, name: str = "feat/x", start: Optional[str] = None) -> None:
+            args = ["git", "switch", "-c", name] + ([start] if start else [])
+            sh(*args, cwd=fork)
+
+        def test_no_gate_configured(self):
+            fork = make_fork(self.tmp)
+            self.feature(fork)
+            commit_fork(fork, "ours/new.txt", "one\n", "one")
+            code, out, err = run("-C", fork, "check")
+            self.assertEqual(code, 0, err)
+            self.assertIn("none configured (.forkflow.toml gate = [...])", out)
+            self.assertIn("check    ok", out)
+
+        @needs_tomllib
+        def test_passing_gate_runs_in_the_repo_root(self):
+            fork = make_fork(self.tmp, config='gate = ["test -f README.md", "true"]\n')
+            self.feature(fork)
+            commit_fork(fork, "ours/new.txt", "one\n", "one")
+            code, out, err = run("-C", os.path.join(fork, "src"), "check")
+            self.assertEqual(code, 0, err)
+            self.assertIn("sh -c 'test -f README.md'  -> passed", out)
+            self.assertIn("sh -c 'true'  -> passed", out)
+
+        @needs_tomllib
+        def test_failing_gate_is_exit_3_with_its_output_tail(self):
+            fork = make_fork(
+                self.tmp,
+                config='gate = ["echo first line; echo boom >&2; exit 2", "touch second-ran"]\n')
+            self.feature(fork)
+            code, out, err = run("-C", fork, "check")
+            self.assertEqual(code, 3)
+            self.assertIn("FAILED (exit 2)", out)
+            self.assertIn("boom", out)
+            self.assertIn("first line", out)
+            self.assertIn("check    FAILED:", out)
+            # the first failure is the one to fix: later gate commands do not run
+            self.assertFalse(os.path.exists(os.path.join(fork, "second-ran")))
+
+        @needs_tomllib
+        def test_dry_run_never_executes_a_gate(self):
+            fork = make_fork(self.tmp, config='gate = ["touch gate-ran; exit 2"]\n')
+            self.feature(fork)
+            code, out, err = run("-C", fork, "check", "--dry-run")
+            self.assertEqual(code, 0, err)
+            self.assertIn("would:", out)
+            self.assertIn("not run (dry run)", out)
+            self.assertFalse(os.path.exists(os.path.join(fork, "gate-ran")))
+
+        @needs_tomllib
+        def test_gate_of_a_wrong_type_is_exit_2(self):
+            fork = make_fork(self.tmp, config="gate = 3\n")
+            code, out, err = run("-C", fork, "check")
+            self.assertEqual(code, 2)
+            self.assertIn("list of shell commands", err)
+
+        def test_on_the_trunks_tip_is_exit_0(self):
+            fork = make_fork(self.tmp)
+            self.feature(fork)
+            commit_fork(fork, "ours/new.txt", "one\n", "one")
+            code, out, err = run("-C", fork, "check")
+            self.assertEqual(code, 0, err)
+            self.assertIn("on origin/develop's tip", out)
+
+        def test_diverged_from_the_trunk_is_exit_3_with_both_numbers(self):
+            fork = make_fork(self.tmp)
+            self.feature(fork)
+            commit_fork(fork, "ours/new.txt", "one\n", "one")
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n")
+            push_upstream_into_origin(self.tmp, "develop")
+            sh("git", "fetch", "origin", cwd=fork)
+            code, out, err = run("-C", fork, "check")
+            self.assertEqual(code, 3)
+            self.assertIn("not on origin/develop's tip (behind by 1, ahead by 1)", out)
+            self.assertIn("check    FAILED:", out)
+
+        def test_tip_is_checked_against_the_trunk_not_the_mirror(self):
+            fork = make_fork(self.tmp)
+            commit_fork(fork, "ours/trunk.txt", "trunk\n", "trunk moves", push=True)
+            sh("git", "fetch", "origin", cwd=fork)
+            self.feature(fork, start="main")               # on the mirror's tip, behind the trunk
+            commit_fork(fork, "ours/new.txt", "one\n", "one")
+            code, out, err = run("-C", fork, "check")
+            self.assertEqual(code, 3)
+            self.assertIn("not on origin/develop's tip (behind by 1, ahead by 1)", out)
+            self.assertNotIn("origin/main's tip", out)
+
+        def test_skipped_on_the_trunk_even_when_behind(self):
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n")
+            push_upstream_into_origin(self.tmp, "develop")
+            sh("git", "fetch", "origin", cwd=fork)
+            code, out, err = run("-C", fork, "check")
+            self.assertEqual(code, 0, err)
+            self.assertIn("skipped (on the trunk `develop`)", out)
+            self.assertIn("check    ok", out)
+
+        def test_upstream_tracked_warning_does_not_fail_the_check(self):
+            fork = make_fork(self.tmp)
+            self.feature(fork)
+            commit_fork(fork, "src/app.py", "def main():\n    return 7\n", "touch theirs")
+            commit_fork(fork, "ours/new.txt", "ours only\n", "add ours")
+            code, out, err = run("-C", fork, "check")
+            self.assertEqual(code, 0, err)
+            self.assertIn("touches upstream-tracked files (WARNING, 1)", out)
+            self.assertIn("    src/app.py", out)
+            self.assertNotIn("ours/new.txt", out)
+            self.assertIn("check    ok", out)
+
+        @needs_tomllib
+        def test_custom_trunk_name_from_config(self):
+            fork = make_fork(self.tmp, trunk="trunk", mirror="upstream-main",
+                             config='trunk = "trunk"\nmirror = "upstream-main"\n')
+            self.feature(fork)
+            commit_fork(fork, "ours/new.txt", "one\n", "one")
+            code, out, err = run("-C", fork, "check")
+            self.assertEqual(code, 0, err)
+            self.assertIn("on origin/trunk's tip", out)
+
+        def test_missing_trunk_on_origin_is_exit_2(self):
+            fork = make_fresh_fork(self.tmp)
+            code, out, err = run("-C", fork, "check")
+            self.assertEqual(code, 2)
+            self.assertIn("forkflow setup", err)
+
+        def test_diverged_mirror_is_exit_2(self):
+            fork = make_fork(self.tmp)
+            sh("git", "switch", "main", cwd=fork)
+            commit_fork(fork, "ours.txt", "ours\n", "work on the mirror")
+            code, out, err = run("-C", fork, "check")
+            self.assertEqual(code, 2)
+            self.assertIn("Adopting forkflow", err)
+
+        def test_check_is_read_only(self):
+            fork = make_fork(self.tmp)
+            self.feature(fork)
+            commit_fork(fork, "ours/new.txt", "one\n", "one")
+            before = sh("git", "for-each-ref", cwd=fork)
+            code, out, err = run("-C", fork, "check")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(sh("git", "for-each-ref", cwd=fork), before)
+            self.assertNotIn("git fetch", out)
+
+    # ------------------------------------------------------------------- #
     # argument parsing and main
     # ------------------------------------------------------------------- #
 
@@ -1540,7 +1774,7 @@ def run_tests() -> None:
     suite = unittest.TestSuite()
     for case in (TestDetectPlatform, TestGitVersion, TestLoadConfig, TestResolveCtx,
                  TestCleanTree, TestPush, TestPushMirror, TestAdvanceMirror,
-                 TestBootstrapTrunk, TestStatus, TestParseArgs, TestMainWiring):
+                 TestBootstrapTrunk, TestStatus, TestCheck, TestParseArgs, TestMainWiring):
         suite.addTests(loader.loadTestsFromTestCase(case))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)

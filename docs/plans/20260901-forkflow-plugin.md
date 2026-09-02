@@ -575,10 +575,10 @@ step-by-step document with its real branch names and SHAs with that project, not
 **Files:**
 - Modify: `plugins/forkflow/scripts/forkflow.py`
 
-- [ ] `cmd_check`: upstream-tracked WARNING (shared with status), gate commands via `sh -c` in the repo root with output tail on failure, "none configured" note otherwise; tip check (`origin/<trunk>` ancestor of HEAD, "behind by n, ahead by m" otherwise; skipped on the trunk)
-- [ ] exit 3 on gate failure or tip check failure; 0 otherwise; the WARNING alone never changes the exit code
-- [ ] write tests (`make_fork(config=...)` with a committed `gate`; config-dependent cases skipped without `tomllib`): gate absent -> note + 0; passing gate -> 0; failing gate -> 3 with its output tail; diverged from `origin/develop` -> 3 with both numbers; on tip -> 0; upstream-tracked touched -> WARNING listed and still 0; the tip check is against the trunk, never the mirror
-- [ ] run tests - must pass before task 4
+- [x] `cmd_check`: upstream-tracked WARNING (shared with status), gate commands via `sh -c` in the repo root with output tail on failure, "none configured" note otherwise; tip check (`origin/<trunk>` ancestor of HEAD, "behind by n, ahead by m" otherwise; skipped on the trunk)
+- [x] exit 3 on gate failure or tip check failure; 0 otherwise; the WARNING alone never changes the exit code
+- [x] write tests (`make_fork(config=...)` with a committed `gate`; config-dependent cases skipped without `tomllib`): gate absent -> note + 0; passing gate -> 0; failing gate -> 3 with its output tail; diverged from `origin/develop` -> 3 with both numbers; on tip -> 0; upstream-tracked touched -> WARNING listed and still 0; the tip check is against the trunk, never the mirror
+- [x] run tests - must pass before task 4
 
 ### Task 4: `backup()` and `simulate_merge()`
 
