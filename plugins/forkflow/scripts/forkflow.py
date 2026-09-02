@@ -1705,6 +1705,121 @@ def setup_push_url(ctx: Ctx) -> None:
     step("push url", cmd, f"pushes to `{ctx.upstream}` now fail")
 
 
+# The hook is the second half of the guarantee: the script routes every push through the three
+# helpers, and this refuses the forbidden pushes even when git is driven by hand. Every name and
+# the upstream URL are baked in at install time, so the hook needs no config of its own.
+HOOK_TEMPLATE = """#!/bin/sh
+%(mark)s - written by `forkflow setup`; `forkflow setup --force` replaces it.
+#
+# Refuses the pushes the workflow forbids, however git is driven:
+#   - anything to the original project (remote `%(upstream)s` or its URL)
+#   - anything to the trunk `%(trunk)s`, deletion included: merge requests only
+#   - any push of the mirror `%(mirror)s` that is not a pure copy of upstream
+#
+# The mirror check validates against the last fetch of `%(upstream)s` (%(up_ref)s);
+# fetch before pushing the mirror.
+
+up_remote='%(upstream)s'
+up_url='%(upstream_url)s'
+up_ref='%(up_ref)s'
+trunk_ref='refs/heads/%(trunk)s'
+mirror_ref='refs/heads/%(mirror)s'
+zero='0000000000000000000000000000000000000000'
+
+to_upstream=no
+[ "$1" = "$up_remote" ] && to_upstream=yes
+[ -n "$up_url" ] && [ "$2" = "$up_url" ] && to_upstream=yes
+if [ "$to_upstream" = yes ]; then
+    echo "forkflow: never push to upstream (rule 1) - it is the original project" >&2
+    exit 1
+fi
+
+status=0
+while read local_ref local_sha remote_ref remote_sha; do
+    [ -n "$remote_ref" ] || continue
+    case "$remote_ref" in
+    "$trunk_ref")
+        echo "forkflow: never push the trunk (rule 2) - $remote_ref moves only through a merge request" >&2
+        status=1
+        ;;
+    "$mirror_ref")
+        if [ "$local_sha" = "$zero" ]; then
+            echo "forkflow: refusing to delete the mirror $remote_ref (rule 6)" >&2
+            status=1
+            continue
+        fi
+        git merge-base --is-ancestor "$local_sha" "$up_ref" 2>/dev/null
+        rc=$?
+        if [ "$rc" -eq 1 ]; then
+            echo "forkflow: the mirror push must be a pure copy of upstream (rule 6) - $local_sha is not in $up_ref" >&2
+            status=1
+        elif [ "$rc" -ne 0 ]; then
+            echo "forkflow: cannot verify the mirror against $up_ref (missing or unfetched); run: git fetch $up_remote" >&2
+            status=1
+        fi
+        ;;
+    esac
+done
+exit $status
+"""
+
+
+def hook_text(ctx: Ctx) -> str:
+    """The pre-push hook for this fork - names and upstream URL substituted in."""
+    return HOOK_TEMPLATE % {
+        "mark": HOOK_MARK,
+        "upstream": ctx.upstream,
+        "upstream_url": ctx.upstream_url,
+        "up_ref": f"refs/remotes/{ctx.upstream}/{ctx.upstream_branch}",
+        "trunk": ctx.trunk,
+        "mirror": ctx.mirror,
+    }
+
+
+def setup_hook(ctx: Ctx, force: bool) -> None:
+    """Install the pre-push hook. It must run after the trunk exists: the hook refuses every
+    push of the trunk, creation included."""
+    d = hooks_path(ctx.root)
+    if not d:
+        raise Fail("cannot locate the hooks directory (`git rev-parse --git-path hooks`)")
+    path = os.path.join(d, "pre-push")
+    cmd = f"write {path}"
+
+    shared = git("config", "--get", "core.hooksPath", cwd=ctx.root, check=False)
+    if shared:
+        step("hook", cmd, f"WARNING: `core.hooksPath` is `{shared}` - a shared hooks directory")
+        if not force:
+            raise Fail(f"the hooks directory `{d}` is shared through `core.hooksPath`: "
+                       f"forkflow's pre-push hook would apply to every repository that uses "
+                       f"it. Install it there yourself, or rerun with `forkflow setup --force`")
+
+    state = hook_state(ctx)
+    if state == "foreign" and not force:
+        step("hook", cmd, "REFUSED")
+        raise Fail(f"`{path}` is not forkflow's hook: rerun with `forkflow setup --force` to "
+                   f"install forkflow's and keep the current one as `pre-push.pre-forkflow`")
+
+    what = {"missing": "would install it",
+            "installed": "would rewrite it with the current names",
+            "foreign": "would install it, keeping the current one as `pre-push.pre-forkflow`"}
+    if ctx.dry_run:
+        step("hook", cmd, what[state], dry=True)
+        return
+
+    os.makedirs(d, exist_ok=True)
+    if state == "foreign":
+        os.replace(path, path + ".pre-forkflow")
+    with open(path, "w") as fh:
+        fh.write(hook_text(ctx))
+    os.chmod(path, 0o755)
+    done = {"missing": "installed", "installed": "rewritten with the current names",
+            "foreign": "installed; the previous hook is kept as `pre-push.pre-forkflow`"}
+    step("hook", cmd, done[state])
+    print(f"    it refuses every push to `{ctx.upstream}` (by name or URL) and to `{ctx.trunk}`, "
+          f"and any `{ctx.mirror}` push that is not a copy of `{ctx.up()}` as last fetched - "
+          f"so `git fetch {ctx.upstream}` before pushing the mirror")
+
+
 def setup_git_config(ctx: Ctx) -> None:
     """ff-only for the two long-lived branches is rule 3 and rule 6 in git's own hands."""
     settings = [
@@ -1771,6 +1886,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     setup_mirror(ctx, target)
     setup_trunk(ctx, target)
     setup_push_url(ctx)
+    setup_hook(ctx, bool(getattr(args, "force", False)))
     setup_git_config(ctx)
     setup_template(ctx)
     return 0
@@ -3839,6 +3955,207 @@ def run_tests() -> None:
             self.untouched(fork)
 
     # ------------------------------------------------------------------- #
+    # setup: the pre-push hook, exercised as a hook by real `git push` runs
+    # ------------------------------------------------------------------- #
+
+    class HookBase(SetupBase):
+        def hook_path(self, repo: str) -> str:
+            return os.path.join(repo, ".git", "hooks", "pre-push")
+
+        def read_hook(self, repo: str) -> str:
+            with open(self.hook_path(repo)) as fh:
+                return fh.read()
+
+        def setup_ok(self, repo: str, *extra: str) -> str:
+            code, out, err = run("-C", repo, "setup", *extra)
+            self.assertEqual(code, 0, err + out)
+            return out
+
+        def push(self, repo: str, *args: str):
+            """A real `git push` from the fork - the only way to test a hook as a hook."""
+            rc, out, err = git_rc("push", *args, cwd=repo)
+            return rc, out + err
+
+        def upstream_url(self, repo: str) -> str:
+            return sh("git", "remote", "get-url", "upstream", cwd=repo)
+
+        def advance_mirror_to_upstream(self, repo: str) -> str:
+            """Upstream moves, the fork fetches and fast-forwards `main`: now a push of the
+            mirror carries a real ref line (an up-to-date push feeds the hook nothing)."""
+            commit_upstream(self.tmp, "src/app.py", "def main():\n    return 3\n")
+            sh("git", "fetch", "upstream", cwd=repo)
+            sh("git", "switch", "main", cwd=repo)
+            sh("git", "merge", "--ff-only", "upstream/main", cwd=repo)
+            return rev(repo, "refs/heads/main")
+
+    class TestSetupHookInstall(HookBase):
+        def test_the_hook_is_installed_marked_and_executable(self):
+            fork = make_fork(self.tmp)
+            out = self.setup_ok(fork)
+            text = self.read_hook(fork)
+            self.assertIn(HOOK_MARK, text)
+            self.assertTrue(os.access(self.hook_path(fork), os.X_OK))
+            self.assertIn("refs/remotes/upstream/main", text)
+            self.assertIn("refs/heads/develop", text)
+            self.assertIn("refs/heads/main", text)
+            self.assertIn(self.upstream_url(fork), text)
+            self.assertIn("fetch before pushing the mirror", text)
+            self.assertIn("hook", out)
+            self.assertEqual(hook_state(ctx_for(fork)), "installed")
+
+        def test_the_names_of_a_renamed_layout_are_baked_in(self):
+            fork = make_fork(self.tmp, trunk="trunk", mirror="vendor")
+            self.setup_ok(fork, "--trunk", "trunk", "--mirror", "vendor")
+            text = self.read_hook(fork)
+            self.assertIn("trunk_ref='refs/heads/trunk'", text)
+            self.assertIn("mirror_ref='refs/heads/vendor'", text)
+
+        def test_a_second_setup_does_not_duplicate_the_hook(self):
+            fork = make_fork(self.tmp)
+            self.setup_ok(fork)
+            first = self.read_hook(fork)
+            self.setup_ok(fork)
+            self.assertEqual(self.read_hook(fork), first)
+            self.assertEqual(first.count(HOOK_MARK), 1)
+            self.assertFalse(os.path.exists(self.hook_path(fork) + ".pre-forkflow"))
+
+        def test_a_foreign_hook_is_refused_and_kept_by_force(self):
+            fork = make_fork(self.tmp)
+            os.makedirs(os.path.dirname(self.hook_path(fork)), exist_ok=True)
+            with open(self.hook_path(fork), "w") as fh:
+                fh.write("#!/bin/sh\n# someone else's hook\nexit 0\n")
+            code, out, err = run("-C", fork, "setup")
+            self.assertEqual(code, 2, out)
+            self.assertIn("--force", err)
+            self.assertIn("someone else's hook", self.read_hook(fork))
+            self.assertEqual(self.cfg(fork, "pull.ff"), "")        # stopped before the config step
+
+            self.setup_ok(fork, "--force")
+            self.assertIn(HOOK_MARK, self.read_hook(fork))
+            with open(self.hook_path(fork) + ".pre-forkflow") as fh:
+                self.assertIn("someone else's hook", fh.read())
+
+        def test_core_hookspath_is_refused_with_a_warning_and_forced(self):
+            fork = make_fork(self.tmp)
+            shared = os.path.join(self.tmp, "shared-hooks")
+            os.makedirs(shared)
+            sh("git", "config", "core.hooksPath", shared, cwd=fork)
+            code, out, err = run("-C", fork, "setup")
+            self.assertEqual(code, 2, out)
+            self.assertIn("WARNING", out)
+            self.assertIn("core.hooksPath", out)
+            self.assertFalse(os.path.exists(os.path.join(shared, "pre-push")))
+
+            out = self.setup_ok(fork, "--force")
+            self.assertIn("WARNING", out)
+            with open(os.path.join(shared, "pre-push")) as fh:
+                self.assertIn(HOOK_MARK, fh.read())
+
+        def test_dry_run_writes_no_hook(self):
+            fork = make_fork(self.tmp)
+            code, out, err = run("-C", fork, "setup", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("would install it", out)
+            self.assertFalse(os.path.exists(self.hook_path(fork)))
+
+    class TestSetupHookRefuses(HookBase):
+        def setUp(self):
+            super().setUp()
+            self.fork = make_fork(self.tmp)
+            self.setup_ok(self.fork)
+
+        def test_pushing_to_upstream_by_name_fails_before_the_hook(self):
+            rc, out = self.push(self.fork, "upstream", "main")
+            self.assertEqual(rc, 128, out)
+            self.assertIn("DISABLED", out)
+            self.assertNotIn("forkflow:", out)          # the push URL stopped it, not the hook
+
+        def test_pushing_to_the_upstream_url_is_refused_by_the_hook(self):
+            rc, out = self.push(self.fork, self.upstream_url(self.fork), "main")
+            self.assertEqual(rc, 1, out)
+            self.assertIn("never push to upstream", out)
+
+        def test_upstream_under_another_remote_name_is_refused_by_url(self):
+            sh("git", "remote", "add", "mirror-src", self.upstream_url(self.fork), cwd=self.fork)
+            rc, out = self.push(self.fork, "mirror-src", "main")
+            self.assertEqual(rc, 1, out)
+            self.assertIn("never push to upstream", out)
+
+        def test_the_trunk_cannot_be_pushed(self):
+            before = origin_sha(self.fork, "develop")
+            commit_fork(self.fork, "ours/feature.txt", "ours\n", "ours: on the trunk")
+            rc, out = self.push(self.fork, "origin", "develop")
+            self.assertEqual(rc, 1, out)
+            self.assertIn("never push the trunk", out)
+            self.assertEqual(origin_sha(self.fork, "develop"), before)
+
+        def test_the_trunk_cannot_be_deleted(self):
+            before = origin_sha(self.fork, "develop")
+            rc, out = self.push(self.fork, "origin", ":develop")
+            self.assertEqual(rc, 1, out)
+            self.assertIn("never push the trunk", out)
+            self.assertEqual(origin_sha(self.fork, "develop"), before)
+
+        def test_a_commit_on_the_mirror_cannot_be_pushed(self):
+            before = origin_sha(self.fork, "main")
+            sh("git", "switch", "main", cwd=self.fork)
+            commit_fork(self.fork, "ours/local.txt", "ours\n", "ours: on the mirror")
+            rc, out = self.push(self.fork, "origin", "main")
+            self.assertEqual(rc, 1, out)
+            self.assertIn("pure copy of upstream", out)
+            self.assertEqual(origin_sha(self.fork, "main"), before)
+
+        def test_the_mirror_cannot_be_deleted(self):
+            before = origin_sha(self.fork, "main")
+            rc, out = self.push(self.fork, "origin", ":main")
+            self.assertEqual(rc, 1, out)
+            self.assertIn("refusing to delete the mirror", out)
+            self.assertEqual(origin_sha(self.fork, "main"), before)
+
+        def test_the_mirror_is_refused_when_upstream_is_not_fetched(self):
+            self.advance_mirror_to_upstream(self.fork)
+            sh("git", "update-ref", "-d", "refs/remotes/upstream/main", cwd=self.fork)
+            before = origin_sha(self.fork, "main")
+            rc, out = self.push(self.fork, "origin", "main")
+            self.assertEqual(rc, 1, out)
+            self.assertIn("cannot verify the mirror", out)
+            self.assertIn("git fetch upstream", out)
+            self.assertEqual(origin_sha(self.fork, "main"), before)
+
+    class TestSetupHookAllows(HookBase):
+        def setUp(self):
+            super().setUp()
+            self.fork = make_fork(self.tmp)
+            self.setup_ok(self.fork)
+
+        def test_a_mirror_that_is_a_copy_of_upstream_is_pushed(self):
+            target = self.advance_mirror_to_upstream(self.fork)
+            self.assertNotEqual(origin_sha(self.fork, "main"), target)   # a real ref line
+            rc, out = self.push(self.fork, "origin", "main")
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(origin_sha(self.fork, "main"), target)
+
+        def test_feature_branches_are_pushed_and_can_be_deleted(self):
+            sh("git", "switch", "-c", "feat/x", cwd=self.fork)
+            commit_fork(self.fork, "ours/feature.txt", "ours\n", "ours: a feature")
+            rc, out = self.push(self.fork, "origin", "feat/x")
+            self.assertEqual(rc, 0, out)
+            self.assertNotEqual(origin_sha(self.fork, "feat/x"), "")
+
+            rc, out = self.push(self.fork, "origin", "HEAD:refs/heads/sync/stale")
+            self.assertEqual(rc, 0, out)
+            rc, out = self.push(self.fork, "origin", ":sync/stale")
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(origin_sha(self.fork, "sync/stale"), "")
+
+        def test_sync_still_works_with_the_hook_installed(self):
+            commit_upstream(self.tmp, "src/app.py", "def main():\n    return 4\n")
+            code, out, err = run("-C", self.fork, "sync")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(origin_sha(self.fork, "main"), rev(self.fork, "refs/remotes/upstream/main"))
+            self.assertNotEqual(origin_sha(self.fork, sync_branch_name()), "")
+
+    # ------------------------------------------------------------------- #
     # merge requests
     # ------------------------------------------------------------------- #
 
@@ -4112,6 +4429,7 @@ def run_tests() -> None:
                  TestBootstrapTrunk, TestBackup, TestSimulateMerge, TestSimulateMergeOldGit,
                  TestStatus, TestCheck, TestSync, TestSyncConflicts,
                  TestShip, TestShipErrors, TestSetup,
+                 TestSetupHookInstall, TestSetupHookRefuses, TestSetupHookAllows,
                  TestMrCommand, TestOpenMr, TestMrEndToEnd,
                  TestParseArgs, TestMainWiring):
         suite.addTests(loader.loadTestsFromTestCase(case))

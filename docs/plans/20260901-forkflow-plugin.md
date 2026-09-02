@@ -669,10 +669,15 @@ step-by-step document with its real branch names and SHAs with that project, not
 **Files:**
 - Modify: `plugins/forkflow/scripts/forkflow.py`
 
-- [ ] hook path joined to root from `git rev-parse --git-path hooks`, `makedirs`; `core.hooksPath` set -> WARNING + 2 unless `--force`; foreign hook -> 2 unless `--force` (kept as `pre-push.pre-forkflow`); marked hook rewritten idempotently; executable bit
-- [ ] hook content exactly as in the `setup` block: upstream refused by name **or** URL; trunk refused incl. deletion; mirror deletion refused; mirror push allowed only on `--is-ancestor` rc 0, refused with distinct messages on rc 1 and rc >= 2; other refs and their deletions allowed; the last-fetch comment line
-- [ ] write tests (real `git push` from the fork after `setup`): `git push upstream main` -> 128 mentioning `DISABLED` (push URL, not the hook); `git push <upstream fetch URL> main` -> refused by the hook (URL match); a remote `mirror-src` with the upstream URL under another name -> `git push mirror-src main` refused by the hook (URL match); `git push origin develop` and `git push origin :develop` refused; **advance upstream, ff the local mirror, then `git push origin main` succeeds and the hook saw a ref line** (assert via the hook writing its stdin to a temp log in test mode, or via `origin/main` moving); commit on local `main` then `git push origin main` refused with "pure copy"; delete `refs/remotes/<upstream>/main` then `git push origin main` refused with "cannot verify"; `git push origin :main` refused; feature-branch push allowed; `git push origin :sync/x` allowed; second `setup` does not duplicate the hook; foreign hook -> 2, `--force` keeps a copy; `core.hooksPath` set -> 2 with WARNING, `--force` proceeds
-- [ ] run tests - must pass before task 11
+- [x] hook path joined to root from `git rev-parse --git-path hooks`, `makedirs`; `core.hooksPath` set -> WARNING + 2 unless `--force`; foreign hook -> 2 unless `--force` (kept as `pre-push.pre-forkflow`); marked hook rewritten idempotently; executable bit
+- [x] hook content exactly as in the `setup` block: upstream refused by name **or** URL; trunk refused incl. deletion; mirror deletion refused; mirror push allowed only on `--is-ancestor` rc 0, refused with distinct messages on rc 1 and rc >= 2; other refs and their deletions allowed; the last-fetch comment line
+- [x] write tests (real `git push` from the fork after `setup`): `git push upstream main` -> 128 mentioning `DISABLED` (push URL, not the hook); `git push <upstream fetch URL> main` -> refused by the hook (URL match); a remote `mirror-src` with the upstream URL under another name -> `git push mirror-src main` refused by the hook (URL match); `git push origin develop` and `git push origin :develop` refused; **advance upstream, ff the local mirror, then `git push origin main` succeeds and the hook saw a ref line** (assert via the hook writing its stdin to a temp log in test mode, or via `origin/main` moving); commit on local `main` then `git push origin main` refused with "pure copy"; delete `refs/remotes/<upstream>/main` then `git push origin main` refused with "cannot verify"; `git push origin :main` refused; feature-branch push allowed; `git push origin :sync/x` allowed; second `setup` does not duplicate the hook; foreign hook -> 2, `--force` keeps a copy; `core.hooksPath` set -> 2 with WARNING, `--force` proceeds
+- [x] run tests - must pass before task 11
+- ➕ [x] "the hook saw a ref line" is proven by `origin/main` moving after an upstream advance
+  (the alternative, a test-only stdin log inside the installed hook, would have put test
+  machinery in the artifact the workflow's safety rests on)
+- ➕ [x] a `sync` run with the hook installed is tested end to end: the hook must not refuse
+  the pushes forkflow itself makes (mirror fast-forward, sync branch)
 
 ### Task 11: `setup` - platform report
 
