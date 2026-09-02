@@ -606,12 +606,12 @@ step-by-step document with its real branch names and SHAs with that project, not
 **Files:**
 - Modify: `plugins/forkflow/scripts/forkflow.py`
 
-- [ ] conflict path: merge rc != 0 with unmerged paths -> files listed, markers left, sync branch stays checked out, exit 4, hint `forkflow sync --continue` printed
-- [ ] `--continue`: precondition current branch has `sync_prefix` and no unmerged paths (else 2); commit the merge with `git commit --no-edit` if `MERGE_HEAD` exists; resume at verify with ours=`HEAD^1`, theirs=`HEAD^2` -> check -> push -> MR
-- [ ] `both_sides_survived(ctx, ours, theirs)`: `mb`, both-sides file set, per file `ours a/b`, `theirs c/d` (added lines present, removed lines absent, stripped comparison); deleted-in-result, binary and renamed files -> `CHECK <reason>` row; any shortfall -> `CHECK`; summary line naming flagged files
-- [ ] write tests: conflicting upstream change (same lines of `shared.tf`) -> exit 4, markers present, trunk unchanged, mirror already advanced and pushed; resolve in test, `git add`, `--continue` -> merge committed, table shows both sides `n/n`, branch pushed, exit 0; clean-but-both-sides file (different hunks of `shared.tf`) appears in the table with full counts; **the mirror and `origin/<trunk>` are moved between the conflicting run and `--continue` and the table is unchanged**
-- [ ] write tests: `--continue` with unmerged paths -> 2; `--continue` not on a sync branch -> 2; `CHECK` flagged when a resolution drops one side's lines; delete/modify collision -> `CHECK deleted` row, exit 0; binary file changed on both sides -> `CHECK binary`
-- [ ] run tests - must pass before task 7
+- [x] conflict path: merge rc != 0 with unmerged paths -> files listed, markers left, sync branch stays checked out, exit 4, hint `forkflow sync --continue` printed
+- [x] `--continue`: precondition current branch has `sync_prefix` and no unmerged paths (else 2); commit the merge with `git commit --no-edit` if `MERGE_HEAD` exists; resume at verify with ours=`HEAD^1`, theirs=`HEAD^2` -> check -> push -> MR
+- [x] `both_sides_survived(ctx, ours, theirs)`: `mb`, both-sides file set, per file `ours a/b`, `theirs c/d` (added lines present, removed lines absent, stripped comparison); deleted-in-result, binary and renamed files -> `CHECK <reason>` row; any shortfall -> `CHECK`; summary line naming flagged files
+- [x] write tests: conflicting upstream change (same lines of `shared.tf`) -> exit 4, markers present, trunk unchanged, mirror already advanced and pushed; resolve in test, `git add`, `--continue` -> merge committed, table shows both sides `n/n`, branch pushed, exit 0; clean-but-both-sides file (different hunks of a 20-line `notes.txt`) appears in the table with full counts; **the mirror and `origin/<trunk>` are moved between the conflicting run and `--continue` and the table is unchanged**
+- [x] write tests: `--continue` with unmerged paths -> 2; `--continue` not on a sync branch -> 2 (and on a sync branch with no merge -> 2 "nothing to continue"); `CHECK` flagged when a resolution drops one side's lines; delete/modify collision -> `CHECK deleted` row, exit 0; binary file changed on both sides -> `CHECK binary`
+- [x] run tests - must pass before task 7
 
 ### Task 7: `ship`
 

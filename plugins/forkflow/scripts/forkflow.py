@@ -67,6 +67,8 @@ DEFAULT_BACKUP_PREFIX = "backup/"
 README_POINTER = "See README, *Adopting forkflow in an existing fork*"
 GATE_TAIL = 12                       # lines of a failing gate command's output that are shown
 MERGE_TREE_GIT = (2, 38)             # `git merge-tree --write-tree` - older git skips the simulation
+BOTH_SIDES_SNIFF = 8192              # bytes of a blob looked at for a NUL before it is "binary"
+BOTH_SIDES_WIDTH = 48                # column the both-sides table pads paths to
 
 # What each backup is for, printed with the rollback line so the restore point is understood.
 BACKUP_PURPOSE = {
@@ -948,28 +950,119 @@ def fetch_both(ctx: Ctx) -> None:
     step("fetch", cmd, ", ".join(moved))
 
 
+def blob(ctx: Ctx, ref: str, path: str) -> Optional[str]:
+    """Content of `<ref>:<path>`, None when that tree does not carry the path."""
+    rc, out, _ = git_rc("show", f"{ref}:{path}", cwd=ctx.root)
+    return None if rc != 0 else out
+
+
+def line_counts(text: str) -> dict:
+    """How often each non-blank stripped line occurs.
+
+    Removals are judged by count, not by presence: a `}` that one side deleted has not
+    survived just because the file still has other closing braces."""
+    seen = {}
+    for line in text.splitlines():
+        s = line.strip()
+        if s:
+            seen[s] = seen.get(s, 0) + 1
+    return seen
+
+
+def side_lines(ctx: Ctx, mb: str, side: str, path: str) -> Tuple[list, list]:
+    """(added, removed) non-blank stripped lines of `git diff <mb> <side> -- <path>`."""
+    rc, out, _ = git_rc("diff", "--no-color", "--no-ext-diff", "--no-renames",
+                        mb, side, "--", path, cwd=ctx.root)
+    added, removed = [], []
+    for line in out.splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            bucket = added
+        elif line.startswith("-"):
+            bucket = removed
+        else:
+            continue
+        text = line[1:].strip()
+        if text:
+            bucket.append(text)
+    return added, removed
+
+
+def side_survived(added: Sequence[str], removed: Sequence[str],
+                  base: dict, merged: dict) -> Tuple[int, int]:
+    """(checks met, checks made) for one side: its additions are there, its deletions are gone."""
+    met = 0
+    for line in added:
+        if merged.get(line, 0) > 0:
+            met += 1
+    for line in removed:
+        if merged.get(line, 0) < base.get(line, 0):
+            met += 1
+    return met, len(added) + len(removed)
+
+
+def both_sides_row(ctx: Ctx, mb: str, ours: str, theirs: str, path: str, renamed: set) -> str:
+    """One table row: what happened to each side's lines in the merged file."""
+    if path in renamed:
+        return "CHECK renamed on one side - compare the old and the new path yourself"
+    merged_text = blob(ctx, "HEAD", path)
+    if merged_text is None:
+        return "CHECK deleted in the merge result - confirm both sides meant that"
+    base_text = blob(ctx, mb, path) or ""
+    if "\0" in merged_text[:BOTH_SIDES_SNIFF] or "\0" in base_text[:BOTH_SIDES_SNIFF]:
+        return "CHECK binary - compare it with a tool that understands the format"
+    merged, base = line_counts(merged_text), line_counts(base_text)
+    parts, missing = [], []
+    for label, side in (("ours", ours), ("theirs", theirs)):
+        added, removed = side_lines(ctx, mb, side, path)
+        met, made = side_survived(added, removed, base, merged)
+        parts.append(f"{label} {met}/{made}")
+        if met < made:
+            missing.append(f"{made - met} of {label}")
+    row = "  ".join(parts)
+    if missing:
+        row += "  CHECK " + " and ".join(missing) + " did not survive"
+    return row
+
+
 def both_sides_survived(ctx: Ctx, ours: str, theirs: str) -> list:
     """Files changed on both sides of the merge that was actually made.
 
     A clean merge is not automatically a correct one: the file that motivated this check
-    merged clean and still had to be looked at. Advisory - the exit code never changes."""
+    merged clean and still had to be looked at. Advisory - the exit code never changes.
+    Returns [(path, row)] for the merge-request body."""
     mb = git("merge-base", ours, theirs, cwd=ctx.root, check=False)
     cmd = f"git diff --name-only {short(mb)} {ours} / {theirs}"
     if not mb:
         step("verify", cmd, f"no merge base between {ours} and {theirs}")
         return []
-    changed = []
+    changed, renamed = [], set()
     for side in (ours, theirs):
-        out = git("diff", "--name-only", mb, side, cwd=ctx.root, check=False)
+        out = git("diff", "--name-only", "--no-renames", mb, side, cwd=ctx.root, check=False)
         changed.append(set(f for f in out.splitlines() if f))
+        status = git("diff", "--name-status", "--find-renames", mb, side,
+                     cwd=ctx.root, check=False)
+        for line in status.splitlines():
+            fields = line.split("\t")
+            if fields and fields[0].startswith("R"):
+                renamed.update(f for f in fields[1:] if f)
     files = sorted(changed[0] & changed[1])
     if not files:
         step("verify", cmd, "no file was changed on both sides")
         return []
     step("verify", cmd, f"{len(files)} file(s) changed on both sides")
+    width = min(max(len(f) for f in files), BOTH_SIDES_WIDTH)
+    rows = []
     for f in files:
-        print(f"    {f}")
-    return files
+        row = both_sides_row(ctx, mb, ours, theirs, f, renamed)
+        print(f"    {f.ljust(width)}  {row}")
+        rows.append((f, row))
+    flagged = [f for f, row in rows if "CHECK" in row]
+    if flagged:
+        print(f"    CHECK: look at {', '.join(flagged)} yourself - "
+              f"a clean merge is not automatically a correct one")
+    return rows
 
 
 def make_sync_branch(ctx: Ctx, name: str, force: bool) -> None:
@@ -1019,7 +1112,7 @@ def merge_upstream(ctx: Ctx, name: str, target: str, commits: Sequence[str]) -> 
                f"then run `forkflow sync --continue`", 4)
 
 
-def sync_body(ctx: Ctx, commits: Sequence[str], both: Sequence[str],
+def sync_body(ctx: Ctx, commits: Sequence[str], both: Sequence[Tuple[str, str]],
               mirror_move: Tuple[str, str], backup_ref: str) -> str:
     """What the reviewer of a sync MR needs: what came in, what was touched on both sides,
     where the mirror stands, how to get back, and which button to press."""
@@ -1027,20 +1120,132 @@ def sync_body(ctx: Ctx, commits: Sequence[str], both: Sequence[str],
     lines = [f"Merge `{ctx.mirror}` (mirror of `{ctx.up()}`) into `{ctx.trunk}`.", "",
              f"Upstream commits taken ({len(commits)}):", ""]
     lines += [f"- {c}" for c in commits] or ["- (none)"]
-    lines += ["", f"Files changed on both sides: "
-                  + (", ".join(f"`{f}`" for f in both) if both else "none"),
-              "", f"Mirror `{ctx.mirror}`: {short(old)} -> {short(new)} (pushed to {ctx.origin})",
-              f"Backup of `{ctx.origin}/{ctx.trunk}` from before this sync: `{backup_ref}`",
-              f"Rollback: `git reset --hard {ctx.origin}/{backup_ref}`",
-              "", f"Merge button: {merge_button(ctx, 'sync')}."]
+    if both:
+        lines += ["", f"Files changed on both sides ({len(both)}):", ""]
+        lines += [f"- `{f}` - {row}" for f, row in both]
+    else:
+        lines += ["", "Files changed on both sides: none"]
+    lines += [""]
+    if old and new and old != new:
+        lines.append(f"Mirror `{ctx.mirror}`: {short(old)} -> {short(new)} "
+                     f"(pushed to {ctx.origin})")
+    else:
+        lines.append(f"Mirror `{ctx.mirror}`: at {short(new or old)}")
+    if backup_ref:
+        lines += [f"Backup of `{ctx.origin}/{ctx.trunk}` from before this sync: `{backup_ref}`",
+                  f"Rollback: `git reset --hard {ctx.origin}/{backup_ref}`"]
+    lines += ["", f"Merge button: {merge_button(ctx, 'sync')}."]
     return "\n".join(lines)
+
+
+def merge_in_progress(ctx: Ctx) -> bool:
+    """True while a merge is resolved but not committed (`MERGE_HEAD` still there)."""
+    path = git("rev-parse", "--git-path", "MERGE_HEAD", cwd=ctx.root, check=False)
+    if path and not os.path.isabs(path):
+        path = os.path.join(ctx.root, path)
+    return bool(path) and os.path.exists(path)
+
+
+def unmerged_paths(ctx: Ctx) -> list:
+    """Paths still carrying conflict markers."""
+    out = git("diff", "--name-only", "--diff-filter=U", cwd=ctx.root, check=False)
+    return [f for f in out.splitlines() if f]
+
+
+def last_backup(ctx: Ctx, reason: str) -> str:
+    """Newest local backup branch of this kind - what `--continue` reports without state."""
+    out = git("for-each-ref", "--format=%(refname:short)",
+              f"refs/heads/{ctx.backup_prefix}*-{reason}", cwd=ctx.root, check=False)
+    names = sorted([ln for ln in out.splitlines() if ln], reverse=True)
+    return names[0] if names else ""
+
+
+def finish_sync(ctx: Ctx, args: argparse.Namespace, name: str, commits: Sequence[str],
+                rows: Sequence[Tuple[str, str]], mirror_move: Tuple[str, str],
+                backup_ref: str) -> int:
+    """check -> push -> merge request: the tail both `sync` and `sync --continue` run."""
+    hint = "  fix that, then: forkflow sync --continue"
+    if ctx.dry_run:
+        step("check", "forkflow check", "not run (dry run)", dry=True)
+    elif run_check(ctx) == 3:
+        print(hint)
+        return 3
+
+    try:
+        push(ctx, name)
+    except Fail as exc:
+        if exc.code == 5:
+            print(hint)
+        raise
+
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
+    title = getattr(args, "title", None) or f"sync: {ctx.up()} {stamp} ({len(commits)} commits)"
+    open_mr(ctx, name, title, sync_body(ctx, commits, rows, mirror_move, backup_ref),
+            bool(getattr(args, "mr", False)))
+    print(f"  after the MR is merged: git fetch {ctx.origin} && git switch {ctx.trunk} "
+          f"&& git merge --ff-only {ctx.origin}/{ctx.trunk}")
+    return 0
+
+
+def cmd_sync_continue(ctx: Ctx, args: argparse.Namespace) -> int:
+    """Resume the sync the conflicted run left on the sync branch.
+
+    Verification uses the parents of the merge that was actually made, so a mirror or a
+    trunk that moved in the meantime cannot change what is checked."""
+    name = current_branch(ctx)
+    where = f"on `{name}`" if name else "a detached HEAD"
+    if not name or not name.startswith(ctx.sync_prefix):
+        raise Fail(f"`--continue` resumes a sync: switch to the `{ctx.sync_prefix}...` branch "
+                   f"the conflicted run left you on (HEAD is {where})")
+
+    unmerged = unmerged_paths(ctx)
+    if unmerged:
+        step("continue", "git diff --name-only --diff-filter=U",
+             f"{len(unmerged)} file(s) still unmerged")
+        for f in unmerged:
+            print(f"    {f}")
+        raise Fail("resolve the conflicts and `git add` them, "
+                   "then run `forkflow sync --continue` again")
+
+    merging = merge_in_progress(ctx)
+    parents = git("rev-list", "--parents", "-n", "1", "HEAD", cwd=ctx.root, check=False).split()
+    committed = len(parents) >= 3
+    if not merging and not committed:
+        raise Fail(f"nothing to continue: `{name}` carries no sync merge - "
+                   f"run `forkflow sync`")
+    if merging:
+        cmd = "git commit --no-edit"
+        if ctx.dry_run:
+            step("continue", cmd, "would commit the resolved merge", dry=True)
+        else:
+            rc, out, err = git_rc("commit", "--no-edit", cwd=ctx.root)
+            if rc != 0:
+                raise Fail(f"cannot commit the resolved merge:\n{(err or out).strip()}")
+            committed = True
+            step("continue", cmd, f"merge commit {short(rev(ctx.root, 'HEAD'))}")
+    else:
+        step("continue", "git rev-parse MERGE_HEAD", "the merge is already committed")
+
+    if committed:
+        log = git("log", "--oneline", "--no-decorate", "HEAD^1..HEAD^2",
+                  cwd=ctx.root, check=False)
+        commits = [ln for ln in log.splitlines() if ln]
+        rows = both_sides_survived(ctx, "HEAD^1", "HEAD^2")
+    else:                                   # dry run over an uncommitted merge
+        step("verify", "git diff HEAD^1 / HEAD^2",
+             "not run (dry run: the merge is not committed)", dry=True)
+        commits, rows = [], []
+
+    mirror_sha = rev(ctx.root, f"refs/heads/{ctx.mirror}")
+    return finish_sync(ctx, args, name, commits, rows, (mirror_sha, mirror_sha),
+                       last_backup(ctx, "pre-sync"))
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
     ctx = resolve_ctx(args.dir, args, need_upstream=True, need_trunk=True, strict_mirror=True)
     header(ctx, "sync")
     if getattr(args, "cont", False):
-        raise Fail("`forkflow sync --continue` is not implemented yet")
+        return cmd_sync_continue(ctx, args)
 
     branch = current_branch(ctx)
     if not branch:
@@ -1087,31 +1292,12 @@ def cmd_sync(args: argparse.Namespace) -> int:
     make_sync_branch(ctx, name, force=bool(getattr(args, "force", False)))
     merge_upstream(ctx, name, target, commits)
 
-    hint = "  fix that, then: forkflow sync --continue"
     if ctx.dry_run:
         step("verify", "git diff HEAD^1 / HEAD^2", "not run (dry run)", dry=True)
-        step("check", "forkflow check", "not run (dry run)", dry=True)
-        both = []
+        rows = []
     else:
-        both = both_sides_survived(ctx, "HEAD^1", "HEAD^2")
-        if run_check(ctx) == 3:
-            print(hint)
-            return 3
-
-    try:
-        push(ctx, name)
-    except Fail as exc:
-        if exc.code == 5:
-            print(hint)
-        raise
-
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
-    title = getattr(args, "title", None) or f"sync: {ctx.up()} {stamp} ({len(commits)} commits)"
-    open_mr(ctx, name, title, sync_body(ctx, commits, both, mirror_move, backup_ref),
-            bool(getattr(args, "mr", False)))
-    print(f"  after the MR is merged: git fetch {ctx.origin} && git switch {ctx.trunk} "
-          f"&& git merge --ff-only {ctx.origin}/{ctx.trunk}")
-    return 0
+        rows = both_sides_survived(ctx, "HEAD^1", "HEAD^2")
+    return finish_sync(ctx, args, name, commits, rows, mirror_move, backup_ref)
 
 
 def cmd_ship(args: argparse.Namespace) -> int:
@@ -1248,10 +1434,11 @@ def run_tests() -> None:
             os.environ.clear()
             os.environ.update(saved)
 
-    def write(root: str, path: str, text: str) -> str:
+    def write(root: str, path: str, text) -> str:
+        """Text, or bytes for the binary cases the both-sides table has to flag."""
         full = os.path.join(root, path)
         os.makedirs(os.path.dirname(full), exist_ok=True)
-        with open(full, "w") as fh:
+        with open(full, "wb" if isinstance(text, bytes) else "w") as fh:
             fh.write(text)
         return full
 
@@ -1396,6 +1583,10 @@ def run_tests() -> None:
 
     def local_branches(fork: str) -> str:
         return sh("git", "for-each-ref", "--format=%(refname)", "refs/heads/", cwd=fork)
+
+    def sync_branch_name(remote: str = "upstream") -> str:
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
+        return "%s%s-%s" % (DEFAULT_SYNC_PREFIX, remote, stamp)
 
     def capture(fn, *a, **kw):
         out, err = io.StringIO(), io.StringIO()
@@ -2273,8 +2464,7 @@ def run_tests() -> None:
 
     class TestSync(Base):
         def sync_name(self, remote: str = "upstream") -> str:
-            stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
-            return "%s%s-%s" % (DEFAULT_SYNC_PREFIX, remote, stamp)
+            return sync_branch_name(remote)
 
         def ahead_upstream(self, fork: str, n: int = 1) -> str:
             for i in range(n):
@@ -2501,6 +2691,196 @@ def run_tests() -> None:
             self.assertEqual(origin_sha(fork, self.sync_name()), "")   # nothing was pushed
             self.assertEqual(origin_sha(fork, "develop"), before_trunk)
 
+    class TestSyncConflicts(Base):
+        """The conflict path, `sync --continue`, and the both-sides table."""
+
+        BASE_TF = 'resource "null_resource" "a" {\n  count = 1\n}\n'
+
+        def block(self, who: str) -> str:
+            return '\nresource "null_resource" "%s" {\n  count = 1\n}\n' % who
+
+        def conflicting_fork(self) -> str:
+            """Both sides change the same line of shared.tf."""
+            fork = make_fork(self.tmp)
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "ours: shared", push=True)
+            commit_upstream(self.tmp, "shared.tf",
+                            self.BASE_TF.replace("count = 1", "count = 3"), "theirs: shared")
+            return fork
+
+        def appending_fork(self) -> str:
+            """Both sides append a different block: a conflict a resolution can keep both of."""
+            fork = make_fork(self.tmp)
+            commit_fork(fork, "shared.tf", self.BASE_TF + self.block("ours"),
+                        "ours: shared", push=True)
+            commit_upstream(self.tmp, "shared.tf", self.BASE_TF + self.block("theirs"),
+                            "theirs: shared")
+            return fork
+
+        def take_upstream_into_trunk(self, fork: str) -> None:
+            """Test setup: publish upstream's tip as the trunk, as a merged sync MR would,
+            so a later merge base carries the files both sides then change."""
+            push_upstream_into_origin(self.tmp, "develop")
+            sh("git", "fetch", "origin", cwd=fork)
+            sh("git", "checkout", "develop", cwd=fork)
+            sh("git", "reset", "--hard", "origin/develop", cwd=fork)
+
+        def resolve(self, fork: str, text, path: str = "shared.tf") -> None:
+            write(fork, path, text)
+            sh("git", "add", path, cwd=fork)
+
+        def row_for(self, out: str, path: str) -> str:
+            rows = [ln.strip() for ln in out.splitlines()
+                    if ln.startswith("    " + path) and ("ours " in ln or "CHECK" in ln)]
+            self.assertTrue(rows, "no both-sides row for %s in:\n%s" % (path, out))
+            return rows[0]
+
+        def counts(self, row: str):
+            m = re.search(r"ours (\d+)/(\d+)\s+theirs (\d+)/(\d+)", row)
+            self.assertIsNotNone(m, "no counts in row: " + row)
+            return tuple(int(g) for g in m.groups())
+
+        def test_conflict_is_exit_4_with_markers_and_an_untouched_trunk(self):
+            fork = self.conflicting_fork()
+            name = sync_branch_name()
+            before_trunk = origin_sha(fork, "develop")
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 4, err + out)
+            self.assertIn("forkflow sync --continue", err)
+            self.assertIn("conflicting file(s)", out)
+            self.assertIn("    shared.tf", out)
+            with open(os.path.join(fork, "shared.tf")) as fh:
+                self.assertIn("<<<<<<<", fh.read())
+            self.assertEqual(checked_out(fork), name)                  # left on the sync branch
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+            self.assertEqual(origin_sha(fork, name), "")               # nothing pushed yet
+            # the mirror step ran before the merge and is complete on its own
+            self.assertEqual(rev(fork, "refs/heads/main"), rev(fork, "upstream/main"))
+            self.assertEqual(origin_sha(fork, "main"), rev(fork, "upstream/main"))
+
+        def test_continue_after_a_resolution_that_keeps_both_sides(self):
+            fork = self.appending_fork()
+            self.assertEqual(run("-C", fork, "sync")[0], 4)
+            name = sync_branch_name()
+            target = rev(fork, "upstream/main")
+            before_trunk = origin_sha(fork, "develop")
+            self.resolve(fork, self.BASE_TF + self.block("ours") + self.block("theirs"))
+
+            code, out, err = run("-C", fork, "sync", "--continue")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("merge commit", out)
+            self.assertEqual(rev(fork, name + "^2"), target)
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+            row = self.row_for(out, "shared.tf")
+            ours_met, ours_made, theirs_met, theirs_made = self.counts(row)
+            self.assertTrue(ours_made and theirs_made, row)
+            self.assertEqual((ours_met, theirs_met), (ours_made, theirs_made), row)
+            self.assertNotIn("CHECK", row)
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+            self.assertEqual(checked_out(fork), name)
+
+        def test_clean_file_changed_on_both_sides_is_listed_with_full_counts(self):
+            fork = make_fork(self.tmp)
+            base = ["line %02d" % i for i in range(1, 21)]
+            commit_upstream(self.tmp, "notes.txt", "\n".join(base) + "\n", "theirs: notes")
+            self.take_upstream_into_trunk(fork)
+            ours = list(base)
+            ours[1] = "line 02 - ours"
+            commit_fork(fork, "notes.txt", "\n".join(ours) + "\n", "ours: top", push=True)
+            theirs = list(base)
+            theirs[18] = "line 19 - theirs"
+            commit_upstream(self.tmp, "notes.txt", "\n".join(theirs) + "\n", "theirs: bottom")
+
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 0, err + out)
+            row = self.row_for(out, "notes.txt")
+            self.assertEqual(self.counts(row), (2, 2, 2, 2), row)   # one added, one removed each
+            self.assertNotIn("CHECK", row)
+            merged = sh("git", "show", "HEAD:notes.txt", cwd=fork)
+            self.assertIn("line 02 - ours", merged)
+            self.assertIn("line 19 - theirs", merged)
+
+        def test_refs_moving_between_the_runs_does_not_change_the_table(self):
+            fork = self.appending_fork()
+            self.assertEqual(run("-C", fork, "sync")[0], 4)
+            name = sync_branch_name()
+            target = rev(fork, "upstream/main")
+            self.resolve(fork, self.BASE_TF + self.block("ours") + self.block("theirs"))
+
+            # both long-lived refs move behind the sync branch's back
+            commit_upstream(self.tmp, "docs/later.md", "later\n", "theirs: later")
+            sh("git", "fetch", "upstream", cwd=fork)
+            sh("git", "update-ref", "refs/heads/main", rev(fork, "upstream/main"), cwd=fork)
+            second_clone_commit(self.tmp)
+            self.assertNotEqual(rev(fork, "refs/heads/main"), target)
+
+            code, out, err = run("-C", fork, "sync", "--continue")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(fork, name + "^2"), target)     # the merge that was made
+            row = self.row_for(out, "shared.tf")
+            ours_met, ours_made, theirs_met, theirs_made = self.counts(row)
+            self.assertEqual((ours_met, theirs_met), (ours_made, theirs_made), row)
+            self.assertNotIn("later.md", out)                    # not part of this sync
+
+        def test_continue_with_unmerged_paths_is_exit_2(self):
+            fork = self.conflicting_fork()
+            self.assertEqual(run("-C", fork, "sync")[0], 4)
+            code, out, err = run("-C", fork, "sync", "--continue")
+            self.assertEqual(code, 2)
+            self.assertIn("still unmerged", out)
+            self.assertIn("    shared.tf", out)
+            self.assertIn("resolve the conflicts", err)
+            self.assertEqual(origin_sha(fork, sync_branch_name()), "")
+
+        def test_continue_off_a_sync_branch_and_with_nothing_to_continue(self):
+            fork = make_fork(self.tmp)
+            code, out, err = run("-C", fork, "sync", "--continue")
+            self.assertEqual(code, 2)
+            self.assertIn("--continue", err)
+            self.assertIn("develop", err)
+
+            sh("git", "checkout", "-b", sync_branch_name(), "develop", cwd=fork)
+            code, out, err = run("-C", fork, "sync", "--continue")
+            self.assertEqual(code, 2)
+            self.assertIn("nothing to continue", err)
+
+        def test_a_resolution_that_drops_one_side_is_flagged_check(self):
+            fork = self.appending_fork()
+            self.assertEqual(run("-C", fork, "sync")[0], 4)
+            self.resolve(fork, self.BASE_TF + self.block("theirs"))   # ours' block dropped
+            code, out, err = run("-C", fork, "sync", "--continue")
+            self.assertEqual(code, 0, err + out)                      # advisory, never a failure
+            row = self.row_for(out, "shared.tf")
+            self.assertIn("of ours did not survive", row)
+            self.assertIn("CHECK: look at shared.tf", out)
+
+        def test_delete_modify_collision_is_flagged_deleted(self):
+            fork = make_fork(self.tmp)
+            sh("git", "rm", "README.md", cwd=fork)
+            sh("git", "commit", "-m", "ours: drop the readme", cwd=fork)
+            sh("git", "push", "origin", "develop:refs/heads/develop", cwd=fork)
+            commit_upstream(self.tmp, "README.md", "# project moved\n", "theirs: readme")
+
+            self.assertEqual(run("-C", fork, "sync")[0], 4)
+            sh("git", "rm", "-f", "README.md", cwd=fork)              # keep the deletion
+            code, out, err = run("-C", fork, "sync", "--continue")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("CHECK deleted", self.row_for(out, "README.md"))
+
+        def test_binary_changed_on_both_sides_is_flagged_binary(self):
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "logo.bin", b"\x00\x01 base\n", "theirs: logo")
+            self.take_upstream_into_trunk(fork)
+            commit_fork(fork, "logo.bin", b"\x00\x01 ours\n", "ours: logo", push=True)
+            commit_upstream(self.tmp, "logo.bin", b"\x00\x01 theirs\n", "theirs: logo again")
+
+            self.assertEqual(run("-C", fork, "sync")[0], 4)
+            sh("git", "checkout", "--ours", "--", "logo.bin", cwd=fork)
+            sh("git", "add", "logo.bin", cwd=fork)
+            code, out, err = run("-C", fork, "sync", "--continue")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("CHECK binary", self.row_for(out, "logo.bin"))
+
     # ------------------------------------------------------------------- #
     # argument parsing and main
     # ------------------------------------------------------------------- #
@@ -2556,7 +2936,8 @@ def run_tests() -> None:
     for case in (TestDetectPlatform, TestGitVersion, TestLoadConfig, TestResolveCtx,
                  TestCleanTree, TestPush, TestPushMirror, TestAdvanceMirror,
                  TestBootstrapTrunk, TestBackup, TestSimulateMerge, TestSimulateMergeOldGit,
-                 TestStatus, TestCheck, TestSync, TestParseArgs, TestMainWiring):
+                 TestStatus, TestCheck, TestSync, TestSyncConflicts,
+                 TestParseArgs, TestMainWiring):
         suite.addTests(loader.loadTestsFromTestCase(case))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)
