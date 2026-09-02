@@ -51,8 +51,10 @@ import argparse
 import datetime
 import os
 import re
+import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Optional, Sequence, Tuple
@@ -118,6 +120,14 @@ def tail_lines(text: str, count: int) -> list:
     """The last `count` non-blank lines - what a failing gate command is judged by."""
     lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
     return lines[-count:]
+
+
+def write_temp(text: str, name: str) -> str:
+    """A file for `-F <file>`: commit and merge messages are never `-m` with embedded newlines."""
+    fd, path = tempfile.mkstemp(prefix="forkflow-", suffix="-" + name)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text if text.endswith("\n") else text + "\n")
+    return path
 
 
 def _parse_version(text: str) -> Tuple[int, int]:
@@ -714,6 +724,80 @@ def simulate_merge(ctx: Ctx, target: str) -> Optional[Tuple[bool, list]]:
 
 
 # --------------------------------------------------------------------------- #
+# merge requests
+# --------------------------------------------------------------------------- #
+
+def merge_button(ctx: Ctx, kind: str) -> str:
+    """How the MR must be merged. Squashing or rebasing a sync MR rewrites upstream's SHAs
+    out of the trunk's ancestry and every later sync re-conflicts on the same hunks."""
+    if kind == "sync":
+        if ctx.platform == "gitlab":
+            return ("merge it fast-forward - its tip is the merge commit; "
+                    "never squash it, never rebase it")
+        if ctx.platform == "github":
+            return 'merge it with "Create a merge commit"; never squash it, never rebase it'
+        return "merge it as a merge commit; never squash it, never rebase it"
+    if ctx.platform == "gitlab":
+        return "merge it fast-forward"
+    if ctx.platform == "github":
+        return ('merge it with "Rebase and merge", then delete the local branch - '
+                "GitHub rewrites the commit's SHA")
+    return "merge it fast-forward"
+
+
+def mr_command(ctx: Ctx, branch: str, title: str, body_file: str) -> list:
+    """The platform's MR command, or [] when the platform is unknown."""
+    if ctx.platform == "gitlab":
+        return ["glab", "mr", "create",
+                "--source-branch", branch, "--target-branch", ctx.trunk,
+                "--title", title, "--description-file", body_file, "--remove-source-branch"]
+    if ctx.platform == "github":
+        return ["gh", "pr", "create",
+                "--head", branch, "--base", ctx.trunk,
+                "--title", title, "--body-file", body_file]
+    return []
+
+
+def open_mr(ctx: Ctx, branch: str, title: str, body: str, run_it: bool) -> str:
+    """Print the MR command and, with --mr, run it. Never a failure: the branch is pushed,
+    the merge request is the only thing left to do."""
+    path = "<description file>" if ctx.dry_run else write_temp(body, "mr-body.md")
+    cmd = mr_command(ctx, branch, title, path)
+    if not cmd:
+        step("mr", f"# platform {ctx.platform}",
+             f"open the merge request manually: {branch} -> {ctx.trunk}", dry=ctx.dry_run)
+        print(f"    title: {title}")
+        if not ctx.dry_run:
+            print(f"    description: {path}")
+        return ""
+    shown = " ".join(shlex.quote(c) for c in cmd)
+    if ctx.dry_run:
+        step("mr", shown, "not run (dry run)", dry=True)
+        return shown
+    if not run_it:
+        step("mr", shown, "not run (add --mr to run it)")
+        print(f"    description: {path}")
+        return shown
+    try:
+        p = subprocess.run(cmd, cwd=ctx.root, capture_output=True)
+    except OSError as exc:
+        step("mr", shown, f"{cmd[0]} unavailable ({exc.strerror or exc})")
+        print(f"    description: {path}")
+        return shown
+    out = p.stdout.decode("utf-8", "replace").strip()
+    if p.returncode != 0:
+        step("mr", shown, f"FAILED (exit {p.returncode}) - open it yourself")
+        for line in tail_lines(p.stderr.decode("utf-8", "replace"), GATE_TAIL):
+            print(f"      {line}")
+        print(f"    description: {path}")
+        return shown
+    step("mr", shown, "created")
+    for line in out.splitlines():
+        print(f"    {line}")
+    return shown
+
+
+# --------------------------------------------------------------------------- #
 # subcommands
 # --------------------------------------------------------------------------- #
 
@@ -841,8 +925,193 @@ def cmd_check(args: argparse.Namespace) -> int:
     return run_check(ctx)
 
 
+def sync_branch(ctx: Ctx) -> str:
+    """`sync/<upstream remote>-<UTC YYYYMMDD>` - a non-standard remote name shows in the name."""
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
+    return f"{ctx.sync_prefix}{ctx.upstream}-{stamp}"
+
+
+def fetch_both(ctx: Ctx) -> None:
+    """Refresh both remotes and report what moved; every later step reads these refs."""
+    refs = [ctx.up(), f"{ctx.origin}/{ctx.trunk}", f"{ctx.origin}/{ctx.mirror}"]
+    before = dict((r, rev(ctx.root, r)) for r in refs)
+    cmd = f"git fetch --multiple {ctx.origin} {ctx.upstream}"
+    rc, _, err = git_rc("fetch", "--multiple", ctx.origin, ctx.upstream, cwd=ctx.root)
+    if rc != 0:
+        step("fetch", cmd, "FAILED")
+        raise Fail(f"fetch failed: {err.strip()}")
+    moved = []
+    for r in refs:
+        now = rev(ctx.root, r)
+        moved.append(f"{r} unchanged" if now == before[r]
+                     else f"{r} {short(before[r])}..{short(now)}")
+    step("fetch", cmd, ", ".join(moved))
+
+
+def both_sides_survived(ctx: Ctx, ours: str, theirs: str) -> list:
+    """Files changed on both sides of the merge that was actually made.
+
+    A clean merge is not automatically a correct one: the file that motivated this check
+    merged clean and still had to be looked at. Advisory - the exit code never changes."""
+    mb = git("merge-base", ours, theirs, cwd=ctx.root, check=False)
+    cmd = f"git diff --name-only {short(mb)} {ours} / {theirs}"
+    if not mb:
+        step("verify", cmd, f"no merge base between {ours} and {theirs}")
+        return []
+    changed = []
+    for side in (ours, theirs):
+        out = git("diff", "--name-only", mb, side, cwd=ctx.root, check=False)
+        changed.append(set(f for f in out.splitlines() if f))
+    files = sorted(changed[0] & changed[1])
+    if not files:
+        step("verify", cmd, "no file was changed on both sides")
+        return []
+    step("verify", cmd, f"{len(files)} file(s) changed on both sides")
+    for f in files:
+        print(f"    {f}")
+    return files
+
+
+def make_sync_branch(ctx: Ctx, name: str, force: bool) -> None:
+    """Create the sync branch off `origin/<trunk>` and switch to it. Never off the local trunk:
+    the MR has to apply to what is published."""
+    base = f"{ctx.origin}/{ctx.trunk}"
+    cmd = f"git checkout --no-track -b {name} {base}"
+    exists = has_ref(ctx.root, f"refs/heads/{name}")
+    if exists and not force:
+        raise Fail(f"branch `{name}` already exists: resume it with `forkflow sync --continue`, "
+                   f"or recreate it from {base} with `forkflow sync --force`")
+    if ctx.dry_run:
+        step("branch", cmd, f"would {'recreate' if exists else 'create'} it off {base}", dry=True)
+        return
+    if exists:
+        if current_branch(ctx) == name:              # git refuses to delete the checked-out branch
+            git("checkout", "--detach", base, cwd=ctx.root)
+        git("branch", "-D", name, cwd=ctx.root)
+    git("checkout", "--no-track", "-b", name, base, cwd=ctx.root)
+    step("branch", cmd, f"{'recreated' if exists else 'created'} at {short(rev(ctx.root, 'HEAD'))}")
+
+
+def merge_upstream(ctx: Ctx, name: str, target: str, commits: Sequence[str]) -> None:
+    """One `--no-ff` merge commit, so `git log --merges <trunk>` is the record of every sync."""
+    text = (f"Merge {ctx.mirror} (mirror of {ctx.up()}) into {name}\n\n"
+            + "\n".join(commits))
+    cmd = f"git merge --no-ff -F <message> {short(target)}"
+    if ctx.dry_run:
+        step("merge", cmd, f"would merge {short(target)} into {name} as one merge commit", dry=True)
+        return
+    path = write_temp(text, "merge-message")
+    try:
+        rc, out, err = git_rc("merge", "--no-ff", "-F", path, target, cwd=ctx.root)
+    finally:
+        os.unlink(path)
+    if rc == 0:
+        step("merge", cmd, f"merge commit {short(rev(ctx.root, 'HEAD'))}")
+        return
+    unmerged = [f for f in git("diff", "--name-only", "--diff-filter=U",
+                               cwd=ctx.root, check=False).splitlines() if f]
+    if not unmerged:
+        raise Fail(f"merge of {short(target)} failed:\n{(err or out).strip()}")
+    step("merge", cmd, f"{len(unmerged)} conflicting file(s)")
+    for f in unmerged:
+        print(f"    {f}")
+    raise Fail(f"resolve the conflicts on `{name}`, `git add` them, "
+               f"then run `forkflow sync --continue`", 4)
+
+
+def sync_body(ctx: Ctx, commits: Sequence[str], both: Sequence[str],
+              mirror_move: Tuple[str, str], backup_ref: str) -> str:
+    """What the reviewer of a sync MR needs: what came in, what was touched on both sides,
+    where the mirror stands, how to get back, and which button to press."""
+    old, new = mirror_move
+    lines = [f"Merge `{ctx.mirror}` (mirror of `{ctx.up()}`) into `{ctx.trunk}`.", "",
+             f"Upstream commits taken ({len(commits)}):", ""]
+    lines += [f"- {c}" for c in commits] or ["- (none)"]
+    lines += ["", f"Files changed on both sides: "
+                  + (", ".join(f"`{f}`" for f in both) if both else "none"),
+              "", f"Mirror `{ctx.mirror}`: {short(old)} -> {short(new)} (pushed to {ctx.origin})",
+              f"Backup of `{ctx.origin}/{ctx.trunk}` from before this sync: `{backup_ref}`",
+              f"Rollback: `git reset --hard {ctx.origin}/{backup_ref}`",
+              "", f"Merge button: {merge_button(ctx, 'sync')}."]
+    return "\n".join(lines)
+
+
 def cmd_sync(args: argparse.Namespace) -> int:
-    raise Fail("`sync` is not implemented yet")
+    ctx = resolve_ctx(args.dir, args, need_upstream=True, need_trunk=True, strict_mirror=True)
+    header(ctx, "sync")
+    if getattr(args, "cont", False):
+        raise Fail("`forkflow sync --continue` is not implemented yet")
+
+    branch = current_branch(ctx)
+    if not branch:
+        raise Fail("HEAD is detached: switch to a branch before syncing")
+    if not clean_tree(ctx):
+        raise Fail("the working tree has uncommitted changes: commit or stash them first")
+    name = sync_branch(ctx)
+    print(f"  leaving `{branch}`, switching to `{name}` "
+          f"(you stay on it when this finishes; the trunk is never touched)")
+
+    fetch_both(ctx)
+    target = rev(ctx.root, ctx.up())
+    if not target:
+        raise Fail(f"`{ctx.up()}` does not resolve after the fetch: is `{ctx.upstream}` right?")
+    step("target", f"git rev-parse {ctx.up()}", short(target))
+
+    # the mirror first: it rewrites nothing and is useful on its own, and a failure here
+    # leaves the trunk untouched. Everything after this reads `target`, not the mirror branch,
+    # so a dry run previews the pending merge even though it moves nothing.
+    mirror_move = advance_mirror(ctx, target)
+    if rev(ctx.root, f"refs/remotes/{ctx.origin}/{ctx.mirror}") == target:
+        step("mirror push", f"git push {ctx.origin} {ctx.mirror}", "up to date")
+    else:
+        push_mirror(ctx)
+
+    trunk_ref = f"refs/remotes/{ctx.origin}/{ctx.trunk}"
+    rc, _, _ = git_rc("merge-base", "--is-ancestor", target, trunk_ref, cwd=ctx.root)
+    if rc == 0:
+        print(f"  already in sync: {ctx.origin}/{ctx.trunk} already contains {short(target)} "
+              f"(the mirror was advanced and pushed above if it was behind)")
+        return 0
+
+    simulate_merge(ctx, target)
+
+    log = git("log", "--oneline", "--no-decorate", f"{ctx.origin}/{ctx.trunk}..{target}",
+              cwd=ctx.root, check=False)
+    commits = [ln for ln in log.splitlines() if ln]
+    step("commits", f"git log --oneline {ctx.origin}/{ctx.trunk}..{short(target)}",
+         f"{len(commits)} upstream commit(s) to take")
+    for line in commits:
+        print(f"    {line}")
+
+    backup_ref = backup(ctx, "pre-sync", f"{ctx.origin}/{ctx.trunk}")
+    make_sync_branch(ctx, name, force=bool(getattr(args, "force", False)))
+    merge_upstream(ctx, name, target, commits)
+
+    hint = "  fix that, then: forkflow sync --continue"
+    if ctx.dry_run:
+        step("verify", "git diff HEAD^1 / HEAD^2", "not run (dry run)", dry=True)
+        step("check", "forkflow check", "not run (dry run)", dry=True)
+        both = []
+    else:
+        both = both_sides_survived(ctx, "HEAD^1", "HEAD^2")
+        if run_check(ctx) == 3:
+            print(hint)
+            return 3
+
+    try:
+        push(ctx, name)
+    except Fail as exc:
+        if exc.code == 5:
+            print(hint)
+        raise
+
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
+    title = getattr(args, "title", None) or f"sync: {ctx.up()} {stamp} ({len(commits)} commits)"
+    open_mr(ctx, name, title, sync_body(ctx, commits, both, mirror_move, backup_ref),
+            bool(getattr(args, "mr", False)))
+    print(f"  after the MR is merged: git fetch {ctx.origin} && git switch {ctx.trunk} "
+          f"&& git merge --ff-only {ctx.origin}/{ctx.trunk}")
+    return 0
 
 
 def cmd_ship(args: argparse.Namespace) -> int:
@@ -1066,6 +1335,24 @@ def run_tests() -> None:
         """Move origin/<branch> forward without touching the fork (test setup only)."""
         sh("git", "push", os.path.join(tmp, "origin.git"), "main:refs/heads/" + branch,
            cwd=os.path.join(tmp, "seed"))
+
+    def second_clone_commit(tmp: str, branch: str = "develop", path: str = "ours/other.txt",
+                            content: str = "from another clone\n") -> str:
+        """A commit that reaches origin behind the fork's back - only a fetch can find it."""
+        other = os.path.join(tmp, "other")
+        if not os.path.exists(other):
+            sh("git", "clone", os.path.join(tmp, "origin.git"), other)
+            identity(other)
+        sh("git", "fetch", "origin", cwd=other)
+        sh("git", "checkout", "-B", branch, "origin/" + branch, cwd=other)
+        write(other, path, content)
+        sh("git", "add", "-A", cwd=other)
+        sh("git", "commit", "-m", "from another clone", cwd=other)
+        sh("git", "push", "origin", branch, cwd=other)
+        return sh("git", "rev-parse", "HEAD", cwd=other)
+
+    def checked_out(fork: str) -> str:
+        return sh("git", "symbolic-ref", "-q", "--short", "HEAD", cwd=fork, check=False)
 
     def origin_sha(fork: str, branch: str) -> str:
         out = sh("git", "ls-remote", "origin", "refs/heads/" + branch, cwd=fork)
@@ -1981,6 +2268,240 @@ def run_tests() -> None:
             self.assertNotIn("git fetch", out)
 
     # ------------------------------------------------------------------- #
+    # sync - the clean path
+    # ------------------------------------------------------------------- #
+
+    class TestSync(Base):
+        def sync_name(self, remote: str = "upstream") -> str:
+            stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
+            return "%s%s-%s" % (DEFAULT_SYNC_PREFIX, remote, stamp)
+
+        def ahead_upstream(self, fork: str, n: int = 1) -> str:
+            for i in range(n):
+                commit_upstream(self.tmp, "docs/theirs%d.md" % i, "theirs %d\n" % i,
+                                "theirs: doc %d" % i)
+            return sh("git", "rev-parse", "HEAD", cwd=os.path.join(self.tmp, "seed"))
+
+        def test_clean_sync_end_to_end(self):
+            fork = make_fork(self.tmp)
+            commit_fork(fork, "ours/feature.txt", "ours\n", "ours: feature", push=True)
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            commit_upstream(self.tmp, "README.md", "# project moved\n", "theirs: readme")
+            second_clone_commit(self.tmp)          # origin/develop moved behind the fork's back
+            before_trunk = origin_sha(fork, "develop")
+            name = self.sync_name()
+
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 0, err + out)
+
+            target = rev(fork, "upstream/main")
+            self.assertEqual(origin_sha(fork, "main"), target)     # mirror is a pure copy again
+            self.assertEqual(rev(fork, "refs/heads/main"), target)
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+            self.assertEqual(rev(fork, name + "^1"), before_trunk)  # branched off origin/develop
+            self.assertEqual(rev(fork, name + "^2"), target)        # one merge of upstream
+            msg = sh("git", "log", "-1", "--format=%B", name, cwd=fork)
+            self.assertIn("Merge main (mirror of upstream/main) into " + name, msg)
+            self.assertIn("theirs: docs", msg)
+            self.assertIn("theirs: readme", msg)
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)   # the trunk is never pushed
+            self.assertTrue(sh("git", "ls-remote", "--heads", "origin",
+                               "refs/heads/backup/*", cwd=fork))
+            self.assertEqual(checked_out(fork), name)
+            self.assertIn("open the merge request manually", out)
+            fetch_line = [ln for ln in out.splitlines() if "git fetch --multiple" in ln][0]
+            self.assertNotIn("upstream/main unchanged", fetch_line)
+            self.assertNotIn("origin/develop unchanged", fetch_line)
+
+        def test_mirror_is_pushed_before_already_in_sync(self):
+            fork = make_fork(self.tmp)
+            self.ahead_upstream(fork)
+            push_upstream_into_origin(self.tmp, "develop")     # the trunk already has it
+            before_trunk = origin_sha(fork, "develop")
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(origin_sha(fork, "main"), rev(fork, "upstream/main"))
+            self.assertIn("already in sync", out)
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+            self.assertNotIn(self.sync_name(), local_branches(fork))
+            self.assertEqual(origin_sha(fork, self.sync_name()), "")
+            self.assertNotIn("backup/", local_branches(fork))
+
+        def test_fully_in_sync_moves_nothing(self):
+            fork = make_fork(self.tmp)
+            before = sh("git", "for-each-ref", cwd=fork)
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("already in sync", out)
+            self.assertIn("up to date", out)
+            self.assertEqual(sh("git", "for-each-ref", cwd=fork), before)
+
+        def test_dry_run_previews_the_pending_merge_and_moves_nothing(self):
+            fork = make_fork(self.tmp)
+            commit_fork(fork, "shared.tf",
+                        'resource "null_resource" "a" {\n  count = 2\n}\n', "ours: shared",
+                        push=True)
+            commit_upstream(self.tmp, "shared.tf",
+                            'resource "null_resource" "a" {\n  count = 3\n}\n', "theirs: shared")
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            before_trunk = origin_sha(fork, "develop")
+            before_mirror = origin_sha(fork, "main")
+            before_local_mirror = rev(fork, "refs/heads/main")
+
+            code, out, err = run("-C", fork, "sync", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("2 upstream commit(s) to take", out)
+            self.assertIn("theirs: shared", out)
+            self.assertIn("theirs: docs", out)
+            self.assertIn("would:", out)
+            if git_version() >= MERGE_TREE_GIT:
+                self.assertIn("1 conflicting file(s)", out)
+                self.assertIn("    shared.tf", out)
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+            self.assertEqual(origin_sha(fork, "main"), before_mirror)
+            self.assertEqual(rev(fork, "refs/heads/main"), before_local_mirror)
+            self.assertNotIn("backup/", local_branches(fork))
+            self.assertNotIn(self.sync_name(), local_branches(fork))
+            self.assertEqual(checked_out(fork), "develop")
+
+        def test_existing_sync_branch_is_exit_2(self):
+            fork = make_fork(self.tmp)
+            self.ahead_upstream(fork)
+            sh("git", "branch", self.sync_name(), "develop", cwd=fork)
+            before_trunk = origin_sha(fork, "develop")
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 2)
+            self.assertIn("already exists", err)
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+
+        def test_force_recreates_the_sync_branch_we_are_on(self):
+            fork = make_fork(self.tmp)
+            self.ahead_upstream(fork)
+            name = self.sync_name()
+            sh("git", "branch", name, "develop", cwd=fork)
+            sh("git", "checkout", name, cwd=fork)
+            code, out, err = run("-C", fork, "sync", "--force")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("recreated", out)
+            self.assertEqual(rev(fork, name + "^2"), rev(fork, "upstream/main"))
+            self.assertEqual(checked_out(fork), name)
+
+        def test_dirty_tree_is_exit_2(self):
+            fork = make_fork(self.tmp)
+            self.ahead_upstream(fork)
+            write(fork, "README.md", "# dirty\n")
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 2)
+            self.assertIn("uncommitted changes", err)
+            self.assertEqual(origin_sha(fork, "main"), rev(fork, "refs/heads/main"))
+
+        def test_detached_head_is_exit_2(self):
+            fork = make_fork(self.tmp)
+            self.ahead_upstream(fork)
+            sh("git", "checkout", "--detach", "develop", cwd=fork)
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 2)
+            self.assertIn("detached", err)
+
+        def test_mirror_checked_out_here_is_fast_forwarded(self):
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "main", cwd=fork)
+            self.ahead_upstream(fork)
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("git merge --ff-only", out)
+            self.assertEqual(rev(fork, "refs/heads/main"), rev(fork, "upstream/main"))
+            self.assertEqual(origin_sha(fork, "main"), rev(fork, "upstream/main"))
+
+        def test_mirror_in_a_linked_worktree_is_exit_2_before_anything_is_pushed(self):
+            fork = make_fork(self.tmp)
+            self.ahead_upstream(fork)
+            sh("git", "worktree", "add", os.path.join(self.tmp, "wt"), "main", cwd=fork)
+            before_mirror = origin_sha(fork, "main")
+            before_trunk = origin_sha(fork, "develop")
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 2)
+            self.assertIn("checked out in", err)
+            self.assertEqual(origin_sha(fork, "main"), before_mirror)
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+            self.assertNotIn("backup/", local_branches(fork))
+            self.assertNotIn(self.sync_name(), local_branches(fork))
+
+        @needs_tomllib
+        def test_custom_names_from_config(self):
+            fork = make_fork(self.tmp, trunk="trunk", mirror="upstream-main",
+                             config='trunk = "trunk"\nmirror = "upstream-main"\n')
+            self.ahead_upstream(fork)
+            before_trunk = origin_sha(fork, "trunk")
+            name = self.sync_name()
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 0, err + out)
+            target = rev(fork, "upstream/main")
+            self.assertEqual(origin_sha(fork, "upstream-main"), target)
+            self.assertEqual(rev(fork, name + "^1"), before_trunk)
+            self.assertEqual(rev(fork, name + "^2"), target)
+            self.assertEqual(origin_sha(fork, "trunk"), before_trunk)
+            self.assertIn("Merge upstream-main (mirror of upstream/main)",
+                          sh("git", "log", "-1", "--format=%B", name, cwd=fork))
+
+        def test_mirror_push_rejection_is_exit_5_before_any_backup(self):
+            fork = make_fork(self.tmp)
+            self.ahead_upstream(fork)
+            reject_pushes(self.tmp, "refs/heads/main")
+            before_trunk = origin_sha(fork, "develop")
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 5)
+            self.assertIn("mirror", err)
+            self.assertNotIn("backup/", local_branches(fork))
+            self.assertNotIn(self.sync_name(), local_branches(fork))
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+
+        def test_mirror_with_its_own_commit_is_exit_2_and_touches_nothing(self):
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "main", cwd=fork)
+            commit_fork(fork, "ours.txt", "ours\n", "work on the mirror")
+            before = sh("git", "for-each-ref", cwd=fork)
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 2)
+            self.assertIn("Adopting forkflow", err)
+            self.assertEqual(sh("git", "for-each-ref", cwd=fork), before)
+
+        def test_backup_rejection_is_exit_5_with_no_sync_branch(self):
+            fork = make_fork(self.tmp)
+            self.ahead_upstream(fork)
+            reject_pushes(self.tmp, "refs/heads/backup/*")
+            before_trunk = origin_sha(fork, "develop")
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 5)
+            self.assertNotIn(self.sync_name(), local_branches(fork))
+            self.assertNotIn("backup/", local_branches(fork))
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+            # the mirror step ran first and is unaffected by a failure further down
+            self.assertEqual(origin_sha(fork, "main"), rev(fork, "upstream/main"))
+
+        def test_push_of_the_sync_branch_rejected_is_exit_5_with_the_continue_hint(self):
+            fork = make_fork(self.tmp)
+            self.ahead_upstream(fork)
+            reject_pushes(self.tmp, "refs/heads/sync/*")
+            before_trunk = origin_sha(fork, "develop")
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 5)
+            self.assertIn("forkflow sync --continue", out)
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+            self.assertEqual(rev(fork, self.sync_name() + "^2"), rev(fork, "upstream/main"))
+
+        @needs_tomllib
+        def test_failing_gate_is_exit_3_with_the_continue_hint(self):
+            fork = make_fork(self.tmp, config='gate = ["exit 2"]\n')
+            self.ahead_upstream(fork)
+            before_trunk = origin_sha(fork, "develop")
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 3)
+            self.assertIn("forkflow sync --continue", out)
+            self.assertEqual(origin_sha(fork, self.sync_name()), "")   # nothing was pushed
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+
+    # ------------------------------------------------------------------- #
     # argument parsing and main
     # ------------------------------------------------------------------- #
 
@@ -2035,7 +2556,7 @@ def run_tests() -> None:
     for case in (TestDetectPlatform, TestGitVersion, TestLoadConfig, TestResolveCtx,
                  TestCleanTree, TestPush, TestPushMirror, TestAdvanceMirror,
                  TestBootstrapTrunk, TestBackup, TestSimulateMerge, TestSimulateMergeOldGit,
-                 TestStatus, TestCheck, TestParseArgs, TestMainWiring):
+                 TestStatus, TestCheck, TestSync, TestParseArgs, TestMainWiring):
         suite.addTests(loader.loadTestsFromTestCase(case))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)
