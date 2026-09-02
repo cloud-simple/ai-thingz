@@ -1529,8 +1529,251 @@ def cmd_ship(args: argparse.Namespace) -> int:
     return finish_ship(ctx, args, branch, backup_ref, lease)
 
 
+# --------------------------------------------------------------------------- #
+# setup
+# --------------------------------------------------------------------------- #
+
+# key = value lines of `.forkflow.toml`, commented or not, with whatever trails them
+CONFIG_KEY_LINE = re.compile(r'^\s*#?\s*(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*'
+                             r'(?P<val>"[^"]*"|\[[^\]]*\]|\S*)(?P<rest>.*)$')
+
+
+def template_text(ctx: Ctx) -> str:
+    """The commented `.forkflow.toml` `setup` drops in: every key optional, defaults shown."""
+    return "\n".join([
+        "# forkflow - every key is optional; the values below are what this clone resolves to.",
+        "# Reading this file needs Python 3.11+ (tomllib); a file that cannot be read is fatal.",
+        "",
+        f'# upstream = "{ctx.upstream}"                # remote name of the original project',
+        f'# upstream_branch = "{ctx.upstream_branch}"  # its branch we track (default: its HEAD)',
+        f'# mirror = "{ctx.mirror}"                    # our fast-forward-only copy of it',
+        f'# trunk = "{ctx.trunk}"                      # protected, MR-only branch with our work',
+        '# gate = []                                  # e.g. ["make test", "terraform fmt"]',
+        f'# sync_prefix = "{ctx.sync_prefix}"',
+        f'# backup_prefix = "{ctx.backup_prefix}"',
+        "",
+    ]) + "\n"
+
+
+def config_with_keys(text: str, pairs: Sequence[Tuple[str, str]]) -> str:
+    """`text` with each key set: an existing line (commented or not) is rewritten in place,
+    keeping the comment that trails it; every other line is left exactly as it was."""
+    lines = text.splitlines()
+    for key, value in pairs:
+        entry = f'{key} = "{value}"'
+        for i, line in enumerate(lines):
+            m = CONFIG_KEY_LINE.match(line)
+            if m and m.group("key") == key:
+                lines[i] = entry + m.group("rest")
+                break
+        else:
+            lines.append(entry)
+    return "\n".join(lines) + "\n"
+
+
+def write_config_keys(ctx: Ctx, pairs: Sequence[Tuple[str, str]]) -> None:
+    """--trunk/--mirror persisted: the branch names must outlive the flags that set them."""
+    path = os.path.join(ctx.root, CONFIG_FILE)
+    exists = os.path.exists(path)
+    if exists:
+        with open(path, "r", errors="replace") as fh:
+            text = fh.read()
+    else:
+        text = template_text(ctx)
+    new = config_with_keys(text, pairs)
+    shown = ", ".join(f'{k} = "{v}"' for k, v in pairs)
+    cmd = f"edit {CONFIG_FILE}"
+    if new == text:
+        step("toml", cmd, f"already {shown}")
+        return
+    if ctx.dry_run:
+        step("toml", cmd, f"would {'update' if exists else 'create'} it with {shown}", dry=True)
+        return
+    with open(path, "w") as fh:
+        fh.write(new)
+    step("toml", cmd, f"{'updated' if exists else 'created'}: {shown}")
+
+
+def setup_upstream_remote(ctx: Ctx, args: argparse.Namespace) -> Optional[str]:
+    """The remote of the original project, added from --upstream-url when it is missing.
+
+    None means a dry run cannot go further: the remote it would add is not there yet."""
+    remotes = git("remote", cwd=ctx.root).split()
+    name = getattr(args, "upstream", None) or ctx.cfg.get("upstream")
+    others = [r for r in remotes if r != ctx.origin]
+    if not name:
+        name = others[0] if len(others) == 1 else None
+    url = getattr(args, "upstream_url", None)
+
+    if name and name in remotes:
+        current = git("remote", "get-url", name, cwd=ctx.root, check=False)
+        step("remote", f"git remote get-url {name}", f"{name} -> {current or '-'}")
+        if url and url != current:
+            print(f"    note: `{name}` already points at {current}; --upstream-url is ignored - "
+                  f"change it with `git remote set-url {name} {url}` if that is what you want")
+        if name != "upstream":
+            print(f"    note: the original project is the remote `{name}`, not `upstream`; "
+                  f"forkflow uses it as it is - `git remote rename {name} upstream` if you "
+                  f"prefer the usual name")
+        return name
+
+    if not url:
+        what = (f"remote `{name}` does not exist" if name else
+                ("several non-origin remotes (" + ", ".join(others) + ")" if others
+                 else "no remote for the original project"))
+        raise Fail(f"{what}; run `forkflow setup --upstream-url <URL>` "
+                   f"(or `forkflow setup --upstream <NAME>` for an existing remote)")
+    name = name or "upstream"
+    cmd = f"git remote add {name} {url}"
+    if ctx.dry_run:
+        step("remote", cmd, "would add the remote of the original project", dry=True)
+        return None
+    git("remote", "add", name, url, cwd=ctx.root)
+    step("remote", cmd, "added")
+    return name
+
+
+def setup_fetch(ctx: Ctx, upstream: str) -> None:
+    """Both remotes, then their HEADs. A failure here has changed nothing yet."""
+    cmd = f"git fetch --multiple {ctx.origin} {upstream}"
+    rc, _, err = git_rc("fetch", "--multiple", ctx.origin, upstream, cwd=ctx.root)
+    if rc != 0:
+        step("fetch", cmd, "FAILED")
+        raise Fail(f"fetch failed - nothing has been changed yet:\n{err.strip()}")
+    step("fetch", cmd, "remote-tracking refs refreshed")
+    for remote in (ctx.origin, upstream):
+        sub = f"git remote set-head {remote} -a"
+        if ctx.dry_run:                      # set-head writes config: not in a dry run
+            step("set-head", sub, "not run (dry run)", dry=True)
+            continue
+        rc, _, err = git_rc("remote", "set-head", remote, "-a", cwd=ctx.root)
+        tail = (err.strip().splitlines() or ["see git output"])[-1]
+        step("set-head", sub, f"{remote}/HEAD set" if rc == 0 else f"not set ({tail})")
+
+
+def setup_mirror(ctx: Ctx, target: str) -> None:
+    """Check the mirror, or create it in a single-branch clone. It is never reset:
+    a `<mirror>` that carries work is a migration, and that is done by hand."""
+    m = ctx.mirror
+    local = has_ref(ctx.root, f"refs/heads/{m}")
+    remote = has_ref(ctx.root, f"refs/remotes/{ctx.origin}/{m}")
+    if not (local or remote):
+        cmd = f"git branch --no-track {m} {short(target)}"
+        if ctx.dry_run:
+            step("mirror", cmd, f"would create the mirror at {short(target)}", dry=True)
+            return
+        git("branch", "--no-track", m, target, cwd=ctx.root)
+        step("mirror", cmd, f"created at {short(target)}")
+        return
+    for ref in ([m] if local else []) + ([f"{ctx.origin}/{m}"] if remote else []):
+        rc, _, _ = git_rc("merge-base", "--is-ancestor", ref, target, cwd=ctx.root)
+        if rc == 1:
+            raise Fail(f"`{ref}` has commits that are not in `{ctx.up()}`: it cannot be the "
+                       f"mirror, and forkflow never resets a published branch. {README_POINTER}")
+        if rc != 0:
+            raise Fail(f"cannot compare `{ref}` with `{ctx.up()}`: run `git fetch {ctx.upstream}`")
+    step("mirror", f"git merge-base --is-ancestor {m} {ctx.up()}",
+         f"`{m}` is a pure copy of `{ctx.up()}` (behind is fine - `forkflow sync` advances it)")
+
+
+def setup_trunk(ctx: Ctx, target: str) -> None:
+    """Create the trunk on a fresh fork. Runs before the hook, which refuses every push
+    of the trunk - creation included."""
+    t = ctx.trunk
+    origin_t = rev(ctx.root, f"refs/remotes/{ctx.origin}/{t}")
+    if origin_t:
+        step("trunk", f"git rev-parse {ctx.origin}/{t}",
+             f"already on {ctx.origin} at {short(origin_t)}")
+        return
+    if has_ref(ctx.root, f"refs/heads/{t}"):
+        raise Fail(f"trunk `{t}` exists locally but not on {ctx.origin}: forkflow never pushes "
+                   f"the trunk - push it yourself once it is what you want "
+                   f"(`git push -u {ctx.origin} {t}`), or delete it and rerun `forkflow setup`")
+    bootstrap_trunk(ctx, target)
+
+
+def setup_push_url(ctx: Ctx) -> None:
+    """`DISABLED` makes `git push <upstream>` fail before any hook can even run."""
+    cmd = f"git remote set-url --push {ctx.upstream} DISABLED"
+    if git("remote", "get-url", "--push", ctx.upstream, cwd=ctx.root, check=False) == "DISABLED":
+        step("push url", cmd, "already DISABLED")
+        return
+    if ctx.dry_run:
+        step("push url", cmd, f"would stop every push to `{ctx.upstream}`", dry=True)
+        return
+    git("remote", "set-url", "--push", ctx.upstream, "DISABLED", cwd=ctx.root)
+    step("push url", cmd, f"pushes to `{ctx.upstream}` now fail")
+
+
+def setup_git_config(ctx: Ctx) -> None:
+    """ff-only for the two long-lived branches is rule 3 and rule 6 in git's own hands."""
+    settings = [
+        (f"branch.{ctx.trunk}.mergeOptions", "--ff-only", "rule: the trunk only fast-forwards"),
+        (f"branch.{ctx.mirror}.mergeOptions", "--ff-only", "rule: the mirror only fast-forwards"),
+        ("pull.ff", "only", "rule: a pull never creates a merge commit"),
+        ("rerere.enabled", "true", "convenience, not a rule: remembers conflict resolutions"),
+    ]
+    for key, value, why in settings:
+        cmd = f"git config {key} {value}"
+        if git("config", "--get", key, cwd=ctx.root, check=False) == value:
+            step("config", cmd, f"already set ({why})")
+            continue
+        if ctx.dry_run:
+            step("config", cmd, f"would set it ({why})", dry=True)
+            continue
+        git("config", key, value, cwd=ctx.root)
+        step("config", cmd, why)
+
+
+def setup_template(ctx: Ctx) -> None:
+    """A commented `.forkflow.toml`, left untracked: the branch names are the fork's decision."""
+    path = os.path.join(ctx.root, CONFIG_FILE)
+    cmd = f"write {CONFIG_FILE}"
+    if os.path.exists(path):
+        step("template", cmd, "already there, left as it is")
+    elif ctx.dry_run:
+        step("template", cmd, "would write the commented template", dry=True)
+        return
+    else:
+        with open(path, "w") as fh:
+            fh.write(template_text(ctx))
+        step("template", cmd, "commented template written")
+    if not git_ok("ls-files", "--error-unmatch", CONFIG_FILE, cwd=ctx.root):
+        print(f"    it is untracked: commit {CONFIG_FILE} when you are happy with it, so the "
+              f"branch names and the gate are the same for everyone")
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
-    raise Fail("`setup` is not implemented yet")
+    """Make the rules mechanical in this clone. The step order matters - see README."""
+    ctx = resolve_ctx(args.dir, args, need_upstream=False, need_trunk=False, strict_mirror=False)
+    header(ctx, "setup")
+
+    name = setup_upstream_remote(ctx, args)
+    if name is None:                                   # dry run: the remote is not there yet
+        print("  the rest of `setup` needs the upstream remote - rerun without --dry-run")
+        return 0
+    args.upstream = name
+    setup_fetch(ctx, name)
+    # the upstream branch (and with it the default mirror name) is only known after the fetch
+    ctx = resolve_ctx(ctx.root, args, need_upstream=True, need_trunk=False, strict_mirror=False)
+    step("names", "-", f"upstream={ctx.up()}  mirror={ctx.mirror}  trunk={ctx.trunk}")
+
+    pairs = [(key, getattr(ctx, key)) for key in ("trunk", "mirror")
+             if getattr(args, key, None)]
+    if pairs:
+        write_config_keys(ctx, pairs)
+
+    target = rev(ctx.root, ctx.up())
+    if not target:
+        raise Fail(f"`{ctx.up()}` does not resolve after the fetch: is `{name}` the right remote?")
+    step("target", f"git rev-parse {ctx.up()}", short(target))
+
+    setup_mirror(ctx, target)
+    setup_trunk(ctx, target)
+    setup_push_url(ctx)
+    setup_git_config(ctx)
+    setup_template(ctx)
+    return 0
 
 
 COMMANDS = {
@@ -3399,6 +3642,203 @@ def run_tests() -> None:
             self.assertEqual(origin_sha(fork, "develop"), before_trunk)
 
     # ------------------------------------------------------------------- #
+    # setup: remotes, names, mirror, trunk bootstrap, config, template
+    # ------------------------------------------------------------------- #
+
+    class SetupBase(Base):
+        def cfg(self, repo: str, key: str) -> str:
+            return sh("git", "config", "--get", key, cwd=repo, check=False)
+
+        def push_url(self, repo: str, remote: str = "upstream") -> str:
+            return sh("git", "remote", "get-url", "--push", remote, cwd=repo, check=False)
+
+        def toml_path(self, repo: str) -> str:
+            return os.path.join(repo, CONFIG_FILE)
+
+        def untouched(self, repo: str) -> None:
+            """What every failing `setup` must leave exactly as it found it."""
+            self.assertNotEqual(self.push_url(repo), "DISABLED")
+            self.assertEqual(self.cfg(repo, "pull.ff"), "")
+            self.assertEqual(self.cfg(repo, "rerere.enabled"), "")
+            self.assertFalse(os.path.exists(self.toml_path(repo)))
+
+    class TestSetup(SetupBase):
+        def test_configures_the_clone_and_is_idempotent(self):
+            fork = make_fork(self.tmp)
+            sh("git", "symbolic-ref", "refs/remotes/origin/HEAD",
+               "refs/remotes/origin/main", cwd=fork)
+            code, out, err = run("-C", fork, "setup")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(sh("git", "symbolic-ref", "refs/remotes/origin/HEAD", cwd=fork),
+                             "refs/remotes/origin/develop")      # set-head -a corrected it
+            self.assertEqual(self.push_url(fork), "DISABLED")
+            self.assertEqual(self.cfg(fork, "branch.develop.mergeOptions"), "--ff-only")
+            self.assertEqual(self.cfg(fork, "branch.main.mergeOptions"), "--ff-only")
+            self.assertEqual(self.cfg(fork, "pull.ff"), "only")
+            self.assertEqual(self.cfg(fork, "rerere.enabled"), "true")
+            with open(self.toml_path(fork)) as fh:
+                template = fh.read()
+            self.assertIn('# trunk = "develop"', template)
+            self.assertIn('# mirror = "main"', template)
+            self.assertIn("commit " + CONFIG_FILE, out)
+            self.assertNotIn("would:", out)
+
+            branches, trunk_sha = local_branches(fork), origin_sha(fork, "develop")
+            code, out, err = run("-C", fork, "setup")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("already DISABLED", out)
+            self.assertIn("already set", out)
+            self.assertIn("already there", out)
+            self.assertEqual(local_branches(fork), branches)
+            self.assertEqual(origin_sha(fork, "develop"), trunk_sha)
+            with open(self.toml_path(fork)) as fh:
+                self.assertEqual(fh.read(), template)
+
+        def test_a_non_standard_remote_name_is_used_as_it_is(self):
+            fork = make_fork(self.tmp)
+            sh("git", "remote", "rename", "upstream", "original", cwd=fork)
+            code, out, err = run("-C", fork, "setup")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("git remote rename original upstream", out)
+            self.assertEqual(self.push_url(fork, "original"), "DISABLED")
+            self.assertIn("upstream=original/main", out)
+
+        @needs_tomllib
+        def test_trunk_and_mirror_flags_are_written_and_other_keys_survive(self):
+            fork = make_fork(self.tmp, trunk="trunk", mirror="upstream-main",
+                             config='gate = ["true"]\n')
+            code, out, err = run("-C", fork, "setup",
+                                 "--trunk", "trunk", "--mirror", "upstream-main")
+            self.assertEqual(code, 0, err + out)
+            cfg = load_config(fork)
+            self.assertEqual(cfg["trunk"], "trunk")
+            self.assertEqual(cfg["mirror"], "upstream-main")
+            self.assertEqual(cfg["gate"], ["true"])
+            self.assertEqual(self.cfg(fork, "branch.trunk.mergeOptions"), "--ff-only")
+            self.assertEqual(self.cfg(fork, "branch.upstream-main.mergeOptions"), "--ff-only")
+
+        def test_config_with_keys_rewrites_in_place_and_keeps_comments(self):
+            text = ('# forkflow\n'
+                    '# trunk = "develop"    # protected, MR-only\n'
+                    'gate = ["true"]\n')
+            out = config_with_keys(text, [("trunk", "mainline"), ("mirror", "vendor")])
+            self.assertIn('trunk = "mainline"    # protected, MR-only', out)
+            self.assertIn('gate = ["true"]', out)
+            self.assertIn('mirror = "vendor"', out)        # appended: it was not there
+            self.assertNotIn('"develop"', out)
+
+        def test_upstream_url_adds_the_remote_sets_both_heads_and_bootstraps(self):
+            fork = make_fresh_fork(self.tmp)
+            sh("git", "remote", "remove", "upstream", cwd=fork)
+            url = os.path.join(self.tmp, "upstream.git")
+            code, out, err = run("-C", fork, "setup", "--upstream-url", url)
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(sh("git", "remote", "get-url", "upstream", cwd=fork), url)
+            self.assertEqual(sh("git", "symbolic-ref", "refs/remotes/upstream/HEAD", cwd=fork),
+                             "refs/remotes/upstream/main")
+            self.assertEqual(sh("git", "symbolic-ref", "refs/remotes/origin/HEAD", cwd=fork),
+                             "refs/remotes/origin/main")
+            target = rev(fork, "refs/remotes/upstream/main")
+            self.assertEqual(origin_sha(fork, "develop"), target)
+
+        def test_a_fresh_fork_gets_a_trunk_equal_to_upstream(self):
+            fork = make_fresh_fork(self.tmp)
+            self.assertEqual(origin_sha(fork, "develop"), "")
+            code, out, err = run("-C", fork, "setup")
+            self.assertEqual(code, 0, err + out)
+            target = rev(fork, "refs/remotes/upstream/main")
+            self.assertEqual(rev(fork, "refs/heads/develop"), target)
+            self.assertEqual(origin_sha(fork, "develop"), target)
+            self.assertEqual(self.cfg(fork, "branch.develop.remote"), "")     # --no-track
+            self.assertEqual(self.cfg(fork, "branch.develop.merge"), "")
+
+        def test_a_single_branch_clone_gets_a_local_mirror(self):
+            make_fork(self.tmp)
+            thin = os.path.join(self.tmp, "thin")
+            sh("git", "clone", "--single-branch", "--branch", "develop",
+               os.path.join(self.tmp, "origin.git"), thin)
+            identity(thin)
+            sh("git", "remote", "add", "upstream", os.path.join(self.tmp, "upstream.git"), cwd=thin)
+            self.assertEqual(rev(thin, "refs/heads/main"), "")
+            self.assertEqual(rev(thin, "refs/remotes/origin/main"), "")
+
+            code, out, err = run("-C", thin, "setup")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(thin, "refs/heads/main"), rev(thin, "refs/remotes/upstream/main"))
+            self.assertEqual(self.cfg(thin, "branch.main.remote"), "")        # --no-track
+
+        def test_a_mirror_that_carries_work_is_refused(self):
+            fork = make_fork(self.tmp)
+            sh("git", "switch", "main", cwd=fork)
+            commit_fork(fork, "ours/local.txt", "ours\n", "ours: on the mirror")
+            sh("git", "switch", "develop", cwd=fork)
+            code, out, err = run("-C", fork, "setup")
+            self.assertEqual(code, 2, out)
+            self.assertIn("Adopting forkflow", err)
+            self.assertIn("never resets", err)
+            self.untouched(fork)
+
+        def test_a_local_only_trunk_is_refused(self):
+            fork = make_fresh_fork(self.tmp)
+            sh("git", "branch", "--no-track", "develop", "main", cwd=fork)
+            code, out, err = run("-C", fork, "setup")
+            self.assertEqual(code, 2, out)
+            self.assertIn("push it yourself", err)
+            self.assertEqual(origin_sha(fork, "develop"), "")
+            self.untouched(fork)
+
+        def test_a_failing_fetch_changes_nothing(self):
+            fork = make_fork(self.tmp)
+            sh("git", "remote", "set-url", "upstream",
+               os.path.join(self.tmp, "nowhere.git"), cwd=fork)
+            code, out, err = run("-C", fork, "setup")
+            self.assertEqual(code, 2, out)
+            self.assertIn("fetch failed", err)
+            self.untouched(fork)
+
+        def test_no_upstream_remote_and_no_url_is_exit_2_with_the_hint(self):
+            fork = make_fork(self.tmp)
+            sh("git", "remote", "remove", "upstream", cwd=fork)
+            code, out, err = run("-C", fork, "setup")
+            self.assertEqual(code, 2, out)
+            self.assertIn("--upstream-url", err)
+            self.untouched(fork)
+
+        def test_dry_run_changes_nothing(self):
+            fork = make_fork(self.tmp)
+            # a wrong origin/HEAD that only `set-head -a` would correct (a fetch only ever
+            # fills in a missing one), so its survival proves set-head was not run
+            sh("git", "symbolic-ref", "refs/remotes/origin/HEAD",
+               "refs/remotes/origin/main", cwd=fork)
+            branches = local_branches(fork)
+            code, out, err = run("-C", fork, "setup", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("would:", out)
+            self.assertEqual(local_branches(fork), branches)
+            self.assertEqual(sh("git", "symbolic-ref", "refs/remotes/origin/HEAD", cwd=fork),
+                             "refs/remotes/origin/main")
+            self.assertEqual(self.cfg(fork, "branch.develop.mergeOptions"), "")
+            self.untouched(fork)
+
+        def test_dry_run_on_a_fresh_fork_previews_the_bootstrap(self):
+            fork = make_fresh_fork(self.tmp)
+            code, out, err = run("-C", fork, "setup", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("would create develop", out)
+            self.assertEqual(origin_sha(fork, "develop"), "")
+            self.assertNotIn("refs/heads/develop", local_branches(fork))
+
+        def test_dry_run_stops_before_a_remote_it_would_have_to_add(self):
+            fork = make_fork(self.tmp)
+            sh("git", "remote", "remove", "upstream", cwd=fork)
+            code, out, err = run("-C", fork, "setup", "--dry-run",
+                                 "--upstream-url", os.path.join(self.tmp, "upstream.git"))
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("would add the remote", out)
+            self.assertEqual(sh("git", "remote", cwd=fork).split(), ["origin"])
+            self.untouched(fork)
+
+    # ------------------------------------------------------------------- #
     # merge requests
     # ------------------------------------------------------------------- #
 
@@ -3671,7 +4111,7 @@ def run_tests() -> None:
                  TestCleanTree, TestPush, TestPushMirror, TestAdvanceMirror,
                  TestBootstrapTrunk, TestBackup, TestSimulateMerge, TestSimulateMergeOldGit,
                  TestStatus, TestCheck, TestSync, TestSyncConflicts,
-                 TestShip, TestShipErrors,
+                 TestShip, TestShipErrors, TestSetup,
                  TestMrCommand, TestOpenMr, TestMrEndToEnd,
                  TestParseArgs, TestMainWiring):
         suite.addTests(loader.loadTestsFromTestCase(case))

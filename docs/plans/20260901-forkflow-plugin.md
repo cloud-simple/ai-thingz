@@ -648,15 +648,21 @@ step-by-step document with its real branch names and SHAs with that project, not
 **Files:**
 - Modify: `plugins/forkflow/scripts/forkflow.py`
 
-- [ ] remotes: resolve upstream (`--upstream NAME`, cfg, the only other remote); `--upstream-url URL` adds `upstream` when missing; none -> 2 with the hint; fetch both (git_rc, failure -> 2); `set-head` for both remotes via `git_rc`, degrading to a note; non-standard name reported with the `git remote rename` suggestion; `git remote set-url --push <upstream> DISABLED`
-- [ ] names: `--trunk NAME` / `--mirror NAME` written into `.forkflow.toml` (create or update the two keys only, preserving the rest; requires `tomllib` to read an existing file)
-- [ ] `target`; mirror check after the fetch (rc 1 -> 2 with the README pointer; never reset); no mirror branch anywhere -> local `--no-track` branch at `target`
-- [ ] trunk: `bootstrap_trunk(target)` when absent everywhere; local-only trunk -> 2 with the explanation; existing -> nothing; **runs before the hook step**
-- [ ] git config: `branch.<trunk>.mergeOptions=--ff-only`, `branch.<mirror>.mergeOptions=--ff-only`, `pull.ff=only` (named as rules), `rerere.enabled=true` (named as convenience)
-- [ ] `.forkflow.toml` template written if absent (commented keys) with the "commit it" note
-- [ ] `--dry-run` prints every change as `would:` (bootstrap push included), runs `set-head`, hook, config and template not at all
-- [ ] write tests: after setup on `make_fork` - push URL DISABLED, config keys set, template written, second run idempotent; remote named `original` used as-is with the rename suggestion printed; `--trunk trunk --mirror upstream-main` writes the keys and preserves other keys (skipped without `tomllib`); fresh clone with one remote + `--upstream-url` -> remote added, fetched, both HEADs set, then bootstrap; `make_fresh_fork` + `setup` -> `develop` created locally and on origin equal to upstream's SHA, no tracking config, and the platform report flags the default branch; single-branch clone without local `main` -> local mirror created at `target`; a fork whose `main` has its own commits -> 2 with the README pointer and nothing changed; local-only `develop` -> 2; fetch failure (upstream URL pointing nowhere) -> 2 with nothing changed; dry run changes nothing (remotes, config, template, branches all untouched)
-- [ ] run tests - must pass before task 10
+- [x] remotes: resolve upstream (`--upstream NAME`, cfg, the only other remote); `--upstream-url URL` adds `upstream` when missing; none -> 2 with the hint; fetch both (git_rc, failure -> 2); `set-head` for both remotes via `git_rc`, degrading to a note; non-standard name reported with the `git remote rename` suggestion; `git remote set-url --push <upstream> DISABLED`
+- [x] names: `--trunk NAME` / `--mirror NAME` written into `.forkflow.toml` (create or update the two keys only, preserving the rest; requires `tomllib` to read an existing file)
+- [x] `target`; mirror check after the fetch (rc 1 -> 2 with the README pointer; never reset); no mirror branch anywhere -> local `--no-track` branch at `target`
+- [x] trunk: `bootstrap_trunk(target)` when absent everywhere; local-only trunk -> 2 with the explanation; existing -> nothing; **runs before the hook step**
+- [x] git config: `branch.<trunk>.mergeOptions=--ff-only`, `branch.<mirror>.mergeOptions=--ff-only`, `pull.ff=only` (named as rules), `rerere.enabled=true` (named as convenience)
+- [x] `.forkflow.toml` template written if absent (commented keys) with the "commit it" note
+- [x] `--dry-run` prints every change as `would:` (bootstrap push included), runs `set-head`, hook, config and template not at all
+- [x] write tests: after setup on `make_fork` - push URL DISABLED, config keys set, template written, second run idempotent; remote named `original` used as-is with the rename suggestion printed; `--trunk trunk --mirror upstream-main` writes the keys and preserves other keys (skipped without `tomllib`); fresh clone with one remote + `--upstream-url` -> remote added, fetched, both HEADs set, then bootstrap; `make_fresh_fork` + `setup` -> `develop` created locally and on origin equal to upstream's SHA, no tracking config, and the platform report flags the default branch; single-branch clone without local `main` -> local mirror created at `target`; a fork whose `main` has its own commits -> 2 with the README pointer and nothing changed; local-only `develop` -> 2; fetch failure (upstream URL pointing nowhere) -> 2 with nothing changed; dry run changes nothing (remotes, config, template, branches all untouched)
+- [x] run tests - must pass before task 10
+- ➕ [x] the platform-report assertion of the `make_fresh_fork` case moves to task 11 (the report
+  itself is task 11); `--dry-run` proving `set-head` did not run needs a *wrong* `origin/HEAD`, not a
+  missing one: git 2.46+ fills a missing remote HEAD in during `fetch`, which a dry run does run
+- ➕ [x] `--upstream-url` given while the remote already exists is reported and ignored (never a
+  silent `set-url`), and a `--dry-run` that would have to add the remote stops after that step -
+  there is nothing to preview until the remote exists
 
 ### Task 10: `setup` - the pre-push hook
 
