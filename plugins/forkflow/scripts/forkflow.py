@@ -321,6 +321,61 @@ def divergence(ctx: Ctx) -> Tuple[Optional[int], Optional[int]]:
     return (len(files), len(upstream_tracked(ctx, files)))
 
 
+def branch_files(ctx: Ctx, ref: str = "HEAD") -> list:
+    """Files the current branch changed since it left the trunk (upstream when there is no trunk)."""
+    if not rev(ctx.root, ref):
+        return []
+    for base in (f"refs/remotes/{ctx.origin}/{ctx.trunk}", ctx.up()):
+        if not rev(ctx.root, base):
+            continue
+        mb = git("merge-base", base, ref, cwd=ctx.root, check=False)
+        if not mb:
+            continue
+        out = git("diff", "--name-only", mb, ref, cwd=ctx.root, check=False)
+        return [f for f in out.splitlines() if f]
+    return []
+
+
+def hooks_path(root: str) -> str:
+    """Absolute hooks directory of this worktree (follows core.hooksPath)."""
+    p = git("rev-parse", "--git-path", "hooks", cwd=root, check=False)
+    if not p:
+        return ""
+    return p if os.path.isabs(p) else os.path.join(root, p)
+
+
+def hook_state(ctx: Ctx) -> str:
+    """installed (ours) | foreign (someone else's) | missing."""
+    d = hooks_path(ctx.root)
+    path = os.path.join(d, "pre-push") if d else ""
+    if not path or not os.path.exists(path):
+        return "missing"
+    try:
+        with open(path, "r", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return "missing"
+    return "installed" if HOOK_MARK in text else "foreign"
+
+
+def ff_only(ctx: Ctx, branch: str) -> bool:
+    return "--ff-only" in git("config", "--get", f"branch.{branch}.mergeOptions",
+                              cwd=ctx.root, check=False)
+
+
+def upstream_push(ctx: Ctx) -> str:
+    """`DISABLED` when setup has disabled it, `<url> (LIVE)` while a push could still land."""
+    url = git("remote", "get-url", "--push", ctx.upstream, cwd=ctx.root, check=False)
+    return "DISABLED" if url == "DISABLED" else f"{url or '-'} (LIVE)"
+
+
+def backups(ctx: Ctx) -> list:
+    """Backup branches known from remote-tracking refs - newest (by name) first, no network."""
+    pattern = f"refs/remotes/{ctx.origin}/{ctx.backup_prefix}*"
+    out = git("for-each-ref", "--format=%(refname:short)", pattern, cwd=ctx.root, check=False)
+    return sorted([line for line in out.splitlines() if line], reverse=True)
+
+
 def _rel_age(seconds: float) -> str:
     if seconds < 90:
         return f"{int(seconds)}s ago"
@@ -536,8 +591,65 @@ def bootstrap_trunk(ctx: Ctx, target: str) -> None:
 # --------------------------------------------------------------------------- #
 
 def cmd_status(args: argparse.Namespace) -> int:
+    """Read-only. Without --fetch it makes no network call and writes nothing."""
     ctx = resolve_ctx(args.dir, args, need_upstream=True, need_trunk=False, strict_mirror=False)
+    fetch_result = None
+    if getattr(args, "fetch", False):
+        rc, _, err = git_rc("fetch", "--multiple", ctx.origin, ctx.upstream, cwd=ctx.root)
+        tail = err.strip().splitlines()[-1] if err.strip() else "see git output"
+        fetch_result = ("remote-tracking refs refreshed" if rc == 0
+                        else f"FAILED, reporting the refs on disk: {tail}")
+
     header(ctx, "status")
+    if fetch_result:
+        step("fetch", f"git fetch --multiple {ctx.origin} {ctx.upstream}", fetch_result)
+
+    branch = git("symbolic-ref", "-q", "--short", "HEAD", cwd=ctx.root, check=False)
+    modified = [ln for ln in git("status", "--porcelain", "--untracked-files=no",
+                                 cwd=ctx.root).splitlines() if ln]
+    tree = "clean" if not modified else f"{len(modified)} modified"
+    if not branch:
+        print(f"  branch   (detached at {short(rev(ctx.root, 'HEAD'))})  tree: {tree}")
+    else:
+        if has_ref(ctx.root, f"refs/remotes/{ctx.origin}/{branch}"):
+            ahead, _ = ahead_behind(ctx, f"refs/heads/{branch}",
+                                    f"refs/remotes/{ctx.origin}/{branch}")
+            where = f"{ahead if ahead is not None else '?'} unpushed (vs {ctx.origin}/{branch})"
+        else:
+            where = "not on origin"
+        print(f"  branch   {branch}  {where}  tree: {tree}")
+
+    touched = upstream_tracked(ctx, branch_files(ctx))
+    if touched:
+        print(f"  touches upstream-tracked files (WARNING, {len(touched)}):")
+        for f in touched:
+            print(f"    {f}")
+
+    found = backups(ctx)
+    line = f"  backups  {len(found)} (refs/remotes/{ctx.origin}/{ctx.backup_prefix}*)"
+    if found:
+        line += ":  " + ", ".join(found[:3])
+    print(line)
+
+    hook = hook_state(ctx)
+    print(f"  setup    upstream push: {upstream_push(ctx)}   pre-push hook: {hook}   "
+          f"ff-only: {ctx.trunk} {'yes' if ff_only(ctx, ctx.trunk) else 'no'}, "
+          f"{ctx.mirror} {'yes' if ff_only(ctx, ctx.mirror) else 'no'}")
+
+    todo = []
+    if not has_ref(ctx.root, f"refs/remotes/{ctx.origin}/{ctx.trunk}"):
+        todo.append(f"trunk `{ctx.trunk}` is not on origin")
+    if hook != "installed":
+        todo.append(f"pre-push hook {hook}")
+    if not upstream_push(ctx).startswith("DISABLED"):
+        todo.append(f"`{ctx.upstream}` still has a live push URL")
+    if not (ff_only(ctx, ctx.trunk) and ff_only(ctx, ctx.mirror)):
+        todo.append("ff-only merge config not set")
+    if todo:
+        print("  hint     run `forkflow setup`: " + "; ".join(todo))
+    if ctx.mirror_diverged:
+        print(f"  hint     mirror `{ctx.mirror}` has commits that are not in `{ctx.up()}`. "
+              f"{README_POINTER}")
     return 0
 
 
@@ -1195,6 +1307,186 @@ def run_tests() -> None:
             self.assertEqual(origin_sha(fork, "develop"), "")
 
     # ------------------------------------------------------------------- #
+    # status
+    # ------------------------------------------------------------------- #
+
+    class TestStatus(Base):
+        def test_numbers_for_a_constructed_state(self):
+            fork = make_fork(self.tmp)
+            commit_fork(fork, "src/app.py", "def main():\n    return 9\n", "ours: app", push=True)
+            commit_fork(fork, "ours/notes.md", "notes\n", "ours: notes", push=True)
+            commit_upstream(self.tmp, "README.md", "# project moved\n")
+            sh("git", "fetch", "upstream", cwd=fork)
+            code, out, err = run("-C", fork, "status")
+            self.assertEqual(code, 0, err)
+            self.assertIn("+1/-2 vs origin/develop", out)
+            self.assertIn("divergence: 2 files, 1 upstream-tracked", out)
+            self.assertIn("mirror behind by 1", out)
+
+        def test_upstream_tracked_warning_lists_exactly_the_touched_file(self):
+            fork = make_fork(self.tmp)
+            sh("git", "switch", "-c", "feat/x", cwd=fork)
+            commit_fork(fork, "src/app.py", "def main():\n    return 7\n", "touch theirs")
+            commit_fork(fork, "ours/new.txt", "ours only\n", "add ours")
+            code, out, err = run("-C", fork, "status")
+            self.assertEqual(code, 0, err)
+            self.assertIn("touches upstream-tracked files (WARNING, 1)", out)
+            self.assertIn("    src/app.py", out)
+            self.assertNotIn("ours/new.txt", out)
+            self.assertIn("branch   feat/x  not on origin", out)
+
+        def test_branch_line_counts_unpushed_and_modified(self):
+            fork = make_fork(self.tmp)
+            sh("git", "switch", "-c", "feat/x", cwd=fork)
+            commit_fork(fork, "ours/new.txt", "one\n", "one", push=True)
+            commit_fork(fork, "ours/new.txt", "two\n", "two")
+            write(fork, "README.md", "# dirty\n")
+            code, out, err = run("-C", fork, "status")
+            self.assertEqual(code, 0, err)
+            self.assertIn("branch   feat/x  1 unpushed (vs origin/feat/x)", out)
+            self.assertIn("tree: 1 modified", out)
+
+        def test_detached_head_is_reported(self):
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "--detach", cwd=fork)
+            code, out, err = run("-C", fork, "status")
+            self.assertEqual(code, 0, err)
+            self.assertIn("(detached at", out)
+
+        def test_setup_line_before_setup(self):
+            fork = make_fork(self.tmp)
+            code, out, err = run("-C", fork, "status")
+            self.assertEqual(code, 0, err)
+            self.assertIn("(LIVE)", out)
+            self.assertIn("pre-push hook: missing", out)
+            self.assertIn("ff-only: develop no, main no", out)
+            self.assertIn("run `forkflow setup`", out)
+
+        def test_setup_line_after_a_simulated_setup(self):
+            fork = make_fork(self.tmp)
+            sh("git", "remote", "set-url", "--push", "upstream", "DISABLED", cwd=fork)
+            sh("git", "config", "branch.develop.mergeOptions", "--ff-only", cwd=fork)
+            sh("git", "config", "branch.main.mergeOptions", "--ff-only", cwd=fork)
+            hooks = hooks_path(fork)
+            os.makedirs(hooks, exist_ok=True)
+            with open(os.path.join(hooks, "pre-push"), "w") as fh:
+                fh.write("#!/bin/sh\n" + HOOK_MARK + "\nexit 0\n")
+            code, out, err = run("-C", fork, "status")
+            self.assertEqual(code, 0, err)
+            self.assertIn("upstream push: DISABLED", out)
+            self.assertIn("pre-push hook: installed", out)
+            self.assertIn("ff-only: develop yes, main yes", out)
+            self.assertNotIn("run `forkflow setup`", out)
+
+        def test_foreign_hook_is_named(self):
+            fork = make_fork(self.tmp)
+            hooks = hooks_path(fork)
+            os.makedirs(hooks, exist_ok=True)
+            with open(os.path.join(hooks, "pre-push"), "w") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            code, out, err = run("-C", fork, "status")
+            self.assertEqual(code, 0, err)
+            self.assertIn("pre-push hook: foreign", out)
+
+        def test_backups_listed_newest_first(self):
+            fork = make_fork(self.tmp)
+            for name in ("backup/20260101-000000-pre-sync",
+                         "backup/20260102-000000-pre-ship",
+                         "backup/20251231-000000-pre-sync"):
+                sh("git", "push", "origin", "develop:refs/heads/" + name, cwd=fork)
+            sh("git", "fetch", "origin", cwd=fork)
+            code, out, err = run("-C", fork, "status")
+            self.assertEqual(code, 0, err)
+            self.assertIn("backups  3 (refs/remotes/origin/backup/*):", out)
+            listed = [ln for ln in out.splitlines() if ln.startswith("  backups")][0]
+            self.assertIn("origin/backup/20260102-000000-pre-ship, "
+                          "origin/backup/20260101-000000-pre-sync, "
+                          "origin/backup/20251231-000000-pre-sync", listed)
+
+        def test_no_backups(self):
+            fork = make_fork(self.tmp)
+            _, out, _ = run("-C", fork, "status")
+            self.assertIn("backups  0 (refs/remotes/origin/backup/*)", out)
+
+        def test_fetch_refreshes_a_moved_upstream(self):
+            fork = make_fork(self.tmp)
+            before = rev(fork, "refs/remotes/upstream/main")
+            moved = commit_upstream(self.tmp, "src/app.py", "def main():\n    return 5\n")
+            self.assertEqual(rev(fork, "refs/remotes/upstream/main"), before)
+            code, out, err = run("-C", fork, "status", "--fetch")
+            self.assertEqual(code, 0, err)
+            self.assertIn("git fetch --multiple origin upstream", out)
+            self.assertEqual(rev(fork, "refs/remotes/upstream/main"), moved)
+            self.assertIn("mirror behind by 1", out)
+
+        def test_no_network_and_no_writes_without_fetch(self):
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "src/app.py", "def main():\n    return 5\n")
+            push_upstream_into_origin(self.tmp)
+            before = sh("git", "for-each-ref", cwd=fork)
+            code, out, err = run("-C", fork, "status")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(sh("git", "for-each-ref", cwd=fork), before)
+            self.assertNotIn("git fetch", out)
+
+        def test_mirror_unpushed_after_a_local_advance(self):
+            fork = make_fork(self.tmp)
+            target = commit_upstream(self.tmp, "src/app.py", "def main():\n    return 5\n")
+            sh("git", "fetch", "upstream", cwd=fork)
+            _, out, _ = run("-C", fork, "status")
+            self.assertIn("mirror behind by 1", out)
+            sh("git", "update-ref", "refs/heads/main", target, cwd=fork)
+            code, out, err = run("-C", fork, "status")
+            self.assertEqual(code, 0, err)
+            self.assertIn("unpushed 1", out)
+
+        def test_fresh_fork_gets_the_setup_hint(self):
+            fork = make_fresh_fork(self.tmp)
+            code, out, err = run("-C", fork, "status")
+            self.assertEqual(code, 0, err)
+            self.assertIn("origin/develop missing", out)
+            self.assertIn("run `forkflow setup`", out)
+            self.assertIn("trunk `develop` is not on origin", out)
+
+        def test_diverged_mirror_is_reported_and_exits_0(self):
+            fork = make_fork(self.tmp)
+            sh("git", "switch", "main", cwd=fork)
+            commit_fork(fork, "ours.txt", "ours\n", "work on the mirror")
+            code, out, err = run("-C", fork, "status")
+            self.assertEqual(code, 0, err)
+            self.assertIn("DIVERGED", out)
+            self.assertIn("Adopting forkflow", out)
+
+        def test_unfetched_upstream_is_reported_and_exits_0(self):
+            fork = make_fork(self.tmp)
+            sh("git", "symbolic-ref", "-d", "refs/remotes/upstream/HEAD", cwd=fork)
+            sh("git", "update-ref", "-d", "refs/remotes/upstream/main", cwd=fork)
+            code, out, err = run("-C", fork, "status")
+            self.assertEqual(code, 0, err)
+            self.assertIn("unfetched", out)
+            self.assertIn("divergence: unknown", out)
+
+        def test_single_branch_clone_shows_a_dash(self):
+            make_fork(self.tmp)
+            clone = os.path.join(self.tmp, "single")
+            sh("git", "clone", "--single-branch", "--branch", "develop",
+               os.path.join(self.tmp, "origin.git"), clone)
+            identity(clone)
+            sh("git", "remote", "add", "upstream", os.path.join(self.tmp, "upstream.git"), cwd=clone)
+            sh("git", "fetch", "upstream", cwd=clone)
+            code, out, err = run("-C", clone, "status")
+            self.assertEqual(code, 0, err)
+            self.assertIn("mirror  main -", out)
+
+        def test_no_upstream_remote_is_exit_2(self):
+            fork = make_fork(self.tmp)
+            sh("git", "remote", "remove", "upstream", cwd=fork)
+            code, out, err = run("-C", fork, "status")
+            self.assertEqual(code, 2)
+            self.assertEqual(out, "")
+            self.assertIn("forkflow setup --upstream-url", err)
+
+    # ------------------------------------------------------------------- #
     # argument parsing and main
     # ------------------------------------------------------------------- #
 
@@ -1248,7 +1540,7 @@ def run_tests() -> None:
     suite = unittest.TestSuite()
     for case in (TestDetectPlatform, TestGitVersion, TestLoadConfig, TestResolveCtx,
                  TestCleanTree, TestPush, TestPushMirror, TestAdvanceMirror,
-                 TestBootstrapTrunk, TestParseArgs, TestMainWiring):
+                 TestBootstrapTrunk, TestStatus, TestParseArgs, TestMainWiring):
         suite.addTests(loader.loadTestsFromTestCase(case))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)

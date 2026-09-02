@@ -564,11 +564,11 @@ step-by-step document with its real branch names and SHAs with that project, not
 **Files:**
 - Modify: `plugins/forkflow/scripts/forkflow.py`
 
-- [ ] `cmd_status`: optional `--fetch` (`git fetch --multiple origin <upstream>`); header (mirror line: `=` | `unpushed n` | `mirror behind by n` | `DIVERGED` | `unfetched`; trunk line incl. `missing`); branch line (unpushed count vs `origin/<branch>` or "not on origin", modified count); upstream-tracked files touched by the branch as a WARNING list; backups from `refs/remotes/origin/<backup_prefix>*` (count + newest 3, sorted by name); setup line (push URL DISABLED/LIVE, hook installed/missing via HOOK_MARK, ff-only yes/no for trunk and mirror)
-- [ ] `status` never writes and makes no network call without `--fetch`; degrades as specified (missing trunk -> hint, diverged mirror -> `DIVERGED` and exit 0, unfetched upstream, single-branch clone `-`, detached HEAD reported); missing upstream remote -> 2
-- [ ] write tests: numbers match a constructed state (fork ahead 2 / upstream ahead 1, divergence N/M), WARNING list contains exactly the touched upstream-tracked file, detached HEAD reported, setup line says LIVE/missing before setup, backups listed after a `backup/*` ref exists on origin and is fetched, `--fetch` refreshes a moved `upstream/main`, mirror line shows `mirror behind by 1` after an upstream commit and `unpushed 1` after a local-only advance, fresh fork -> the setup hint, diverged mirror -> `DIVERGED` with exit 0, unfetched upstream -> `unfetched` with exit 0
-- [ ] write tests: error case - no `upstream` remote -> exit 2 with the hint on stderr
-- [ ] run tests - must pass before task 3
+- [x] `cmd_status`: optional `--fetch` (`git fetch --multiple origin <upstream>`); header (mirror line: `=` | `unpushed n` | `mirror behind by n` | `DIVERGED` | `unfetched`; trunk line incl. `missing`); branch line (unpushed count vs `origin/<branch>` or "not on origin", modified count); upstream-tracked files touched by the branch as a WARNING list; backups from `refs/remotes/origin/<backup_prefix>*` (count + newest 3, sorted by name); setup line (push URL DISABLED/LIVE, hook installed/missing via HOOK_MARK, ff-only yes/no for trunk and mirror)
+- [x] `status` never writes and makes no network call without `--fetch`; degrades as specified (missing trunk -> hint, diverged mirror -> `DIVERGED` and exit 0, unfetched upstream, single-branch clone `-`, detached HEAD reported); missing upstream remote -> 2
+- [x] write tests: numbers match a constructed state (fork ahead 2 / upstream ahead 1, divergence N/M), WARNING list contains exactly the touched upstream-tracked file, detached HEAD reported, setup line says LIVE/missing before setup, backups listed after a `backup/*` ref exists on origin and is fetched, `--fetch` refreshes a moved `upstream/main`, mirror line shows `mirror behind by 1` after an upstream commit and `unpushed 1` after a local-only advance, fresh fork -> the setup hint, diverged mirror -> `DIVERGED` with exit 0, unfetched upstream -> `unfetched` with exit 0
+- [x] write tests: error case - no `upstream` remote -> exit 2 with the hint on stderr
+- [x] run tests - must pass before task 3
 
 ### Task 3: `check`
 
