@@ -684,10 +684,20 @@ step-by-step document with its real branch names and SHAs with that project, not
 **Files:**
 - Modify: `plugins/forkflow/scripts/forkflow.py`
 
-- [ ] gitlab `glab api projects/:fullpath` (`default_branch`, `merge_method`) + `protected_branches/<trunk>` and `/<mirror>`; github `gh api repos/{owner}/{repo}` (`default_branch`, `allow_merge_commit`, `allow_rebase_merge`) + `branches/<trunk>/protection` and `/<mirror>/protection`; 404 = unprotected, 403 = "not checked (insufficient rights)", tool missing/failing = "not checked"
-- [ ] expectations and fix commands exactly as in the `setup` block (PUT/POST/PATCH chosen by current state; mirror protection advisory unless force-push is explicitly allowed); never modifies anything remote
-- [ ] write tests with fake `glab`/`gh`: `default_branch: "main"` -> default-branch fix; `merge_method: "merge"` -> ff fix; unprotected trunk -> POST command; protected trunk with `allow_force_push: true` -> PATCH command; github `allow_merge_commit: false` -> PATCH command; 403 on protection -> "not checked (insufficient rights)" and no fix command; mirror unprotected -> advisory line only; matching values -> "ok"; tool absent -> "not checked"; dry run runs the report read-only
-- [ ] run tests - must pass before task 12
+- [x] gitlab `glab api projects/:fullpath` (`default_branch`, `merge_method`) + `protected_branches/<trunk>` and `/<mirror>`; github `gh api repos/{owner}/{repo}` (`default_branch`, `allow_merge_commit`, `allow_rebase_merge`) + `branches/<trunk>/protection` and `/<mirror>/protection`; 404 = unprotected, 403 = "not checked (insufficient rights)", tool missing/failing = "not checked"
+- [x] expectations and fix commands exactly as in the `setup` block (PUT/POST/PATCH chosen by current state; mirror protection advisory unless force-push is explicitly allowed); never modifies anything remote
+- [x] write tests with fake `glab`/`gh`: `default_branch: "main"` -> default-branch fix; `merge_method: "merge"` -> ff fix; unprotected trunk -> POST command; protected trunk with `allow_force_push: true` -> PATCH command; github `allow_merge_commit: false` -> PATCH command; 403 on protection -> "not checked (insufficient rights)" and no fix command; mirror unprotected -> advisory line only; matching values -> "ok"; tool absent -> "not checked"; dry run runs the report read-only
+- [x] run tests - must pass before task 12
+- ➕ [x] boolean fields in the fix commands use `-F` (typed), not the `-f` (string) of the plan's
+  examples: `glab api --help` and `gh api --help` both document `-F/--field` as the typed flag and
+  `-f/--raw-field` as the string one, so `-f allow_force_push=false` would send the *string*
+  `"false"`. Strings (`default_branch`, `merge_method`, `name`) keep `-f`
+- ➕ [x] GitHub branch protection has no PATCH: the fix command is the full PUT its API demands,
+  fed from stdin - `echo '{...}' | gh api -X PUT repos/{owner}/{repo}/branches/<trunk>/protection
+  --input -` (one POSIX-sh line, no heredoc to re-indent)
+- ➕ [x] a failing *project/repo* call ends the report (the protection calls would fail the same
+  way); only a per-branch failure is reported per branch. `api_status()` reads both tools'
+  wording (`(HTTP 404)`, `404 Not Found`) and is unit-tested
 
 ### Task 12: rules and the four skills
 

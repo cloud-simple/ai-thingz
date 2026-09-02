@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import os
 import re
 import shlex
@@ -1840,6 +1841,205 @@ def setup_git_config(ctx: Ctx) -> None:
         step("config", cmd, why)
 
 
+# --------------------------------------------------------------------------- #
+# setup: the platform report
+#
+# Default branch, merge method and branch protection are project-wide settings that only a
+# Maintainer can change, and changing one behind someone's back is exactly the kind of surprise
+# this plugin exists to prevent. So every call here is a GET: what is wrong is reported with the
+# command that fixes it, and a human runs it.
+# --------------------------------------------------------------------------- #
+
+# The four keys GitHub's protection PUT insists on, plus the one setting that matters here.
+GITHUB_PROTECTION = ('{"required_status_checks":null,"enforce_admins":true,'
+                     '"required_pull_request_reviews":null,"restrictions":null,'
+                     '"allow_force_pushes":false}')
+
+
+@dataclass
+class Reply:
+    """One read-only `glab api` / `gh api` call: the object it returned, or why there is none."""
+    data: Optional[dict] = None
+    status: Optional[int] = None
+    note: str = ""
+
+    def ok(self) -> bool:
+        return self.data is not None
+
+
+def api_status(text: str) -> Optional[int]:
+    """The HTTP status a failed call reports: `gh` prints `(HTTP 404)`, `glab` `404 Not Found`."""
+    m = re.search(r"HTTP[ /][0-9.]*\s*(\d{3})", text) or re.search(r"\b([45]\d\d)\b", text)
+    return int(m.group(1)) if m else None
+
+
+def api_get(ctx: Ctx, tool: str, path: str) -> Reply:
+    """`<tool> api <path>` - a GET, always: `setup` reports server settings, never changes them."""
+    try:
+        p = subprocess.run([tool, "api", path], cwd=ctx.root, capture_output=True)
+    except OSError as exc:
+        return Reply(note=f"not checked ({tool} unavailable: {exc.strerror or exc})")
+    out = p.stdout.decode("utf-8", "replace")
+    err = p.stderr.decode("utf-8", "replace")
+    if p.returncode != 0:
+        status = api_status(err + out)
+        if status == 403:
+            return Reply(status=status, note="not checked (insufficient rights)")
+        if status:
+            return Reply(status=status, note=f"not checked (HTTP {status})")
+        tail = (tail_lines(err, 1) or ["no output"])[0]
+        return Reply(note=f"not checked ({tool} exit {p.returncode}: {tail})")
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return Reply(note=f"not checked ({tool} did not answer with JSON)")
+    if not isinstance(data, dict):
+        return Reply(note=f"not checked ({tool} did not answer with an object)")
+    return Reply(data=data)
+
+
+def finding(text: str) -> None:
+    print(f"    {text}")
+
+
+def fix_cmd(cmd: str) -> None:
+    print(f"      fix: {cmd}")
+
+
+def default_branch_finding(ctx: Ctx, default: str) -> bool:
+    """True when the default branch has to change: merge requests open against it."""
+    if default == ctx.trunk:
+        finding(f"default branch: `{default}` is the trunk: ok")
+        return False
+    finding(f"default branch: `{default}` - it must be the trunk `{ctx.trunk}`, so that merge "
+            f"requests open against it and a fresh clone starts there")
+    return True
+
+
+def protection_finding(role: str, branch: str, force: Optional[bool]) -> bool:
+    """Print the verdict for one branch; True when a fix command belongs under it.
+    `force` is None when the branch is not protected at all."""
+    if force is None:
+        if role == "trunk":
+            finding(f"trunk `{branch}`: NOT protected - nothing on the server stops a direct "
+                    f"push or a force-push to it")
+            return True
+        finding(f"mirror `{branch}`: not protected (advisory: forkflow's pre-push hook already "
+                f"keeps it a pure copy of upstream; protecting it as well is optional)")
+        return False
+    if force:
+        finding(f"{role} `{branch}`: protected, but force-push is ALLOWED - undoing a bad merge "
+                f"by rewriting a published branch is the one thing protection is for here")
+        return True
+    finding(f"{role} `{branch}`: protected, force-push disallowed: ok")
+    return False
+
+
+def gitlab_protection(ctx: Ctx, role: str, branch: str) -> None:
+    path = f"projects/:fullpath/protected_branches/{branch}"
+    reply = api_get(ctx, "glab", path)
+    if reply.ok():
+        force = bool(reply.data.get("allow_force_push"))
+    elif reply.status == 404:                       # GitLab: no such protected branch
+        force = None
+    else:
+        finding(f"{role} `{branch}`: {reply.note}")
+        return
+    if not protection_finding(role, branch, force):
+        return
+    if force is None:
+        fix_cmd(f"glab api --method POST projects/:fullpath/protected_branches "
+                f"-f name={branch} -F allow_force_push=false")
+    else:
+        fix_cmd(f"glab api --method PATCH {path} -F allow_force_push=false")
+
+
+def gitlab_report(ctx: Ctx) -> None:
+    path = "projects/:fullpath"
+    reply = api_get(ctx, "glab", path)
+    if not reply.ok():
+        step("platform", f"glab api {path}", reply.note)
+        return
+    default = str(reply.data.get("default_branch") or "-")
+    method = str(reply.data.get("merge_method") or "-")
+    step("platform", f"glab api {path}",
+         f"read-only: default_branch={default}  merge_method={method}")
+    fixes = []
+    if default_branch_finding(ctx, default):
+        fixes.append(f"-f default_branch={ctx.trunk}")
+    if method == "ff":
+        finding("merge method: `ff`: ok")
+    else:
+        finding(f"merge method: `{method}` - ship MRs must fast-forward; a sync MR still goes "
+                f"in whole, its tip being the merge commit")
+        fixes.append("-f merge_method=ff")
+    if fixes:
+        fix_cmd(f"glab api --method PUT {path} " + " ".join(fixes))
+    gitlab_protection(ctx, "trunk", ctx.trunk)
+    gitlab_protection(ctx, "mirror", ctx.mirror)
+
+
+def github_protection(ctx: Ctx, role: str, branch: str) -> None:
+    path = "repos/{owner}/{repo}/branches/%s/protection" % branch
+    reply = api_get(ctx, "gh", path)
+    if reply.ok():
+        allowed = reply.data.get("allow_force_pushes")
+        force = bool(allowed.get("enabled")) if isinstance(allowed, dict) else bool(allowed)
+    elif reply.status == 404:                       # GitHub: "Branch not protected"
+        force = None
+    else:
+        finding(f"{role} `{branch}`: {reply.note}")
+        return
+    if not protection_finding(role, branch, force):
+        return
+    fix_cmd(f"echo '{GITHUB_PROTECTION}' | gh api -X PUT {path} --input -")
+
+
+def github_report(ctx: Ctx) -> None:
+    path = "repos/{owner}/{repo}"
+    reply = api_get(ctx, "gh", path)
+    if not reply.ok():
+        step("platform", f"gh api {path}", reply.note)
+        return
+    default = str(reply.data.get("default_branch") or "-")
+    merge_commit = bool(reply.data.get("allow_merge_commit"))
+    rebase = bool(reply.data.get("allow_rebase_merge"))
+    step("platform", f"gh api {path}",
+         f"read-only: default_branch={default}  allow_merge_commit={str(merge_commit).lower()}"
+         f"  allow_rebase_merge={str(rebase).lower()}")
+    fixes = []
+    if default_branch_finding(ctx, default):
+        fixes.append(f"-f default_branch={ctx.trunk}")
+    if merge_commit:
+        finding("merge commits: allowed: ok (a sync MR is merged with `Create a merge commit`)")
+    else:
+        finding("merge commits: NOT allowed - a sync MR has to go in as a merge commit; "
+                "squashing or rebasing it rewrites upstream's SHAs out of the trunk")
+        fixes.append("-F allow_merge_commit=true")
+    if rebase:
+        finding("rebase merges: allowed: ok (a ship MR is merged with `Rebase and merge`)")
+    else:
+        finding("rebase merges: NOT allowed - a ship MR is merged with `Rebase and merge`")
+        fixes.append("-F allow_rebase_merge=true")
+    if fixes:
+        fix_cmd(f"gh api -X PATCH {path} " + " ".join(fixes))
+    github_protection(ctx, "trunk", ctx.trunk)
+    github_protection(ctx, "mirror", ctx.mirror)
+
+
+def platform_report(ctx: Ctx) -> None:
+    """What the hosting platform has to say - reported, never changed. Runs in a dry run too:
+    every call is a GET."""
+    if ctx.platform == "gitlab":
+        gitlab_report(ctx)
+    elif ctx.platform == "github":
+        github_report(ctx)
+    else:
+        step("platform", f"# origin {ctx.origin_url or '-'}",
+             f"unknown host - check yourself that the default branch is `{ctx.trunk}`, that "
+             f"merge requests into it fast-forward, and that it is protected")
+
+
 def setup_template(ctx: Ctx) -> None:
     """A commented `.forkflow.toml`, left untracked: the branch names are the fork's decision."""
     path = os.path.join(ctx.root, CONFIG_FILE)
@@ -1888,6 +2088,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     setup_push_url(ctx)
     setup_hook(ctx, bool(getattr(args, "force", False)))
     setup_git_config(ctx)
+    platform_report(ctx)
     setup_template(ctx)
     return 0
 
@@ -4156,6 +4357,223 @@ def run_tests() -> None:
             self.assertNotEqual(origin_sha(self.fork, sync_branch_name()), "")
 
     # ------------------------------------------------------------------- #
+    # setup: the platform report - fake `glab`/`gh`, no network, no real tool
+    # ------------------------------------------------------------------- #
+
+    # (stdout or stderr, exit code) of one faked API call
+    GL_OK = ('{"default_branch":"develop","merge_method":"ff"}', 0)
+    GH_OK = ('{"default_branch":"develop","allow_merge_commit":true,'
+             '"allow_rebase_merge":true}', 0)
+    UNPROTECTED = ("404 Not Found", 1)
+    FORBIDDEN = ("403 Forbidden", 1)
+    GL_PROTECTED = ('{"name":"b","allow_force_push":false}', 0)
+    GL_FORCE = ('{"name":"b","allow_force_push":true}', 0)
+    GH_PROTECTED = ('{"allow_force_pushes":{"enabled":false}}', 0)
+    GH_FORCE = ('{"allow_force_pushes":{"enabled":true}}', 0)
+
+    class TestApiStatus(unittest.TestCase):
+        def test_both_tools_wording_is_understood(self):
+            self.assertEqual(api_status("gh: Not Found (HTTP 404)"), 404)
+            self.assertEqual(api_status("HTTP/1.1 403 Forbidden"), 403)
+            self.assertEqual(api_status("404 Not Found"), 404)          # glab
+            self.assertEqual(api_status("500 Internal Server Error"), 500)
+            self.assertIsNone(api_status("could not resolve host: gitlab.example.com"))
+
+    class PlatformBase(Base):
+        def api_tool(self, name: str, routes: Sequence[Tuple[str, str, int]]) -> None:
+            """A fake glab/gh answering per API path; every argument of every call is
+            recorded, so `the report never writes` can be proved."""
+            self.log = os.path.join(self.tmp, name + "-argv.txt")
+            lines = ['for a in "$@"; do echo "$a"; done >> %s' % shlex.quote(self.log),
+                     'case "$2" in']
+            for pattern, text, rc in routes:
+                answer = ("echo %s" % shlex.quote(text) if rc == 0
+                          else "echo %s >&2; exit %d" % (shlex.quote(text), rc))
+                lines.append("%s) %s;;" % (pattern, answer))
+            lines += ['*) echo "unexpected path: $2" >&2; exit 9;;', "esac"]
+            fake_tool(os.path.join(self.tmp, "bin"), name, "\n".join(lines) + "\n")
+
+        def gitlab_tool(self, project=GL_OK, trunk=GL_PROTECTED, mirror=GL_PROTECTED) -> None:
+            self.api_tool("glab", [
+                ("*protected_branches/develop", trunk[0], trunk[1]),
+                ("*protected_branches/main", mirror[0], mirror[1]),
+                ("projects/:fullpath", project[0], project[1]),
+            ])
+
+        def github_tool(self, repo=GH_OK, trunk=GH_PROTECTED, mirror=GH_PROTECTED) -> None:
+            self.api_tool("gh", [
+                ("*branches/develop/protection", trunk[0], trunk[1]),
+                ("*branches/main/protection", mirror[0], mirror[1]),
+                ("repos/*", repo[0], repo[1]),
+            ])
+
+        def argv(self) -> list:
+            with open(self.log) as fh:
+                return [ln.rstrip("\n") for ln in fh]
+
+        def report(self, platform: str) -> str:
+            ctx = ctx_for(make_fork(self.tmp))
+            ctx.platform = platform
+            _, out, err = capture(platform_report, ctx)
+            self.assertEqual(err, "")
+            return out
+
+        def fixes(self, out: str) -> list:
+            return [ln.strip()[len("fix: "):] for ln in out.splitlines()
+                    if ln.strip().startswith("fix: ")]
+
+    class TestPlatformReportGitlab(PlatformBase):
+        def test_everything_matching_is_ok_and_suggests_nothing(self):
+            self.gitlab_tool()
+            out = self.report("gitlab")
+            self.assertIn("default branch: `develop` is the trunk: ok", out)
+            self.assertIn("merge method: `ff`: ok", out)
+            self.assertIn("trunk `develop`: protected, force-push disallowed: ok", out)
+            self.assertIn("mirror `main`: protected, force-push disallowed: ok", out)
+            self.assertEqual(self.fixes(out), [])
+
+        def test_the_report_only_ever_reads(self):
+            self.gitlab_tool()
+            self.report("gitlab")
+            self.assertEqual(self.argv(), [
+                "api", "projects/:fullpath",
+                "api", "projects/:fullpath/protected_branches/develop",
+                "api", "projects/:fullpath/protected_branches/main"])
+
+        def test_a_wrong_default_branch_and_merge_method_share_one_fix(self):
+            self.gitlab_tool(project=('{"default_branch":"main","merge_method":"merge"}', 0))
+            out = self.report("gitlab")
+            self.assertIn("default branch: `main` - it must be the trunk `develop`", out)
+            self.assertIn("merge method: `merge` -", out)
+            self.assertEqual(self.fixes(out), [
+                "glab api --method PUT projects/:fullpath "
+                "-f default_branch=develop -f merge_method=ff"])
+
+        def test_an_unprotected_trunk_gets_a_post_and_the_mirror_only_advice(self):
+            self.gitlab_tool(trunk=UNPROTECTED, mirror=UNPROTECTED)
+            out = self.report("gitlab")
+            self.assertIn("trunk `develop`: NOT protected", out)
+            self.assertIn("mirror `main`: not protected (advisory", out)
+            self.assertEqual(self.fixes(out), [
+                "glab api --method POST projects/:fullpath/protected_branches "
+                "-f name=develop -F allow_force_push=false"])
+
+        def test_force_push_allowed_gets_a_patch_on_either_branch(self):
+            self.gitlab_tool(trunk=GL_FORCE, mirror=GL_FORCE)
+            out = self.report("gitlab")
+            self.assertIn("trunk `develop`: protected, but force-push is ALLOWED", out)
+            self.assertIn("mirror `main`: protected, but force-push is ALLOWED", out)
+            self.assertEqual(self.fixes(out), [
+                "glab api --method PATCH projects/:fullpath/protected_branches/develop "
+                "-F allow_force_push=false",
+                "glab api --method PATCH projects/:fullpath/protected_branches/main "
+                "-F allow_force_push=false"])
+
+        def test_403_on_protection_is_not_checked_and_suggests_nothing(self):
+            self.gitlab_tool(trunk=FORBIDDEN, mirror=FORBIDDEN)
+            out = self.report("gitlab")
+            self.assertIn("trunk `develop`: not checked (insufficient rights)", out)
+            self.assertIn("mirror `main`: not checked (insufficient rights)", out)
+            self.assertEqual(self.fixes(out), [])
+
+        def test_a_failing_project_call_stops_the_report(self):
+            self.gitlab_tool(project=("500 Internal Server Error", 1))
+            out = self.report("gitlab")
+            self.assertIn("not checked (HTTP 500)", out)
+            self.assertNotIn("trunk `develop`", out)
+            self.assertEqual(self.argv(), ["api", "projects/:fullpath"])
+
+        def test_a_missing_tool_is_not_checked(self):
+            ctx = ctx_for(make_fork(self.tmp))
+            ctx.platform = "gitlab"
+            missing = FileNotFoundError(2, "No such file or directory")
+            with mock.patch.object(subprocess, "run", side_effect=missing):
+                _, out, _ = capture(platform_report, ctx)
+            self.assertIn("not checked (glab unavailable: No such file or directory)", out)
+            self.assertNotIn("trunk `develop`", out)
+
+    class TestPlatformReportGithub(PlatformBase):
+        def test_everything_matching_is_ok_and_suggests_nothing(self):
+            self.github_tool()
+            out = self.report("github")
+            self.assertIn("default branch: `develop` is the trunk: ok", out)
+            self.assertIn("merge commits: allowed: ok", out)
+            self.assertIn("rebase merges: allowed: ok", out)
+            self.assertIn("trunk `develop`: protected, force-push disallowed: ok", out)
+            self.assertEqual(self.fixes(out), [])
+            self.assertEqual(self.argv(), [
+                "api", "repos/{owner}/{repo}",
+                "api", "repos/{owner}/{repo}/branches/develop/protection",
+                "api", "repos/{owner}/{repo}/branches/main/protection"])
+
+        def test_disabled_merge_options_are_fixed_together_with_the_default_branch(self):
+            self.github_tool(repo=('{"default_branch":"main","allow_merge_commit":false,'
+                                   '"allow_rebase_merge":false}', 0))
+            out = self.report("github")
+            self.assertIn("merge commits: NOT allowed", out)
+            self.assertIn("rebase merges: NOT allowed", out)
+            self.assertEqual(self.fixes(out), [
+                "gh api -X PATCH repos/{owner}/{repo} -f default_branch=develop "
+                "-F allow_merge_commit=true -F allow_rebase_merge=true"])
+
+        def test_an_unprotected_trunk_gets_the_put_and_the_mirror_only_advice(self):
+            self.github_tool(trunk=UNPROTECTED, mirror=UNPROTECTED)
+            out = self.report("github")
+            self.assertIn("trunk `develop`: NOT protected", out)
+            self.assertIn("mirror `main`: not protected (advisory", out)
+            self.assertEqual(self.fixes(out), [
+                "echo '%s' | gh api -X PUT "
+                "repos/{owner}/{repo}/branches/develop/protection --input -"
+                % GITHUB_PROTECTION])
+            self.assertIn('"allow_force_pushes":false', out)
+
+        def test_enabled_force_pushes_are_flagged(self):
+            self.github_tool(trunk=GH_FORCE, mirror=UNPROTECTED)
+            out = self.report("github")
+            self.assertIn("trunk `develop`: protected, but force-push is ALLOWED", out)
+            self.assertEqual(len(self.fixes(out)), 1)
+
+        def test_403_on_protection_is_not_checked(self):
+            self.github_tool(trunk=FORBIDDEN, mirror=FORBIDDEN)
+            out = self.report("github")
+            self.assertIn("trunk `develop`: not checked (insufficient rights)", out)
+            self.assertEqual(self.fixes(out), [])
+
+    class TestPlatformReportInSetup(PlatformBase):
+        def as_gitlab(self):
+            return mock.patch.object(sys.modules[__name__], "detect_platform",
+                                     lambda url: "gitlab")
+
+        def test_an_unknown_host_says_check_it_yourself(self):
+            out = self.report("unknown")
+            self.assertIn("unknown host", out)
+            self.assertIn("`develop`", out)
+
+        def test_a_fresh_fork_is_told_its_default_branch_is_wrong(self):
+            fork = make_fresh_fork(self.tmp)
+            self.gitlab_tool(project=('{"default_branch":"main","merge_method":"ff"}', 0),
+                             trunk=UNPROTECTED, mirror=UNPROTECTED)
+            with self.as_gitlab():
+                code, out, err = run("-C", fork, "setup")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("default branch: `main` - it must be the trunk `develop`", out)
+            self.assertIn("-f default_branch=develop", out)
+            self.assertIn("trunk `develop`: NOT protected", out)
+
+        def test_a_dry_run_still_runs_the_read_only_report(self):
+            fork = make_fork(self.tmp)
+            self.gitlab_tool()
+            with self.as_gitlab():
+                code, out, err = run("-C", fork, "setup", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("read-only: default_branch=develop  merge_method=ff", out)
+            self.assertIn("trunk `develop`: protected, force-push disallowed: ok", out)
+            self.assertEqual(self.argv(), [
+                "api", "projects/:fullpath",
+                "api", "projects/:fullpath/protected_branches/develop",
+                "api", "projects/:fullpath/protected_branches/main"])
+
+    # ------------------------------------------------------------------- #
     # merge requests
     # ------------------------------------------------------------------- #
 
@@ -4430,6 +4848,8 @@ def run_tests() -> None:
                  TestStatus, TestCheck, TestSync, TestSyncConflicts,
                  TestShip, TestShipErrors, TestSetup,
                  TestSetupHookInstall, TestSetupHookRefuses, TestSetupHookAllows,
+                 TestApiStatus, TestPlatformReportGitlab, TestPlatformReportGithub,
+                 TestPlatformReportInSetup,
                  TestMrCommand, TestOpenMr, TestMrEndToEnd,
                  TestParseArgs, TestMainWiring):
         suite.addTests(loader.loadTestsFromTestCase(case))
