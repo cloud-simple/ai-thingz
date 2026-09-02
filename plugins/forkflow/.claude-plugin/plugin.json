@@ -1,0 +1,10 @@
+{
+  "name": "forkflow",
+  "description": "Fork <-> upstream workflow: a pristine mirror of upstream, a protected MR-only trunk, and status/sync/ship/setup helpers that never push or rebase the trunk",
+  "version": "0.1.0",
+  "author": {
+    "name": "mtilson"
+  },
+  "homepage": "https://github.com/cloud-simple/ai-thingz",
+  "repository": "https://github.com/cloud-simple/ai-thingz"
+}
