@@ -633,11 +633,15 @@ step-by-step document with its real branch names and SHAs with that project, not
 **Files:**
 - Modify: `plugins/forkflow/scripts/forkflow.py`
 
-- [ ] `mr_command(ctx, branch, title, body_file)`: gitlab `glab mr create ...`, github `gh pr create ...` (target = trunk), unknown -> manual note; body written to a temp file; sync body (upstream commits, both-sides rows, mirror advance, backup + rollback, merge-button note), ship body (commit message + WARNING list + merge-button note)
-- [ ] `--mr` executes the command; tool missing or non-zero -> the command and stderr printed, exit stays 0
-- [ ] `--title` override for both `sync` and `ship`; defaults as in Technical Details
-- [ ] write tests: command strings per platform (URL-driven `Ctx`; target branch is the trunk, incl. a custom name); `--mr` with a fake `glab`/`gh` on `PATH` records the expected argv and body-file contents; missing tool -> 0 with the manual line; fake tool exiting 1 -> 0 with its stderr shown
-- [ ] run tests - must pass before task 9
+- [x] `mr_command(ctx, branch, title, body_file)`: gitlab `glab mr create ...`, github `gh pr create ...` (target = trunk), unknown -> manual note; body written to a temp file; sync body (upstream commits, both-sides rows, mirror advance, backup + rollback, merge-button note), ship body (commit message + WARNING list + merge-button note)
+- [x] `--mr` executes the command; tool missing or non-zero -> the command and stderr printed, exit stays 0
+- [x] `--title` override for both `sync` and `ship`; defaults as in Technical Details
+- [x] write tests: command strings per platform (URL-driven `Ctx`; target branch is the trunk, incl. a custom name); `--mr` with a fake `glab`/`gh` on `PATH` records the expected argv and body-file contents; missing tool -> 0 with the manual line; fake tool exiting 1 -> 0 with its stderr shown
+- [x] run tests - must pass before task 9
+- ➕ [x] `mr_command`, `open_mr`, `sync_body`, `ship_body` and `merge_button` were already written
+  in tasks 5-7 (both flows needed them to finish); task 8 verified them against the specification
+  and added the 14 missing tests (`TestMrCommand`, `TestOpenMr`, `TestMrEndToEnd`, `--mr`/`--title`
+  in `TestParseArgs`) - no behaviour change was needed
 
 ### Task 9: `setup` - remotes, names, mirror, trunk bootstrap, config, template
 

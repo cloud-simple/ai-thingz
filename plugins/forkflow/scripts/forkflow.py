@@ -3399,6 +3399,218 @@ def run_tests() -> None:
             self.assertEqual(origin_sha(fork, "develop"), before_trunk)
 
     # ------------------------------------------------------------------- #
+    # merge requests
+    # ------------------------------------------------------------------- #
+
+    class TestMrCommand(unittest.TestCase):
+        def ctx(self, url: str, trunk: str = DEFAULT_TRUNK) -> Ctx:
+            """A Ctx driven by the origin URL alone - no repository needed."""
+            c = Ctx(root="/repo", origin_url=url, trunk=trunk)
+            c.platform = detect_platform(url)
+            return c
+
+        def test_gitlab_command(self):
+            ctx = self.ctx("git@gitlab.com:group/proj.git")
+            self.assertEqual(
+                mr_command(ctx, "sync/upstream-20260101", "sync: title", "/tmp/body.md"),
+                ["glab", "mr", "create",
+                 "--source-branch", "sync/upstream-20260101",
+                 "--target-branch", "develop",
+                 "--title", "sync: title",
+                 "--description-file", "/tmp/body.md",
+                 "--remove-source-branch"])
+
+        def test_github_command(self):
+            ctx = self.ctx("https://github.com/owner/repo.git")
+            self.assertEqual(
+                mr_command(ctx, "feat/x", "ship: title", "/tmp/body.md"),
+                ["gh", "pr", "create",
+                 "--head", "feat/x", "--base", "develop",
+                 "--title", "ship: title", "--body-file", "/tmp/body.md"])
+
+        def test_the_target_is_the_trunk_even_when_renamed(self):
+            for url, flag in (("git@gitlab.com:g/p.git", "--target-branch"),
+                              ("git@github.com:g/p.git", "--base")):
+                cmd = mr_command(self.ctx(url, trunk="mainline"), "feat/x", "t", "/b.md")
+                self.assertEqual(cmd[cmd.index(flag) + 1], "mainline", cmd)
+
+        def test_unknown_platform_has_no_command(self):
+            self.assertEqual(mr_command(self.ctx("/srv/git/repo.git"), "feat/x", "t", "/b.md"), [])
+
+        def test_merge_buttons(self):
+            gitlab, github = (self.ctx("https://gitlab.com/g/p"),
+                              self.ctx("https://github.com/g/p"))
+            unknown = self.ctx("/srv/git/p.git")
+            for c in (gitlab, github, unknown):
+                self.assertIn("never squash", merge_button(c, "sync"), c.platform)
+                self.assertIn("never rebase", merge_button(c, "sync"), c.platform)
+            self.assertIn("fast-forward", merge_button(gitlab, "ship"))
+            self.assertIn("Rebase and merge", merge_button(github, "ship"))
+
+    class TestOpenMr(Base):
+        def test_unknown_platform_prints_the_manual_note(self):
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            shown, out, _ = capture(open_mr, ctx, "feat/x", "a title", "body\n", True)
+            self.assertEqual(shown, "")
+            self.assertIn("open the merge request manually: feat/x -> develop", out)
+            self.assertIn("a title", out)
+
+        def test_missing_tool_is_reported_and_never_raises(self):
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            ctx.platform = "gitlab"
+            missing = FileNotFoundError(2, "No such file or directory")
+            with mock.patch.object(subprocess, "run", side_effect=missing):
+                shown, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+            self.assertIn("glab mr create", shown)
+            self.assertIn("glab unavailable", out)
+            self.assertIn("No such file or directory", out)
+
+        def test_dry_run_writes_no_body_file(self):
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork, dry_run=True)
+            ctx.platform = "github"
+            shown, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+            self.assertIn("gh pr create", shown)
+            self.assertIn("<description file>", shown)
+            self.assertIn("not run (dry run)", out)
+
+    class TestMrEndToEnd(Base):
+        def record(self, name: str) -> str:
+            """A fake glab/gh that records its argv, one argument per line, and prints a URL."""
+            log = os.path.join(self.tmp, name + "-argv.txt")
+            fake_tool(os.path.join(self.tmp, "bin"), name,
+                      'for a in "$@"; do echo "$a"; done > %s\n'
+                      'echo "https://example.invalid/merge_requests/1"\n' % shlex.quote(log))
+            return log
+
+        def argv(self, log: str) -> list:
+            with open(log) as fh:
+                return [ln.rstrip("\n") for ln in fh]
+
+        def value(self, argv: Sequence[str], flag: str) -> str:
+            self.assertIn(flag, argv)
+            return argv[list(argv).index(flag) + 1]
+
+        def body_of(self, argv: Sequence[str], flag: str) -> str:
+            with open(self.value(argv, flag)) as fh:
+                return fh.read()
+
+        def as_gitlab(self):
+            return mock.patch.object(sys.modules[__name__], "detect_platform",
+                                     lambda url: "gitlab")
+
+        def as_github(self):
+            return mock.patch.object(sys.modules[__name__], "detect_platform",
+                                     lambda url: "github")
+
+        def test_sync_mr_runs_glab_with_the_sync_body(self):
+            fork = make_fork(self.tmp)
+            commit_fork(fork, "shared.tf",
+                        'resource "null_resource" "a" {\n  count = 2\n}\n',
+                        "ours: shared", push=True)
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            log = self.record("glab")
+            name = sync_branch_name()
+
+            with self.as_gitlab():
+                code, out, err = run("-C", fork, "sync", "--mr")
+            self.assertEqual(code, 0, err + out)
+
+            argv = self.argv(log)
+            self.assertEqual(argv[:2], ["mr", "create"])
+            self.assertIn("--remove-source-branch", argv)
+            self.assertEqual(self.value(argv, "--source-branch"), name)
+            self.assertEqual(self.value(argv, "--target-branch"), "develop")
+            stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
+            self.assertEqual(self.value(argv, "--title"),
+                             "sync: upstream/main %s (1 commits)" % stamp)
+
+            body = self.body_of(argv, "--description-file")
+            self.assertIn("theirs: docs", body)                     # upstream commits taken
+            self.assertIn("Upstream commits taken (1)", body)
+            self.assertIn("Files changed on both sides", body)
+            self.assertIn("Mirror `main`:", body)                   # the mirror advance
+            self.assertIn(DEFAULT_BACKUP_PREFIX, body)              # backup name
+            self.assertIn("Rollback: `git reset --hard origin/" + DEFAULT_BACKUP_PREFIX, body)
+            self.assertIn("never squash it, never rebase it", body)  # merge button
+            self.assertIn("created", out)
+            self.assertIn("https://example.invalid/merge_requests/1", out)
+
+        def test_ship_mr_runs_gh_with_the_commit_message_as_the_body(self):
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "-b", "feat/x", "develop", cwd=fork)
+            commit_fork(fork, "src/app.py", "def main():\n    return 42\n", "ours: bump app")
+            second_clone_commit(self.tmp)
+            log = self.record("gh")
+
+            with self.as_github():
+                code, out, err = run("-C", fork, "ship", "--mr")
+            self.assertEqual(code, 0, err + out)
+
+            argv = self.argv(log)
+            self.assertEqual(argv[:2], ["pr", "create"])
+            self.assertEqual(self.value(argv, "--head"), "feat/x")
+            self.assertEqual(self.value(argv, "--base"), "develop")
+            self.assertEqual(self.value(argv, "--title"), "ours: bump app")
+
+            body = self.body_of(argv, "--body-file")
+            self.assertIn("ours: bump app", body)
+            self.assertIn("Upstream-tracked files touched (1)", body)   # the WARNING list
+            self.assertIn("- `src/app.py`", body)
+            self.assertIn("Rebase and merge", body)                     # merge button
+            self.assertIn("created", out)
+
+        def test_titles_are_overridden_and_the_command_is_only_printed_without_mr(self):
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            with self.as_gitlab():
+                code, out, err = run("-C", fork, "sync", "--title", "sync: hand written")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("--title 'sync: hand written'", out)
+            self.assertIn("not run (add --mr to run it)", out)
+
+        def test_ship_title_is_overridden(self):
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "-b", "feat/x", "develop", cwd=fork)
+            commit_fork(fork, "ours/a.txt", "a\n", "ours: a")
+            second_clone_commit(self.tmp)
+            with self.as_github():
+                code, out, err = run("-C", fork, "ship", "--title", "ship: hand written")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("--title 'ship: hand written'", out)
+
+        def test_a_failing_tool_leaves_the_branch_pushed_and_exits_0(self):
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            fake_tool(os.path.join(self.tmp, "bin"), "glab",
+                      'echo "glab: not authenticated" >&2\nexit 1\n')
+            name = sync_branch_name()
+
+            with self.as_gitlab():
+                code, out, err = run("-C", fork, "sync", "--mr")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("FAILED (exit 1) - open it yourself", out)
+            self.assertIn("glab: not authenticated", out)
+            self.assertIn("description:", out)
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+
+        def test_a_missing_tool_exits_0_with_the_command(self):
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "-b", "feat/x", "develop", cwd=fork)
+            commit_fork(fork, "ours/a.txt", "a\n", "ours: a")
+            second_clone_commit(self.tmp)
+            absent = ["forkflow-no-such-tool", "pr", "create"]
+
+            with self.as_github(), mock.patch.object(
+                    sys.modules[__name__], "mr_command", lambda *a: absent):
+                code, out, err = run("-C", fork, "ship", "--mr")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("forkflow-no-such-tool unavailable", out)
+            self.assertEqual(origin_sha(fork, "feat/x"), rev(fork, "HEAD"))
+
+    # ------------------------------------------------------------------- #
     # argument parsing and main
     # ------------------------------------------------------------------- #
 
@@ -3421,6 +3633,11 @@ def run_tests() -> None:
             self.assertTrue(parse_args(["ship", "--continue"]).cont)
             self.assertEqual(parse_args(["ship", "--message-file", "m.txt"]).message_file, "m.txt")
             self.assertEqual(parse_args(["setup", "--upstream-url", "U"]).upstream_url, "U")
+            for cmd in ("sync", "ship"):
+                self.assertTrue(parse_args([cmd, "--mr"]).mr, cmd)
+                self.assertEqual(parse_args([cmd, "--title", "t"]).title, "t", cmd)
+                self.assertFalse(parse_args([cmd]).mr, cmd)
+                self.assertIsNone(parse_args([cmd]).title, cmd)
 
         def test_no_subcommand_is_exit_2(self):
             code, _, err = capture(main, [])
@@ -3455,6 +3672,7 @@ def run_tests() -> None:
                  TestBootstrapTrunk, TestBackup, TestSimulateMerge, TestSimulateMergeOldGit,
                  TestStatus, TestCheck, TestSync, TestSyncConflicts,
                  TestShip, TestShipErrors,
+                 TestMrCommand, TestOpenMr, TestMrEndToEnd,
                  TestParseArgs, TestMainWiring):
         suite.addTests(loader.loadTestsFromTestCase(case))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
