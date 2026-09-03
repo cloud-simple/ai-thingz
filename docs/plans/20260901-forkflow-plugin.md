@@ -739,9 +739,18 @@ step-by-step document with its real branch names and SHAs with that project, not
   patches `COMMANDS` so the subcommand raises `KeyboardInterrupt` and asserts `main` returns 130
 
 ### Task 14: [Final] Update documentation
-- [ ] `README.md`: table row for `forkflow`; a `## forkflow` section (the layout diagram, the six rules, the four skills, the sequence, `.forkflow.toml` with the Python 3.11 note, exit codes, `--test`, *Adopting forkflow in an existing fork* generic recipe incl. the GitLab pull-mirroring alternative); install line `/plugin install forkflow@ai-thingz`; layout block gains `plugins/<plugin>/scripts/` (shared scripts) and notes that `forkflow.py` carries its own tests so `tests/` no longer covers every plugin; state that the "link a single skill" symlink install does **not** apply to forkflow (its skills need `${CLAUDE_PLUGIN_ROOT}`); no project-specific names
-- [ ] update CLAUDE.md if new patterns discovered (none expected - the repo has no CLAUDE.md)
-- [ ] move this plan to `docs/plans/completed/`
+- [x] `README.md`: table row for `forkflow`; a `## forkflow` section (the layout diagram, the six rules, the four skills, the sequence, `.forkflow.toml` with the Python 3.11 note, exit codes, `--test`, *Adopting forkflow in an existing fork* generic recipe incl. the GitLab pull-mirroring alternative); install line `/plugin install forkflow@ai-thingz`; layout block gains `plugins/<plugin>/scripts/` (shared scripts) and notes that `forkflow.py` carries its own tests so `tests/` no longer covers every plugin; state that the "link a single skill" symlink install does **not** apply to forkflow (its skills need `${CLAUDE_PLUGIN_ROOT}`); no project-specific names
+- [x] update CLAUDE.md if new patterns discovered - the repo has no `CLAUDE.md` (checked: none at
+  the root, none under `plugins/`, `docs/` or `tests/`), so nothing to update and none was created
+- [x] move this plan to `docs/plans/completed/`
+- ➕ [x] the README claims were checked against the code rather than against the plan, which
+  corrected three of them: the source-invariant sentence (the test asserts the git *argument*
+  `--force` appears nowhere - the CLI flag `--force` does exist, in `parse_args`; the sentence now
+  also names the `update-ref` / `merge --ff-only` / `rebase` invariants), the `status` trigger
+  phrase (the skill's description says "how much has this fork diverged"), and the adoption
+  recipe's step 3 (`setup` prints the fix command for the *detected* platform, not "both commands
+  for GitLab and GitHub"). The sample `status` screen was verified by running the real subcommand
+  on a throwaway fork - it matches the documented format line for line
 
 ## Post-Completion
 *Items requiring manual intervention or external systems - no checkboxes, informational only*
