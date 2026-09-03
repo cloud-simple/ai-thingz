@@ -4840,6 +4840,63 @@ def run_tests() -> None:
             self.assertIn("trunk   develop", out)
             self.assertIn("platform=unknown", out)
 
+        def test_an_interrupt_is_exit_130(self):
+            def interrupted(_args):
+                raise KeyboardInterrupt
+
+            fork = make_fork(self.tmp)
+            with mock.patch.dict(COMMANDS, {"status": interrupted}):
+                code, _, _ = run("-C", fork, "status")
+            self.assertEqual(code, 130)
+
+    class TestSourceInvariants(unittest.TestCase):
+        """The rules read off the source itself.
+
+        The helpers are unit-tested for what they refuse; this proves nothing *else* in the
+        script pushes, rebases or moves the mirror behind their backs - the mistake the whole
+        workflow exists to make impossible. Only the code above `run_tests` is examined."""
+
+        @classmethod
+        def setUpClass(cls):
+            import ast
+            with open(os.path.abspath(__file__), encoding="utf-8") as fh:
+                src = fh.read()
+            tree = ast.parse(src)
+            cls.limit = next(n.lineno for n in tree.body
+                             if isinstance(n, ast.FunctionDef) and n.name == "run_tests")
+            funcs = [n for n in ast.walk(tree)
+                     if isinstance(n, ast.FunctionDef) and n.lineno < cls.limit]
+            funcs.sort(key=lambda n: n.end_lineno - n.lineno, reverse=True)
+            cls.owner = {}
+            for n in funcs:                      # innermost def wins
+                for ln in range(n.lineno, n.end_lineno + 1):
+                    cls.owner[ln] = n.name
+            cls.lines = src.splitlines()
+
+        def owners(self, needle: str) -> set:
+            """Names of the functions whose code contains `needle` (prose is not code)."""
+            return {self.owner[n] for n, line in enumerate(self.lines, 1)
+                    if n < self.limit and n in self.owner and needle in line}
+
+        def test_only_the_three_helpers_push(self):
+            self.assertEqual(self.owners('"push"'), {"push", "push_mirror", "bootstrap_trunk"})
+
+        def test_no_force_push_and_no_hook_bypass(self):
+            self.assertEqual(self.owners('"--force"'), {"parse_args"})   # the CLI flag, not git's
+            self.assertEqual(self.owners("--no-verify"), set())
+            self.assertEqual(self.owners("--force-with-lease"), {"push"})
+
+        def test_only_advance_mirror_moves_the_mirror(self):
+            self.assertEqual(self.owners('"update-ref"'), {"advance_mirror"})
+            self.assertEqual(self.owners('"merge", "--ff-only"'), {"advance_mirror"})
+
+        def test_the_only_rebase_is_of_a_feature_branch(self):
+            self.assertEqual(self.owners('"rebase"'), {"rebase_onto"})
+
+        def test_git_and_the_platform_tools_are_the_only_subprocesses(self):
+            self.assertEqual(self.owners("subprocess"),
+                             {"git", "git_ok", "git_rc", "shell", "open_mr", "api_get"})
+
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     for case in (TestDetectPlatform, TestGitVersion, TestLoadConfig, TestResolveCtx,
@@ -4851,7 +4908,7 @@ def run_tests() -> None:
                  TestApiStatus, TestPlatformReportGitlab, TestPlatformReportGithub,
                  TestPlatformReportInSetup,
                  TestMrCommand, TestOpenMr, TestMrEndToEnd,
-                 TestParseArgs, TestMainWiring):
+                 TestParseArgs, TestMainWiring, TestSourceInvariants):
         suite.addTests(loader.loadTestsFromTestCase(case))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)
