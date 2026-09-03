@@ -175,6 +175,25 @@ CONFIG_STRINGS = ("upstream", "upstream_branch", "mirror", "trunk",
                   "sync_prefix", "backup_prefix")
 
 
+def have_tomllib() -> bool:
+    """Whether `.forkflow.toml` can be read at all - Python 3.11+ (or a backport on the path)."""
+    try:
+        import tomllib  # noqa: F401   Python 3.11+
+    except ImportError:
+        return False
+    return True
+
+
+def configures_nothing(path: str) -> bool:
+    """True when the file holds nothing but blank lines and `#` comments."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return all(not line.strip() or line.strip().startswith("#") for line in text.splitlines())
+
+
 def load_config(root: str) -> dict:
     """{} when absent. A config that exists but cannot be read - or carries a value of the
     wrong type - is a hard failure: it names the branches every safety check depends on."""
@@ -184,6 +203,11 @@ def load_config(root: str) -> dict:
     try:
         import tomllib  # Python 3.11+
     except ImportError:
+        # a file of nothing but comments configures nothing: reading it as `{}` is exactly what
+        # tomllib would have said, and refusing it would brick every subcommand over the
+        # commented template `setup` used to leave behind
+        if configures_nothing(path):
+            return {}
         raise Fail(f"{CONFIG_FILE} needs Python 3.11+ (tomllib) to be read; "
                    f"this is Python {sys.version_info[0]}.{sys.version_info[1]}. "
                    f"Remove the file or run forkflow with a newer Python.")
@@ -263,9 +287,46 @@ def no_upstream_message(name: Optional[str], others: Sequence[str]) -> str:
 
 
 def valid_branch_name(name: str) -> bool:
-    """git's own verdict. The names reach refs, shell commands and the generated hook,
-    so a name git would refuse is refused here rather than interpolated anywhere."""
-    return bool(name) and git_ok("check-ref-format", f"refs/heads/{name}")
+    """git's own verdict, plus the two leading characters git's own parsers read as syntax.
+
+    The names reach refs, shell commands and the generated hook, so a name git would refuse is
+    refused here rather than interpolated anywhere. `check-ref-format` accepts `+foo` and
+    `-foo`, but a refspec beginning with `+` means *force* and an argument beginning with `-`
+    is an option: such a name turns an ordinary command into a different one."""
+    if not name or name[0] in "+-":
+        return False
+    return git_ok("check-ref-format", f"refs/heads/{name}")
+
+
+def mirror_divergence(ctx: Ctx) -> Tuple[bool, bool]:
+    """(diverged, ahead) of the local mirror against `upstream/<branch>` as last fetched.
+
+    (False, False) when there is no local mirror, or when either ref is missing - "cannot tell"
+    is not "diverged". Recomputed after a fetch: what this answers is only ever as true as the
+    upstream ref it was asked about."""
+    if not has_ref(ctx.root, f"refs/heads/{ctx.mirror}"):
+        return (False, False)
+    rc, _, _ = git_rc("merge-base", "--is-ancestor", ctx.mirror, ctx.up(), cwd=ctx.root)
+    if rc != 1:
+        return (False, False)
+    ahead, _, _ = git_rc("merge-base", "--is-ancestor", ctx.up(), ctx.mirror, cwd=ctx.root)
+    return (True, ahead == 0)
+
+
+def mirror_from_origin(ctx: Ctx) -> bool:
+    """True when everything the local mirror carries is also on `origin/<mirror>`.
+
+    That is the ordinary team state, not divergence: a teammate's `sync` advanced
+    `origin/<mirror>` to an upstream commit this clone has not fetched from `upstream` yet, and
+    `git fetch origin` fast-forwarded the local mirror onto it. Only `push_mirror()` and
+    `advance_mirror()`, which run after the command's own fetch, can tell that apart from work
+    committed on the mirror - and they both refuse it. Refusing here instead would fail `sync`,
+    `ship` and `check` in a state every fork with two people in it reaches."""
+    remote = f"refs/remotes/{ctx.origin}/{ctx.mirror}"
+    if not has_ref(ctx.root, remote):
+        return False
+    rc, _, _ = git_rc("merge-base", "--is-ancestor", ctx.mirror, remote, cwd=ctx.root)
+    return rc == 0
 
 
 def resolve_ctx(cwd: str, args: object = None, need_upstream: bool = True,
@@ -337,22 +398,17 @@ def resolve_ctx(cwd: str, args: object = None, need_upstream: bool = True,
     remote_mirror = has_ref(root, f"refs/remotes/{ctx.origin}/{ctx.mirror}")
     if strict_mirror and not (local_mirror or remote_mirror):
         raise Fail(f"mirror `{mirror}` exists neither locally nor on origin - run `forkflow setup`")
-    # only the local mirror, and only against the last fetch. `origin/<mirror>` is checked by
-    # push_mirror() against a *fresh* upstream instead: a teammate's sync legitimately puts it
-    # ahead of an upstream ref this clone has not refreshed yet, and that is not divergence.
     if local_mirror:
-        rc, _, _ = git_rc("merge-base", "--is-ancestor", ctx.mirror, ctx.up(), cwd=root)
-        if rc == 1:
-            ctx.mirror_diverged = True
-            ahead, _, _ = git_rc("merge-base", "--is-ancestor", ctx.up(), ctx.mirror, cwd=root)
-            ctx.mirror_ahead = ahead == 0
-            if strict_mirror:
-                raise Fail(f"`{ctx.mirror}` has commits that are not in `{ctx.up()}` as last "
-                           f"fetched: run `git fetch {upstream}` and try again; if it is still "
-                           f"ahead afterwards it cannot be the mirror. {README_POINTER}")
-        elif rc != 0:
+        if not has_ref(root, f"refs/remotes/{upstream}/{ub}"):
             if strict_mirror:
                 raise Fail(f"`{ctx.up()}` is not fetched yet: run `git fetch {upstream}`")
+        else:
+            ctx.mirror_diverged, ctx.mirror_ahead = mirror_divergence(ctx)
+            if ctx.mirror_diverged and strict_mirror and not mirror_from_origin(ctx):
+                raise Fail(f"`{ctx.mirror}` carries commits that are in neither `{ctx.up()}` "
+                           f"as last fetched nor `{ctx.origin}/{ctx.mirror}`: run "
+                           f"`git fetch {upstream}` and try again; if it is still ahead "
+                           f"afterwards it cannot be the mirror. {README_POINTER}")
 
     if need_trunk and not has_ref(root, f"refs/remotes/{ctx.origin}/{trunk}"):
         raise Fail(f"trunk `{trunk}` is not on origin - run `forkflow setup`")
@@ -642,7 +698,14 @@ def push(ctx: Ctx, branch: str, lease: Optional[str] = None, backup_ref: str = "
     """Push a feature/sync/backup branch. Never the trunk, never the mirror, never --force.
 
     A lease means a rewrite of published history, and rule 4 allows that only behind a
-    backup that is already confirmed on origin - so the caller has to name it."""
+    backup that is already confirmed on origin - so the caller has to name it.
+
+    Both sides of the refspec are fully qualified: `<branch>:refs/heads/<branch>` with a branch
+    named `+x` is read by git as *force* with the source `x`, which is a silent unconditional
+    force-push of a different branch - no `--force` anywhere in sight."""
+    if not valid_branch_name(branch):
+        raise Fail(f"refusing to push `{branch}`: git's refspec grammar does not read that as "
+                   f"one branch (a leading `+` means force, a leading `-` an option)")
     if branch == ctx.trunk:
         raise Fail(f"refusing to push the trunk `{branch}`: it is only ever reached "
                    f"through a merge request")
@@ -658,7 +721,7 @@ def push(ctx: Ctx, branch: str, lease: Optional[str] = None, backup_ref: str = "
         args.append(f"--force-with-lease={branch}:{lease}")
     if not has_ref(ctx.root, f"refs/remotes/{ctx.origin}/{branch}"):
         args.append("-u")
-    args += [ctx.origin, f"{branch}:refs/heads/{branch}"]
+    args += [ctx.origin, f"refs/heads/{branch}:refs/heads/{branch}"]
     cmd = "git " + " ".join(args)
     if ctx.dry_run:
         step("push", cmd, "not run (dry run)", dry=True)
@@ -677,12 +740,16 @@ def push(ctx: Ctx, branch: str, lease: Optional[str] = None, backup_ref: str = "
     return cmd
 
 
-def push_mirror(ctx: Ctx) -> str:
-    """The only way the mirror reaches origin: never forced, only a pure copy of upstream."""
+def push_mirror(ctx: Ctx, target: str = "") -> str:
+    """The only way the mirror reaches origin: never forced, only a pure copy of upstream.
+
+    `target` is the commit this run moves the mirror to. A dry run has not moved the local
+    mirror, so without it the ancestry check would judge a tip the real push never sends and
+    refuse the ordinary state a teammate's sync leaves behind."""
     m = ctx.mirror
     if not has_ref(ctx.root, f"refs/heads/{m}"):
         if ctx.dry_run:              # advance_mirror would have created it; nothing to inspect
-            cmd = f"git push {ctx.origin} {m}:refs/heads/{m}"
+            cmd = f"git push {ctx.origin} refs/heads/{m}:refs/heads/{m}"
             step("mirror push", cmd, f"not run (dry run: `{m}` is created by this run)", dry=True)
             return cmd
         raise Fail(f"no local `{m}` to push")
@@ -693,11 +760,15 @@ def push_mirror(ctx: Ctx) -> str:
     if rc != 0:
         raise Fail(f"cannot verify `{m}` against `{ctx.up()}`: run `git fetch {ctx.upstream}`")
     if has_ref(ctx.root, f"refs/remotes/{ctx.origin}/{m}"):
-        rc, _, _ = git_rc("merge-base", "--is-ancestor", f"{ctx.origin}/{m}", m, cwd=ctx.root)
+        # what this push sends: the local mirror, or the target a dry run has not moved it to
+        sending = target or m
+        what = short(target) if target else f"the local `{m}`"
+        rc, _, _ = git_rc("merge-base", "--is-ancestor", f"{ctx.origin}/{m}", sending,
+                          cwd=ctx.root)
         if rc != 0:
-            raise Fail(f"`{ctx.origin}/{m}` is not an ancestor of the local `{m}`: "
-                       f"fetch and fast-forward first - the mirror is never forced")
-    args = ["push", ctx.origin, f"{m}:refs/heads/{m}"]
+            raise Fail(f"`{ctx.origin}/{m}` is not an ancestor of {what}: fetch and "
+                       f"fast-forward first - the mirror is never forced")
+    args = ["push", ctx.origin, f"refs/heads/{m}:refs/heads/{m}"]
     cmd = "git " + " ".join(args)
     if ctx.dry_run:
         step("mirror push", cmd, "not run (dry run)", dry=True)
@@ -766,12 +837,12 @@ def bootstrap_trunk(ctx: Ctx, target: str) -> None:
     if has_ref(ctx.root, f"refs/heads/{t}") or has_ref(ctx.root, f"refs/remotes/{ctx.origin}/{t}"):
         raise Fail(f"trunk `{t}` already exists: bootstrap only creates it on a fresh fork")
     cmd = (f"git branch --no-track {t} {short(target)} && "
-           f"git push {ctx.origin} {t}:refs/heads/{t}")
+           f"git push {ctx.origin} refs/heads/{t}:refs/heads/{t}")
     if ctx.dry_run:
         step("trunk", cmd, f"would create {t} at {short(target)} and push it", dry=True)
         return
     git("branch", "--no-track", t, target, cwd=ctx.root)
-    rc, _, err = git_rc("push", ctx.origin, f"{t}:refs/heads/{t}", cwd=ctx.root)
+    rc, _, err = git_rc("push", ctx.origin, f"refs/heads/{t}:refs/heads/{t}", cwd=ctx.root)
     if rc != 0:
         git("branch", "-D", t, cwd=ctx.root, check=False)
         step("trunk", cmd, "REJECTED")
@@ -956,6 +1027,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         tail = err.strip().splitlines()[-1] if err.strip() else "see git output"
         fetch_result = ("remote-tracking refs refreshed" if rc == 0
                         else f"FAILED, reporting the refs on disk: {tail}")
+        # resolve_ctx judged the mirror against the refs as they were *before* this fetch:
+        # reporting that verdict next to a table built from the refreshed refs contradicts it
+        ctx.mirror_diverged, ctx.mirror_ahead = mirror_divergence(ctx)
 
     header(ctx, "status")
     if fetch_result:
@@ -1226,6 +1300,35 @@ def sync_branch_is_free(ctx: Ctx, name: str, force: bool) -> None:
                    f"or recreate it from {ctx.origin}/{ctx.trunk} with `forkflow sync --force`")
 
 
+def free_sync_name(ctx: Ctx, name: str) -> str:
+    """The name a `--force` rerun publishes under: `<name>`, or the first free `<name>-N`.
+
+    `--force` redoes a sync whose MR went stale, and the name is dated, so a same-day rerun
+    would push at a branch that is already on origin - which a sync branch cannot be: its tip
+    is a merge commit off the *old* trunk, so the push is not a fast-forward, and rule 5 rules
+    out rewriting it (a sync MR is never rebased and never force-pushed; the stale one is
+    closed and a new one opened). Asked of the remote, not of the remote-tracking refs: this
+    runs before the fetch, and another clone's sync counts too."""
+    rc, out, _ = git_rc("ls-remote", "--heads", ctx.origin, f"refs/heads/{name}",
+                        f"refs/heads/{name}-*", cwd=ctx.root)
+    if rc != 0:                        # cannot ask: the push itself stays the answer
+        return name
+    taken = {line.split("\t")[-1].strip() for line in out.splitlines() if "\t" in line}
+    if f"refs/heads/{name}" not in taken:
+        return name
+    for n in range(2, 100):
+        candidate = f"{name}-{n}"
+        if (f"refs/heads/{candidate}" not in taken
+                and not has_ref(ctx.root, f"refs/heads/{candidate}")):
+            step("branch", f"git ls-remote --heads {ctx.origin} refs/heads/{name}",
+                 f"`{name}` is already published: this sync becomes `{candidate}`")
+            print(f"    close the merge request of `{name}`: it is the stale one this rerun "
+                  f"replaces (a sync MR is never rebased or force-pushed)")
+            return candidate
+    raise Fail(f"`{name}` and every `{name}-N` up to 99 are already on {ctx.origin}: "
+               f"delete the stale sync branches there first")
+
+
 def make_sync_branch(ctx: Ctx, name: str, force: bool) -> None:
     """Create the sync branch off `origin/<trunk>` and switch to it. Never off the local trunk:
     the MR has to apply to what is published."""
@@ -1422,6 +1525,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
     name = sync_branch(ctx)
     force = bool(getattr(args, "force", False))
     sync_branch_is_free(ctx, name, force)     # before the backup: no orphan backup on a rerun
+    if force:
+        name = free_sync_name(ctx, name)      # a published sync branch is never pushed over
     print(f"  leaving `{branch}`, switching to `{name}` "
           f"(you stay on it when this finishes; the trunk is never touched)")
 
@@ -1438,7 +1543,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     if rev(ctx.root, f"refs/remotes/{ctx.origin}/{ctx.mirror}") == target:
         step("mirror push", f"git push {ctx.origin} {ctx.mirror}", "up to date")
     else:
-        push_mirror(ctx)
+        push_mirror(ctx, target)
 
     trunk_ref = f"refs/remotes/{ctx.origin}/{ctx.trunk}"
     rc, _, _ = git_rc("merge-base", "--is-ancestor", target, trunk_ref, cwd=ctx.root)
@@ -1501,6 +1606,11 @@ def ship_preflight(ctx: Ctx) -> str:
                    f"a sync is merged, never squashed")
     if branch.startswith(ctx.backup_prefix):
         raise Fail(f"`{branch}` is a backup branch: it is a restore point, not a feature branch")
+    if not valid_branch_name(branch):
+        # refused here rather than after the squash: `push()` would refuse it at the end
+        raise Fail(f"`{branch}` is a name forkflow will not push: git's refspec grammar does "
+                   f"not read it as one branch (a leading `+` means force, a leading `-` an "
+                   f"option) - rename it with `git branch -m <name>`")
     if not clean_tree(ctx):
         raise Fail("the working tree has uncommitted changes: commit or stash them first")
     return branch
@@ -1621,6 +1731,12 @@ def finish_ship(ctx: Ctx, args: argparse.Namespace, branch: str,
                 backup_ref: str, lease: str) -> int:
     """squash -> check -> push -> merge request: the tail both `ship` and `ship --continue` run."""
     trunk_ref = f"{ctx.origin}/{ctx.trunk}"
+    # here, not in `cmd_ship`: a rebase that dropped every commit (`git rebase --skip`) lands on
+    # the trunk's tip too, and `--continue` resumes straight into this function
+    if not ctx.dry_run and rev(ctx.root, "HEAD") == rev(ctx.root, trunk_ref):
+        print(f"  nothing to ship: every commit of `{branch}` is already on {trunk_ref} "
+              f"(the backup `{backup_ref}` still holds the branch as it was)")
+        return 0
     mb = git("merge-base", trunk_ref, "HEAD", cwd=ctx.root)
     records = commit_records(ctx, mb)
     step("commits", f"git log --oneline {trunk_ref}..HEAD",
@@ -1644,6 +1760,9 @@ def finish_ship(ctx: Ctx, args: argparse.Namespace, branch: str,
     elif run_check(ctx, touched) == 3:
         if rollback:
             print(rollback)
+        # the squash has already happened, so a plain rerun of `ship` starts from a branch whose
+        # commits are no longer the published ones; `--continue` resumes this run instead
+        print(f"  fix that on `{branch}` and commit it, then: forkflow ship --continue")
         return 3
 
     try:
@@ -1664,6 +1783,30 @@ def finish_ship(ctx: Ctx, args: argparse.Namespace, branch: str,
         print(f"    then delete the local `{branch}`: "
               f'"Rebase and merge" rewrites the commit, so the local branch is a stale copy')
     return 0
+
+
+def published_is_ours(ctx: Ctx, branch: str, published: str) -> bool:
+    """True when `origin/<branch>`'s tip is this clone's own earlier state of the branch.
+
+    `ship` exists to rewrite a feature branch and force-push it behind a lease and a backup
+    (rule 4), so `origin/<branch>` not being an ancestor of HEAD is the normal case after an
+    amend, a rebase, or a squash this very command made before a gate failure. What must never
+    be force-pushed away is somebody *else's* work, and the two records that tell them apart
+    are the branch's own reflog - this clone has had the branch at that commit - and the state
+    an interrupted run left behind, which names the lease it fetched and the backup it made."""
+    rc, out, _ = git_rc("reflog", "show", "--format=%H", f"refs/heads/{branch}", cwd=ctx.root)
+    if rc == 0 and published in out.split():
+        return True
+    state = resumable(ctx, "ship", branch)
+    if state.get("lease") == published:
+        return True
+    keep = state.get("backup") or ""
+    for ref in (f"refs/heads/{keep}", f"refs/remotes/{ctx.origin}/{keep}"):
+        if keep and has_ref(ctx.root, ref):
+            rc, _, _ = git_rc("merge-base", "--is-ancestor", published, ref, cwd=ctx.root)
+            if rc == 0:
+                return True
+    return False
 
 
 def cmd_ship(args: argparse.Namespace) -> int:
@@ -1711,26 +1854,25 @@ def cmd_ship(args: argparse.Namespace) -> int:
     if lease:
         cmd = f"git merge-base --is-ancestor {ctx.origin}/{branch} HEAD"
         rc, _, _ = git_rc("merge-base", "--is-ancestor", branch_ref, "HEAD", cwd=ctx.root)
-        if rc != 0:
+        if rc == 0:
+            step("origin", cmd, f"{ctx.origin}/{branch} is already in `{branch}`")
+        elif published_is_ours(ctx, branch, lease):
+            step("origin", cmd, f"{ctx.origin}/{branch} is this clone's own earlier "
+                                f"`{branch}` - the lease and the backup cover it")
+        else:
             step("origin", cmd, f"{ctx.origin}/{branch} is not in `{branch}`")
             theirs = git("log", "--oneline", "--no-decorate", f"HEAD..{branch_ref}",
                          cwd=ctx.root, check=False)
             for line in theirs.splitlines():
                 print(f"    {line}")
-            raise Fail(f"`{ctx.origin}/{branch}` carries commits that `{branch}` does not: "
-                       f"shipping would force-push them away. If they are someone else's, take "
-                       f"them in first (`git pull --rebase {ctx.origin} {branch}`); if they are "
-                       f"your own, rewritten here, drop the published branch first "
-                       f"(`git push {ctx.origin} :{branch}`) and ship again")
-        step("origin", cmd, f"{ctx.origin}/{branch} is already in `{branch}`")
+            raise Fail(f"`{ctx.origin}/{branch}` carries commits that `{branch}` does not and "
+                       f"this clone has never had: shipping would force-push them away. Take "
+                       f"them in first (`git pull --rebase {ctx.origin} {branch}`), then ship "
+                       f"again")
 
     backup_ref = backup(ctx, "pre-ship", "HEAD")
     write_state(ctx, "ship", {"branch": branch, "backup": backup_ref, "lease": lease})
     rebase_onto(ctx, branch, trunk_ref)
-    if not ctx.dry_run and rev(ctx.root, "HEAD") == now:
-        print(f"  nothing to ship: every commit of `{branch}` is already on {trunk_ref} "
-              f"(the backup `{backup_ref}` still holds the branch as it was)")
-        return 0
     return finish_ship(ctx, args, branch, backup_ref, lease)
 
 
@@ -2106,9 +2248,13 @@ def setup_git_config(ctx: Ctx) -> None:
 # command that fixes it, and a human runs it.
 # --------------------------------------------------------------------------- #
 
-# The four keys GitHub's protection PUT insists on, plus the one setting that matters here.
+# The four keys GitHub's protection PUT insists on, plus the two settings that matter here:
+# force-push off, and a pull request required - without the latter a protected branch still
+# takes a direct push from anyone with write access, which is rule 2.
 GITHUB_PROTECTION = ('{"required_status_checks":null,"enforce_admins":true,'
-                     '"required_pull_request_reviews":null,"restrictions":null,'
+                     '"required_pull_request_reviews":{"dismiss_stale_reviews":false,'
+                     '"require_code_owner_reviews":false,'
+                     '"required_approving_review_count":0},"restrictions":null,'
                      '"allow_force_pushes":false}')
 
 
@@ -2177,9 +2323,14 @@ def default_branch_finding(ctx: Ctx, default: str) -> bool:
     return True
 
 
-def protection_finding(role: str, branch: str, force: Optional[bool]) -> bool:
+def protection_finding(role: str, branch: str, force: Optional[bool],
+                       direct_push: Optional[bool] = None) -> bool:
     """Print the verdict for one branch; True when a fix command belongs under it.
-    `force` is None when the branch is not protected at all."""
+
+    `force` is None when the branch is not protected at all. `direct_push` is True when the
+    server still lets somebody push straight to it, None when that could not be read - and it
+    is a finding for the trunk only: `sync` reaches the mirror by pushing it, so the mirror has
+    to stay directly pushable."""
     if force is None:
         if role == "trunk":
             finding(f"trunk `{branch}`: NOT protected - nothing on the server stops a direct "
@@ -2188,12 +2339,37 @@ def protection_finding(role: str, branch: str, force: Optional[bool]) -> bool:
         finding(f"mirror `{branch}`: not protected (advisory: forkflow's pre-push hook already "
                 f"keeps it a pure copy of upstream; protecting it as well is optional)")
         return False
+    problems = []
     if force:
-        finding(f"{role} `{branch}`: protected, but force-push is ALLOWED - undoing a bad merge "
-                f"by rewriting a published branch is the one thing protection is for here")
+        problems.append("force-push is ALLOWED - undoing a bad merge by rewriting a published "
+                        "branch is the one thing protection is for here")
+    if direct_push and role == "trunk":
+        problems.append("a direct push is still allowed - protection without a required merge "
+                        "request stops nobody from pushing to the trunk (rule 2)")
+    if problems:
+        finding(f"{role} `{branch}`: protected, but " + "; and ".join(problems))
         return True
-    finding(f"{role} `{branch}`: protected, force-push disallowed: ok")
+    ok = "protected, force-push disallowed"
+    if role == "trunk":
+        ok += ", direct push blocked" if direct_push is False else ", direct push not checked"
+    finding(f"{role} `{branch}`: {ok}: ok")
     return False
+
+
+def gitlab_push_access(data: dict) -> Optional[bool]:
+    """True when somebody can still push straight to a protected branch.
+
+    `push_access_levels` is a list of rules; level 0 is GitLab's "No one". None when the answer
+    does not carry the field or carries it in a shape this cannot read."""
+    levels = data.get("push_access_levels")
+    if not isinstance(levels, list):
+        return None
+    found = []
+    for item in levels:
+        if not isinstance(item, dict) or not isinstance(item.get("access_level"), int):
+            return None
+        found.append(item["access_level"])
+    return any(level > 0 for level in found)
 
 
 def gitlab_protection(ctx: Ctx, role: str, branch: str) -> None:
@@ -2202,18 +2378,29 @@ def gitlab_protection(ctx: Ctx, role: str, branch: str) -> None:
     reply = api_get(ctx, "glab", path)
     if reply.ok():
         force = bool(reply.data.get("allow_force_push"))
+        direct = gitlab_push_access(reply.data)
     elif reply.status == 404:                       # GitLab: no such protected branch
-        force = None
+        force, direct = None, None
     else:
         finding(f"{role} `{branch}`: {reply.note}")
         return
-    if not protection_finding(role, branch, force):
+    if not protection_finding(role, branch, force, direct):
         return
+    # every name reaches a shell the user is told to paste: `git check-ref-format` allows `;`,
+    # a backtick and `$(`, and these names come from a tracked file a sync can bring in
+    protect = (f"glab api --method POST projects/:fullpath/protected_branches "
+               f"-f name={sh_quote(branch)} -F push_access_level=0 -F merge_access_level=40 "
+               f"-F allow_force_push=false")
     if force is None:
-        fix_cmd(f"glab api --method POST projects/:fullpath/protected_branches "
-                f"-f name={branch} -F allow_force_push=false")
-    else:
+        fix_cmd(protect)
+        return
+    if force:
         fix_cmd(f"glab api --method PATCH {path} -F allow_force_push=false")
+    if direct and role == "trunk":
+        finding("who may push can only be changed by recreating the rule (GitLab's PATCH takes "
+                "`allowed_to_push` entries by id, not a level): this deletes it and creates it "
+                "again, with merge requests merged by Maintainers")
+        fix_cmd(f"glab api --method DELETE {path} && {protect}")
 
 
 def gitlab_report(ctx: Ctx) -> None:
@@ -2228,7 +2415,7 @@ def gitlab_report(ctx: Ctx) -> None:
          f"read-only: default_branch={default}  merge_method={method}")
     fixes = []
     if default_branch_finding(ctx, default):
-        fixes.append(f"-f default_branch={ctx.trunk}")
+        fixes.append(f"-f default_branch={sh_quote(ctx.trunk)}")
     if method == "ff":
         finding("merge method: `ff`: ok")
     else:
@@ -2255,38 +2442,63 @@ def _names(items: object, *keys: str) -> list:
     return out
 
 
-def github_protection_body(current: Optional[dict]) -> str:
-    """The `PUT .../protection` body that turns force-pushes off and changes nothing else.
+def _actors(current: object) -> Optional[dict]:
+    """A `{users, teams, apps}` block of the GET, in the shape the PUT wants it back."""
+    if not isinstance(current, dict):
+        return None
+    return {"users": _names(current.get("users"), "login"),
+            "teams": _names(current.get("teams"), "slug", "name"),
+            "apps": _names(current.get("apps"), "slug", "name")}
 
-    GitHub's PUT replaces the whole protection object, so a required review or a required
-    status check the project already has would be dropped by a body that names only what we
-    care about. Everything the GET returned is translated back into what the PUT expects."""
+
+def _flag(current: dict, key: str) -> bool:
+    """One boolean of the protection object - most of them are wrapped as `{"enabled": ...}`."""
+    value = current.get(key)
+    return bool(value.get("enabled")) if isinstance(value, dict) else bool(value)
+
+
+def github_protection_body(current: Optional[dict], require_pr: bool = False) -> str:
+    """The `PUT .../protection` body that turns force-pushes off (and, with `require_pr`, makes
+    a merge request the only way in) while carrying back every other setting the GET returned.
+
+    GitHub's PUT replaces the whole protection object: anything this body does not name goes
+    back to its default, so a required review, a status check, a linear-history or
+    conversation-resolution requirement the project already has has to be translated back into
+    what the PUT expects, key by key."""
     cur = current if isinstance(current, dict) else {}
     checks = cur.get("required_status_checks")
     status = None
     if isinstance(checks, dict):
         status = {"strict": bool(checks.get("strict")),
                   "contexts": [c for c in (checks.get("contexts") or []) if isinstance(c, str)]}
-    admins = cur.get("enforce_admins")
     reviews = cur.get("required_pull_request_reviews")
     prr = None
     if isinstance(reviews, dict):
         prr = {"dismiss_stale_reviews": bool(reviews.get("dismiss_stale_reviews")),
                "require_code_owner_reviews": bool(reviews.get("require_code_owner_reviews")),
+               "require_last_push_approval": _flag(reviews, "require_last_push_approval"),
                "required_approving_review_count":
                    int(reviews.get("required_approving_review_count") or 0)}
-    rest = cur.get("restrictions")
-    restrictions = None
-    if isinstance(rest, dict):
-        restrictions = {"users": _names(rest.get("users"), "login"),
-                        "teams": _names(rest.get("teams"), "slug", "name"),
-                        "apps": _names(rest.get("apps"), "slug", "name")}
+        dismissal = _actors(reviews.get("dismissal_restrictions"))
+        if dismissal is not None:
+            prr["dismissal_restrictions"] = dismissal
+        bypass = _actors(reviews.get("bypass_pull_request_allowances"))
+        if bypass is not None:
+            prr["bypass_pull_request_allowances"] = bypass
+    elif require_pr:            # rule 2: a protected branch without this takes a direct push
+        prr = {"dismiss_stale_reviews": False, "require_code_owner_reviews": False,
+               "required_approving_review_count": 0}
     body = {"required_status_checks": status,
-            "enforce_admins": (bool(admins.get("enabled")) if isinstance(admins, dict)
-                               else bool(admins)),
+            "enforce_admins": _flag(cur, "enforce_admins"),
             "required_pull_request_reviews": prr,
-            "restrictions": restrictions,
-            "allow_force_pushes": False}
+            "restrictions": _actors(cur.get("restrictions")),
+            "allow_force_pushes": False,
+            "allow_deletions": _flag(cur, "allow_deletions"),
+            "block_creations": _flag(cur, "block_creations"),
+            "required_conversation_resolution": _flag(cur, "required_conversation_resolution"),
+            "required_linear_history": _flag(cur, "required_linear_history"),
+            "lock_branch": _flag(cur, "lock_branch"),
+            "allow_fork_syncing": _flag(cur, "allow_fork_syncing")}
     return json.dumps(body, separators=(",", ":"))
 
 
@@ -2294,22 +2506,23 @@ def github_protection(ctx: Ctx, role: str, branch: str) -> None:
     path = "repos/{owner}/{repo}/branches/%s/protection" % urllib.parse.quote(branch, safe="")
     reply = api_get(ctx, "gh", path)
     if reply.ok():
-        allowed = reply.data.get("allow_force_pushes")
-        force = bool(allowed.get("enabled")) if isinstance(allowed, dict) else bool(allowed)
+        force = _flag(reply.data, "allow_force_pushes")
+        # a protected branch without a required pull request still takes a direct push
+        direct = reply.data.get("required_pull_request_reviews") is None
     elif reply.status == 404:                       # GitHub: "Branch not protected"
-        force = None
+        force, direct = None, None
     else:
         finding(f"{role} `{branch}`: {reply.note}")
         return
-    if not protection_finding(role, branch, force):
+    if not protection_finding(role, branch, force, direct):
         return
     if force is None:
         fix_cmd(f"echo '{GITHUB_PROTECTION}' | gh api -X PUT {path} --input -")
         return
     finding("the PUT below replaces the whole protection object: it carries over the "
             "settings the read above returned - check them before you run it")
-    fix_cmd(f"echo {sh_quote(github_protection_body(reply.data))} | "
-            f"gh api -X PUT {path} --input -")
+    body = github_protection_body(reply.data, require_pr=bool(direct) and role == "trunk")
+    fix_cmd(f"echo {sh_quote(body)} | gh api -X PUT {path} --input -")
 
 
 def github_report(ctx: Ctx) -> None:
@@ -2326,7 +2539,7 @@ def github_report(ctx: Ctx) -> None:
          f"  allow_rebase_merge={str(rebase).lower()}")
     fixes = []
     if default_branch_finding(ctx, default):
-        fixes.append(f"-f default_branch={ctx.trunk}")
+        fixes.append(f"-f default_branch={sh_quote(ctx.trunk)}")
     if merge_commit:
         finding("merge commits: allowed: ok (a sync MR is merged with `Create a merge commit`)")
     else:
@@ -2361,6 +2574,13 @@ def setup_template(ctx: Ctx) -> None:
     """A commented `.forkflow.toml`, left untracked: the branch names are the fork's decision."""
     path = os.path.join(ctx.root, CONFIG_FILE)
     cmd = f"write {CONFIG_FILE}"
+    if not have_tomllib():
+        # the template is a starting point to edit, and the first uncommented key in it would
+        # make every subcommand exit 2 on this Python. Nothing here needs a config file.
+        step("template", cmd, f"skipped: reading {CONFIG_FILE} needs Python 3.11+ (tomllib) "
+                              f"and this is Python {sys.version_info[0]}."
+                              f"{sys.version_info[1]} - the defaults are in use")
+        return
     if os.path.exists(path):
         step("template", cmd, "already there, left as it is")
     elif ctx.dry_run:
@@ -2503,6 +2723,7 @@ def run_tests() -> None:
     import contextlib
     import io
     import tempfile
+    import time
     import unittest
     from unittest import mock
 
@@ -2711,6 +2932,14 @@ def run_tests() -> None:
     def sync_branch_name(remote: str = "upstream") -> str:
         return "%s%s-%s" % (DEFAULT_SYNC_PREFIX, remote, UTC_DATE)
 
+    def next_utc_second() -> None:
+        """Wait for the backup-name clock to tick. `backup/<UTC HH:MM:SS>-<reason>` is refused
+        when that name already exists at another commit, so a test that runs two `sync`s or
+        two `ship`s of one branch has to let the second turn over."""
+        start = real_utc_stamp("%Y%m%d-%H%M%S")
+        while real_utc_stamp("%Y%m%d-%H%M%S") == start:
+            time.sleep(0.05)
+
     def capture(fn, *a, **kw):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -2791,6 +3020,21 @@ def run_tests() -> None:
             with self.assertRaises(Fail) as cm:
                 load_config(self.tmp)
             self.assertEqual(cm.exception.code, 2)
+
+        def test_a_comment_only_file_is_no_config_at_all_without_tomllib(self):
+            """`setup` used to leave a commented template behind on any Python; a file that
+            configures nothing must not brick every subcommand on 3.9/3.10."""
+            write(self.tmp, CONFIG_FILE, "# trunk = \"develop\"\n\n#  gate = []\n")
+            with mock.patch.dict(sys.modules, {"tomllib": None}):
+                self.assertEqual(load_config(self.tmp), {})
+
+        def test_a_file_that_does_configure_something_is_still_fatal_without_tomllib(self):
+            write(self.tmp, CONFIG_FILE, '# the trunk\ntrunk = "trunk"\n')
+            with mock.patch.dict(sys.modules, {"tomllib": None}):
+                with self.assertRaises(Fail) as cm:
+                    load_config(self.tmp)
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("3.11", str(cm.exception))
 
         @needs_tomllib
         def test_a_value_of_the_wrong_type_is_fatal(self):
@@ -2910,6 +3154,53 @@ def run_tests() -> None:
             code, out, err = run("-C", fork, "check")
             self.assertEqual(code, 0, err)
 
+        def synced_by_a_teammate(self) -> str:
+            """A fork where a teammate's sync advanced `origin/<mirror>` and this clone's
+            `git fetch origin` fast-forwarded the local mirror onto it - without fetching
+            `upstream`, which is what every one of these commands does for itself."""
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            push_upstream_into_origin(self.tmp, "main")
+            sh("git", "fetch", "origin", cwd=fork)
+            sh("git", "switch", "main", cwd=fork)
+            sh("git", "merge", "--ff-only", "origin/main", cwd=fork)
+            sh("git", "switch", "develop", cwd=fork)
+            self.assertNotEqual(rev(fork, "refs/heads/main"),
+                                rev(fork, "refs/remotes/upstream/main"))
+            return fork
+
+        def test_a_local_mirror_fast_forwarded_from_origin_is_not_divergence(self):
+            """The local mirror is ahead of `upstream/*` as last fetched, and every commit it
+            carries is on `origin/<mirror>`. `sync`, `ship` and `check` fetch upstream
+            themselves; refusing before that fetch fails them all in an ordinary team state."""
+            fork = self.synced_by_a_teammate()
+            ctx = ctx_for(fork)                       # strict: no longer a hard failure
+            self.assertTrue(ctx.mirror_ahead)
+            self.assertTrue(mirror_from_origin(ctx))
+            for argv in (("status",), ("check",)):
+                code, out, err = run("-C", fork, *argv)
+                self.assertEqual(code, 0, " ".join(argv) + ": " + err + out)
+            sh("git", "switch", "-c", "feat/x", cwd=fork)
+            commit_fork(fork, "ours/a.txt", "a\n", "ours: a")
+            code, out, err = run("-C", fork, "ship", "--dry-run")   # fetches origin only
+            self.assertEqual(code, 0, err + out)
+            code, out, err = run("-C", fork, "sync", "--dry-run")   # fetches upstream itself
+            self.assertEqual(code, 0, err + out)
+
+        def test_a_commit_on_top_of_a_teammates_mirror_is_still_divergence(self):
+            """The tolerance is exactly "everything the mirror carries is on origin's mirror".
+            One commit of our own on top of it is rule 6 again, and still exit 2."""
+            fork = self.synced_by_a_teammate()
+            sh("git", "switch", "main", cwd=fork)
+            commit_fork(fork, "ours.txt", "ours\n", "work on the mirror")
+            sh("git", "switch", "develop", cwd=fork)
+            with self.assertRaises(Fail) as cm:
+                ctx_for(fork)
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("Adopting forkflow", str(cm.exception))
+            self.assertEqual(run("-C", fork, "check")[0], 2)
+            self.assertFalse(mirror_from_origin(ctx_for(fork, strict_mirror=False)))
+
         def test_unfetched_upstream(self):
             fork = make_fork(self.tmp)
             sh("git", "symbolic-ref", "-d", "refs/remotes/upstream/HEAD", cwd=fork)
@@ -3003,6 +3294,88 @@ def run_tests() -> None:
                 ctx_for(fork)
             self.assertEqual(cm.exception.code, 2)
             self.assertIn("check-ref-format", str(cm.exception))
+
+    class TestShQuote(unittest.TestCase):
+        """`sh_quote` is what keeps a branch name out of the shell's syntax: the names come
+        from `.forkflow.toml`, a tracked file a sync can bring in from upstream, and they end
+        up in the generated pre-push hook and in the fix commands `setup` tells a human to
+        paste. `git check-ref-format` allows `;`, `$`, a backtick and `(`."""
+
+        VALUES = ["plain", "with space", "it's", '"quoted"', "$HOME", "`id`", "$(id)",
+                  "a;rm -rf /", "back\\slash", "two\nlines", "!bang", "a&b|c", "#hash"]
+
+        def test_the_shell_reads_back_exactly_what_went_in(self):
+            for value in self.VALUES:
+                out = sh("sh", "-c", "printf %s " + sh_quote(value))
+                self.assertEqual(out, value, "mangled: " + repr(value))
+
+        def test_every_value_stays_one_word(self):
+            for value in self.VALUES:
+                out = sh("sh", "-c", "set -- " + sh_quote(value) + "; echo $#")
+                self.assertEqual(out, "1", "split: " + repr(value))
+
+        def test_it_is_always_quoted(self):
+            self.assertEqual(sh_quote("plain"), "'plain'")
+            self.assertEqual(sh_quote("it's"), "'it'\\''s'")
+
+    class TestState(Base):
+        """`--continue` force-pushes, and rule 4 allows that only behind the backup the run it
+        resumes actually made - so which backup is its own has to be recorded, not guessed."""
+
+        def test_round_trip_and_removal_of_one_kind_at_a_time(self):
+            ctx = ctx_for(make_fork(self.tmp))
+            self.assertEqual(read_state(ctx), {})
+            self.assertEqual(resumable(ctx, "ship", "feat/x"), {})
+
+            write_state(ctx, "ship", {"branch": "feat/x", "backup": "b1", "lease": "abc"})
+            write_state(ctx, "sync", {"branch": "sync/x", "backup": "b2"})
+            self.assertEqual(resumable(ctx, "ship", "feat/x")["backup"], "b1")
+            self.assertEqual(resumable(ctx, "ship", "feat/x")["lease"], "abc")
+            self.assertEqual(resumable(ctx, "sync", "sync/x")["backup"], "b2")
+            self.assertEqual(resumable(ctx, "ship", "feat/other"), {})   # another branch
+            self.assertEqual(resumable(ctx, "ship", "sync/x"), {})       # the other kind
+
+            write_state(ctx, "ship", None)
+            self.assertEqual(resumable(ctx, "ship", "feat/x"), {})
+            self.assertEqual(resumable(ctx, "sync", "sync/x")["backup"], "b2")
+
+        def test_the_file_lives_in_the_git_directory_and_never_in_the_tree(self):
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"})
+            self.assertEqual(os.path.basename(state_path(ctx)), STATE_FILE)
+            self.assertTrue(os.path.exists(state_path(ctx)))
+            self.assertEqual(sh("git", "status", "--porcelain", cwd=fork), "")
+
+        def test_an_absent_or_unreadable_file_is_no_state_rather_than_a_crash(self):
+            ctx = ctx_for(make_fork(self.tmp))
+            self.assertEqual(read_state(ctx), {})                        # absent
+            for text in ("{not json", '["a", "list"]', ""):
+                with open(state_path(ctx), "w") as fh:
+                    fh.write(text)
+                self.assertEqual(read_state(ctx), {}, repr(text))
+                self.assertEqual(resumable(ctx, "ship", "feat/x"), {})
+            write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"})
+            self.assertEqual(resumable(ctx, "ship", "feat/x")["backup"], "b")
+
+        def test_a_dry_run_records_nothing(self):
+            ctx = ctx_for(make_fork(self.tmp), dry_run=True)
+            write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"})
+            self.assertFalse(os.path.exists(state_path(ctx)))
+
+        def test_each_worktree_keeps_its_own(self):
+            """Two worktrees of one clone ship different branches at the same time; a
+            `--continue` in one must not roll back to the other one's backup."""
+            fork = make_fork(self.tmp)
+            other = os.path.join(self.tmp, "wt")
+            sh("git", "worktree", "add", "-b", "feat/other", other, "develop", cwd=fork)
+            here, there = ctx_for(fork), ctx_for(other)
+            write_state(here, "ship", {"branch": "feat/x", "backup": "here"})
+            write_state(there, "ship", {"branch": "feat/other", "backup": "there"})
+            self.assertNotEqual(state_path(here), state_path(there))
+            self.assertEqual(resumable(here, "ship", "feat/x")["backup"], "here")
+            self.assertEqual(resumable(there, "ship", "feat/other")["backup"], "there")
+            self.assertEqual(resumable(here, "ship", "feat/other"), {})
 
     class TestCleanTree(Base):
         def test_untracked_is_clean(self):
@@ -3100,6 +3473,35 @@ def run_tests() -> None:
             self.assertIn("would:", out)
             self.assertEqual(origin_sha(fork, "feat/x"), "")
 
+        def test_a_branch_named_like_a_force_flag_cannot_force_anything(self):
+            """`git push origin +plus:refs/heads/+plus` is `force=yes, src=plus` to git: the
+            name alone makes an ordinary push an unconditional force-push of a *different*
+            branch, with no `--force` literal anywhere for a source check to find. Only running
+            the push can prove it does not happen."""
+            fork = make_fork(self.tmp)
+            sh("git", "branch", "--no-track", "plus", "develop", cwd=fork)   # the decoy source
+            sh("git", "switch", "-c", "+plus", cwd=fork)
+            commit_fork(fork, "src/new.py", "x = 1\n")
+            ctx = ctx_for(fork)
+            with self.assertRaises(Fail) as cm:
+                capture(push, ctx, "+plus")
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("refspec grammar", str(cm.exception))
+            self.assertEqual(origin_sha(fork, "+plus"), "")
+            self.assertEqual(origin_sha(fork, "plus"), "")
+
+        def test_the_source_is_the_branch_and_never_another_ref_of_the_same_name(self):
+            """Both sides of the refspec are fully qualified, so a tag of the same name is
+            neither pushed instead of the branch nor an ambiguity that stops the push."""
+            fork = make_fork(self.tmp)
+            sh("git", "tag", "feat/x", "main", cwd=fork)
+            sh("git", "switch", "-c", "feat/x", cwd=fork)
+            head = commit_fork(fork, "src/new.py", "x = 1\n")
+            ctx = ctx_for(fork)
+            capture(push, ctx, "feat/x")
+            self.assertEqual(origin_sha(fork, "feat/x"), head)
+            self.assertNotEqual(head, rev(fork, "refs/tags/feat/x"))
+
     class TestPushMirror(Base):
         def test_pushes_after_advance(self):
             fork = make_fork(self.tmp)
@@ -3151,6 +3553,36 @@ def run_tests() -> None:
             _, out, _ = capture(push_mirror, ctx)
             self.assertIn("would:", out)
             self.assertIn("created by this run", out)
+
+        def test_a_dry_run_judges_the_target_this_run_would_move_the_mirror_to(self):
+            """The ordinary state of a fork with two people in it: a teammate's sync advanced
+            `origin/<mirror>`, upstream has moved on again, and the local mirror is behind
+            both. The real run fast-forwards the mirror before pushing it, so the dry run has
+            to judge that target - the tip it has not moved is not what would be sent."""
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "docs/a.md", "a\n", "theirs: a")
+            push_upstream_into_origin(self.tmp)              # the teammate's sync
+            commit_upstream(self.tmp, "docs/b.md", "b\n", "theirs: b")
+            sh("git", "fetch", "--multiple", "origin", "upstream", cwd=fork)
+            target = rev(fork, "refs/remotes/upstream/main")
+            self.assertNotEqual(rev(fork, "refs/remotes/origin/main"), target)
+
+            _, out, _ = capture(push_mirror, ctx_for(fork, dry_run=True), target)
+            self.assertIn("would:", out)
+            code, out, err = run("-C", fork, "sync", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+
+        def test_the_target_is_still_refused_when_origin_carries_more_than_upstream(self):
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "docs/a.md", "a\n", "theirs: a")
+            push_upstream_into_origin(self.tmp)
+            sh("git", "fetch", "--multiple", "origin", "upstream", cwd=fork)
+            ctx = ctx_for(fork)
+            stale = rev(fork, "refs/heads/main")             # the mirror before the teammate
+            with self.assertRaises(Fail) as cm:
+                capture(push_mirror, ctx, stale)
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("not an ancestor", str(cm.exception))
 
         def test_an_unfetched_upstream_cannot_verify_the_mirror(self):
             fork = make_fork(self.tmp)
@@ -3658,6 +4090,25 @@ def run_tests() -> None:
             self.assertIn("DIVERGED", out)
             self.assertIn("Adopting forkflow", out)
 
+        def test_fetch_recomputes_the_mirror_hint_it_prints(self):
+            """The hint is a verdict on the refs; `--fetch` refreshes them, so printing the
+            verdict from before the fetch contradicts the table printed above it."""
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            push_upstream_into_origin(self.tmp, "main")
+            sh("git", "fetch", "origin", cwd=fork)
+            sh("git", "switch", "main", cwd=fork)
+            sh("git", "merge", "--ff-only", "origin/main", cwd=fork)
+
+            code, out, err = run("-C", fork, "status")
+            self.assertEqual(code, 0, err)
+            self.assertIn("hint     mirror `main` is ahead of `upstream/main`", out)
+
+            code, out, err = run("-C", fork, "status", "--fetch")
+            self.assertEqual(code, 0, err)
+            self.assertNotIn("hint     mirror", out)
+            self.assertIn("upstream/main %s (=)" % short(rev(fork, "refs/heads/main")), out)
+
         def test_unfetched_upstream_is_reported_and_exits_0(self):
             fork = make_fork(self.tmp)
             sh("git", "symbolic-ref", "-d", "refs/remotes/upstream/HEAD", cwd=fork)
@@ -4013,6 +4464,31 @@ def run_tests() -> None:
             self.assertIn("recreated", out)
             self.assertEqual(rev(fork, name + "^2"), rev(fork, "upstream/main"))
             self.assertEqual(checked_out(fork), name)
+
+        def test_force_redoes_a_published_sync_under_a_free_name(self):
+            """The documented recovery for a sync MR the trunk moved under. The dated name is
+            already on origin, its tip is a merge off the *old* trunk, and a sync branch is
+            never rebased or force-pushed - so the rerun publishes the next free name instead
+            of being rejected with nothing left to try."""
+            fork = make_fork(self.tmp)
+            self.ahead_upstream(fork)
+            first = self.sync_name()
+            self.assertEqual(run("-C", fork, "sync")[0], 0)
+            published = origin_sha(fork, first)
+            self.assertNotEqual(published, "")
+
+            second_clone_commit(self.tmp)                  # the trunk moves under the MR
+            next_utc_second()                              # a second pre-sync backup
+            code, out, err = run("-C", fork, "sync", "--force")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("this sync becomes `%s-2`" % first, out)
+            self.assertEqual(origin_sha(fork, first), published)      # the stale MR untouched
+            self.assertEqual(origin_sha(fork, first + "-2"),
+                             rev(fork, "refs/heads/" + first + "-2"))
+            self.assertEqual(checked_out(fork), first + "-2")
+            self.assertEqual(rev(fork, first + "-2^1"),
+                             rev(fork, "refs/remotes/origin/develop"))
+            self.assertEqual(rev(fork, first + "-2^2"), rev(fork, "upstream/main"))
 
         def test_dirty_tree_is_exit_2(self):
             fork = make_fork(self.tmp)
@@ -4701,6 +5177,22 @@ def run_tests() -> None:
             self.assertEqual(origin_sha(fork, "develop"), before_trunk)
             self.assertNotIn(DEFAULT_BACKUP_PREFIX, local_branches(fork))
 
+        def test_a_branch_amended_after_it_was_published_is_this_clone_s_own(self):
+            """Rewriting a published feature branch and force-pushing it behind a lease and a
+            backup is what `ship` is for (rule 4). `origin/<branch>` not being an ancestor of
+            HEAD is that ordinary case, not a reason to refuse."""
+            fork = make_fork(self.tmp)
+            name = self.feature(fork, commits=1, push=True)
+            published = origin_sha(fork, name)
+            sh("git", "commit", "--amend", "-m", "ours: step 0, amended", cwd=fork)
+
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("this clone's own earlier", out)
+            self.assertEqual(origin_sha(fork, name), rev(fork, "HEAD"))
+            self.assertNotEqual(origin_sha(fork, name), published)
+            self.assertIn("--force-with-lease=%s:%s" % (name, published), out)
+
         def test_a_commit_only_on_origin_is_refused_before_any_backup(self):
             """A lease proves nobody pushed after our fetch - not that what it found is ours."""
             fork = make_fork(self.tmp)
@@ -4748,6 +5240,78 @@ def run_tests() -> None:
             # the squash happened, so the rollback line is the way back
             self.assertEqual(sh("git", "rev-list", "--count",
                                 "origin/develop..HEAD", cwd=fork), "1")
+
+        @needs_tomllib
+        def test_a_gate_failure_on_a_published_branch_is_resumable(self):
+            """exit 3 leaves the branch squashed, so `origin/<branch>` is no longer in it. The
+            hint has to name `--continue`, and neither that nor a fresh `ship` may refuse the
+            branch's own pre-ship state - the old advice was to delete the published branch,
+            which closes the open merge request."""
+            flag = os.path.join(self.tmp, "gate-ok")
+            fork = make_fork(self.tmp, config='gate = ["test -f %s"]\n' % flag)
+            name = self.feature(fork, commits=2, push=True)
+            published = origin_sha(fork, name)
+
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 3, err + out)
+            self.assertIn("forkflow ship --continue", out)
+            self.assertEqual(origin_sha(fork, name), published)      # nothing was pushed
+
+            write(self.tmp, "gate-ok", "")
+            code, out, err = run("-C", fork, "ship", "--continue")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(origin_sha(fork, name), rev(fork, "HEAD"))
+            self.assertEqual(sh("git", "rev-list", "--count",
+                                "origin/develop..HEAD", cwd=fork), "1")
+
+        @needs_tomllib
+        def test_ship_run_again_after_a_gate_failure_is_not_refused(self):
+            """The same state, resumed the other way: a plain rerun of `ship`. Its own squash
+            is what put `origin/<branch>` outside the branch, so refusing it would make exit 3
+            a dead end for every published branch."""
+            flag = os.path.join(self.tmp, "gate-ok")
+            fork = make_fork(self.tmp, config='gate = ["test -f %s"]\n' % flag)
+            name = self.feature(fork, commits=2, push=True)
+            published = origin_sha(fork, name)
+            self.assertEqual(run("-C", fork, "ship")[0], 3)
+
+            write(self.tmp, "gate-ok", "")
+            next_utc_second()                              # a second pre-ship backup
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            self.assertNotIn("push %s :%s" % ("origin", name), out)   # no "delete it" advice
+            self.assertEqual(origin_sha(fork, name), rev(fork, "HEAD"))
+            self.assertNotEqual(origin_sha(fork, name), published)
+
+        def test_continue_after_a_rebase_that_dropped_everything_is_nothing_to_ship(self):
+            """`git rebase --skip` can leave the branch exactly on the trunk's tip; there is
+            then nothing to squash, and that is exit 0, not a failure to squash nothing."""
+            fork, name = self.conflicting_ship()
+            self.assertEqual(run("-C", fork, "ship")[0], 4)
+            sh("git", "rebase", "--skip", cwd=fork)
+            self.assertEqual(rev(fork, "HEAD"), rev(fork, "refs/remotes/origin/develop"))
+
+            code, out, err = run("-C", fork, "ship", "--continue")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("nothing to ship", out)
+            self.assertEqual(origin_sha(fork, name), "")
+
+        def test_a_branch_git_reads_as_a_force_flag_is_refused_by_the_preflight(self):
+            """`+plus` would make `push`'s refspec a force-push of `plus`. Refused before the
+            backup and the squash, not after them."""
+            fork = make_fork(self.tmp)
+            sh("git", "branch", "--no-track", "plus", "develop", cwd=fork)
+            sh("git", "switch", "-c", "+plus", cwd=fork)
+            commit_fork(fork, "ours/a.txt", "a\n", "ours: a")
+            head = rev(fork, "HEAD")
+
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("refspec grammar", err)
+            self.assertEqual(rev(fork, "HEAD"), head)                # nothing was squashed
+            self.assertEqual(origin_sha(fork, "+plus"), "")
+            self.assertEqual(origin_sha(fork, "plus"), "")
+            self.assertNotIn(DEFAULT_BACKUP_PREFIX, local_branches(fork))
 
         def test_a_squash_that_cannot_be_committed_leaves_the_branch_as_it_was(self):
             fork = make_fork(self.tmp)
@@ -4866,6 +5430,20 @@ def run_tests() -> None:
             self.assertEqual(origin_sha(fork, "develop"), trunk_sha)
             with open(self.toml_path(fork)) as fh:
                 self.assertEqual(fh.read(), template)
+
+        def test_no_template_is_written_on_a_python_that_cannot_read_one(self):
+            """`load_config` refuses a config file it cannot parse, so the template `setup`
+            leaves behind would turn every later command - `setup` included - into exit 2 on
+            the 3.9/3.10 the script otherwise supports."""
+            fork = make_fork(self.tmp)
+            with mock.patch.dict(sys.modules, {"tomllib": None}):
+                code, out, err = run("-C", fork, "setup")
+                self.assertEqual(code, 0, err + out)
+                self.assertIn("needs Python 3.11+", out)
+                self.assertFalse(os.path.exists(self.toml_path(fork)))
+                for argv in (("status",), ("check",), ("setup",)):
+                    code, out, err = run("-C", fork, *argv)
+                    self.assertEqual(code, 0, " ".join(argv) + ": " + err + out)
 
         def test_a_non_standard_remote_name_is_used_as_it_is(self):
             fork = make_fork(self.tmp)
@@ -5287,10 +5865,19 @@ def run_tests() -> None:
              '"allow_rebase_merge":true}', 0)
     UNPROTECTED = ("404 Not Found", 1)
     FORBIDDEN = ("403 Forbidden", 1)
-    GL_PROTECTED = ('{"name":"b","allow_force_push":false}', 0)
-    GL_FORCE = ('{"name":"b","allow_force_push":true}', 0)
-    GH_PROTECTED = ('{"allow_force_pushes":{"enabled":false}}', 0)
-    GH_FORCE = ('{"allow_force_pushes":{"enabled":true}}', 0)
+    GL_PROTECTED = ('{"name":"b","allow_force_push":false,'
+                    '"push_access_levels":[{"access_level":0}]}', 0)
+    GL_FORCE = ('{"name":"b","allow_force_push":true,'
+                '"push_access_levels":[{"access_level":0}]}', 0)
+    # protected, force-push off - and a Maintainer may still push straight to it
+    GL_PUSHABLE = ('{"name":"b","allow_force_push":false,'
+                   '"push_access_levels":[{"access_level":40}]}', 0)
+    GH_PROTECTED = ('{"required_pull_request_reviews":{"required_approving_review_count":1},'
+                    '"allow_force_pushes":{"enabled":false}}', 0)
+    GH_FORCE = ('{"required_pull_request_reviews":{"required_approving_review_count":1},'
+                '"allow_force_pushes":{"enabled":true}}', 0)
+    # protected, force-push off - and no merge request required, so a direct push still lands
+    GH_NO_PR = ('{"allow_force_pushes":{"enabled":false}}', 0)
     # a protected branch that already carries the settings a full PUT would wipe
     GH_FORCE_KEPT = ('{"required_status_checks":{"strict":true,"contexts":["ci"]},'
                      '"enforce_admins":{"enabled":true},'
@@ -5362,9 +5949,44 @@ def run_tests() -> None:
             out = self.report("gitlab")
             self.assertIn("default branch: `develop` is the trunk: ok", out)
             self.assertIn("merge method: `ff`: ok", out)
-            self.assertIn("trunk `develop`: protected, force-push disallowed: ok", out)
+            self.assertIn("trunk `develop`: protected, force-push disallowed, "
+                          "direct push blocked: ok", out)
             self.assertIn("mirror `main`: protected, force-push disallowed: ok", out)
             self.assertEqual(self.fixes(out), [])
+
+        def test_a_trunk_anyone_may_push_to_is_a_finding_with_a_reprotect(self):
+            """Rule 2 is not "protected", it is "only a merge request reaches the trunk":
+            a protected branch whose push level is Maintainer takes a direct push."""
+            self.gitlab_tool(trunk=GL_PUSHABLE, mirror=GL_PUSHABLE)
+            out = self.report("gitlab")
+            self.assertIn("trunk `develop`: protected, but a direct push is still allowed", out)
+            # the mirror is pushed by `sync` itself: it must stay directly pushable
+            self.assertIn("mirror `main`: protected, force-push disallowed: ok", out)
+            self.assertEqual(self.fixes(out), [
+                "glab api --method DELETE projects/:fullpath/protected_branches/develop && "
+                "glab api --method POST projects/:fullpath/protected_branches "
+                "-f name='develop' -F push_access_level=0 -F merge_access_level=40 "
+                "-F allow_force_push=false"])
+
+        def test_a_push_level_that_cannot_be_read_is_reported_as_unchecked(self):
+            self.gitlab_tool(trunk=('{"name":"b","allow_force_push":false}', 0))
+            out = self.report("gitlab")
+            self.assertIn("trunk `develop`: protected, force-push disallowed, "
+                          "direct push not checked: ok", out)
+            self.assertEqual(self.fixes(out), [])
+
+        def test_a_branch_name_that_is_shell_syntax_is_quoted_in_the_fix(self):
+            """The names come from `.forkflow.toml`, which a sync can bring in from upstream,
+            and the fix is a command the user is told to paste into a shell."""
+            self.gitlab_tool(project=('{"default_branch":"main","merge_method":"ff"}', 0),
+                             trunk=UNPROTECTED, mirror=UNPROTECTED)
+            ctx = ctx_for(make_fork(self.tmp))
+            ctx.platform, ctx.trunk = "gitlab", "dev;touch /tmp/pwned"
+            _, out, _ = capture(platform_report, ctx)
+            self.assertTrue(self.fixes(out))
+            for line in self.fixes(out):
+                self.assertIn("'dev;touch /tmp/pwned'", line)
+                self.assertNotIn("=dev;touch", line)
 
         def test_the_report_only_ever_reads(self):
             self.gitlab_tool()
@@ -5381,7 +6003,7 @@ def run_tests() -> None:
             self.assertIn("merge method: `merge` -", out)
             self.assertEqual(self.fixes(out), [
                 "glab api --method PUT projects/:fullpath "
-                "-f default_branch=develop -f merge_method=ff"])
+                "-f default_branch='develop' -f merge_method=ff"])
 
         def test_an_unprotected_trunk_gets_a_post_and_the_mirror_only_advice(self):
             self.gitlab_tool(trunk=UNPROTECTED, mirror=UNPROTECTED)
@@ -5390,7 +6012,8 @@ def run_tests() -> None:
             self.assertIn("mirror `main`: not protected (advisory", out)
             self.assertEqual(self.fixes(out), [
                 "glab api --method POST projects/:fullpath/protected_branches "
-                "-f name=develop -F allow_force_push=false"])
+                "-f name='develop' -F push_access_level=0 -F merge_access_level=40 "
+                "-F allow_force_push=false"])
 
         def test_force_push_allowed_gets_a_patch_on_either_branch(self):
             self.gitlab_tool(trunk=GL_FORCE, mirror=GL_FORCE)
@@ -5444,7 +6067,8 @@ def run_tests() -> None:
             self.assertIn("default branch: `develop` is the trunk: ok", out)
             self.assertIn("merge commits: allowed: ok", out)
             self.assertIn("rebase merges: allowed: ok", out)
-            self.assertIn("trunk `develop`: protected, force-push disallowed: ok", out)
+            self.assertIn("trunk `develop`: protected, force-push disallowed, "
+                          "direct push blocked: ok", out)
             self.assertEqual(self.fixes(out), [])
             self.assertEqual(self.argv(), [
                 "api", "repos/{owner}/{repo}",
@@ -5458,7 +6082,7 @@ def run_tests() -> None:
             self.assertIn("merge commits: NOT allowed", out)
             self.assertIn("rebase merges: NOT allowed", out)
             self.assertEqual(self.fixes(out), [
-                "gh api -X PATCH repos/{owner}/{repo} -f default_branch=develop "
+                "gh api -X PATCH repos/{owner}/{repo} -f default_branch='develop' "
                 "-F allow_merge_commit=true -F allow_rebase_merge=true"])
 
         def test_an_unprotected_trunk_gets_the_put_and_the_mirror_only_advice(self):
@@ -5471,6 +6095,48 @@ def run_tests() -> None:
                 "repos/{owner}/{repo}/branches/develop/protection --input -"
                 % GITHUB_PROTECTION])
             self.assertIn('"allow_force_pushes":false', out)
+            # a protected branch with no required review still takes a direct push (rule 2)
+            self.assertIn('"required_pull_request_reviews":{', GITHUB_PROTECTION)
+            self.assertNotIn('"required_pull_request_reviews":null', GITHUB_PROTECTION)
+
+        def test_a_protected_trunk_without_a_required_pr_is_a_finding(self):
+            """"Protected" with force-push off still lets everyone with write access push
+            straight to the trunk; only a required pull request stops that."""
+            self.github_tool(trunk=GH_NO_PR, mirror=GH_NO_PR)
+            out = self.report("github")
+            self.assertIn("trunk `develop`: protected, but a direct push is still allowed", out)
+            # the mirror is pushed by `sync` itself: requiring a PR on it would break sync
+            self.assertIn("mirror `main`: protected, force-push disallowed: ok", out)
+            fixes = self.fixes(out)
+            self.assertEqual(len(fixes), 1)
+            self.assertIn('"required_pull_request_reviews":'
+                          '{"dismiss_stale_reviews":false,"require_code_owner_reviews":false,'
+                          '"required_approving_review_count":0}', fixes[0])
+            self.assertIn('"allow_force_pushes":false', fixes[0])
+
+        def test_the_put_carries_back_the_settings_a_full_replace_would_reset(self):
+            """`PUT .../protection` replaces the whole object: every flag the GET returned has
+            to come back, or the fix silently weakens the branch it claims to tighten."""
+            body = json.loads(github_protection_body(json.loads(
+                '{"allow_force_pushes":{"enabled":true},'
+                '"required_linear_history":{"enabled":true},'
+                '"required_conversation_resolution":{"enabled":true},'
+                '"block_creations":{"enabled":true},"lock_branch":{"enabled":true},'
+                '"allow_deletions":{"enabled":false},"allow_fork_syncing":{"enabled":true},'
+                '"required_pull_request_reviews":{"required_approving_review_count":1,'
+                '"require_last_push_approval":true,'
+                '"dismissal_restrictions":{"users":[{"login":"ada"}],"teams":[],"apps":[]},'
+                '"bypass_pull_request_allowances":{"users":[],"teams":[{"slug":"core"}],'
+                '"apps":[]}}}')))
+            for key in ("required_linear_history", "required_conversation_resolution",
+                        "block_creations", "lock_branch", "allow_fork_syncing"):
+                self.assertIs(body[key], True, key)
+            self.assertIs(body["allow_deletions"], False)
+            self.assertIs(body["allow_force_pushes"], False)
+            prr = body["required_pull_request_reviews"]
+            self.assertIs(prr["require_last_push_approval"], True)
+            self.assertEqual(prr["dismissal_restrictions"]["users"], ["ada"])
+            self.assertEqual(prr["bypass_pull_request_allowances"]["teams"], ["core"])
 
         def test_enabled_force_pushes_are_flagged(self):
             self.github_tool(trunk=GH_FORCE, mirror=UNPROTECTED)
@@ -5518,7 +6184,7 @@ def run_tests() -> None:
                 code, out, err = run("-C", fork, "setup")
             self.assertEqual(code, 0, err + out)
             self.assertIn("default branch: `main` - it must be the trunk `develop`", out)
-            self.assertIn("-f default_branch=develop", out)
+            self.assertIn("-f default_branch='develop'", out)
             self.assertIn("trunk `develop`: NOT protected", out)
 
         def test_a_dry_run_still_runs_the_read_only_report(self):
@@ -5528,7 +6194,8 @@ def run_tests() -> None:
                 code, out, err = run("-C", fork, "setup", "--dry-run")
             self.assertEqual(code, 0, err + out)
             self.assertIn("read-only: default_branch=develop  merge_method=ff", out)
-            self.assertIn("trunk `develop`: protected, force-push disallowed: ok", out)
+            self.assertIn("trunk `develop`: protected, force-push disallowed, "
+                          "direct push blocked: ok", out)
             self.assertEqual(self.argv(), [
                 "api", "projects/:fullpath",
                 "api", "projects/:fullpath/protected_branches/develop",

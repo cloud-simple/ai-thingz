@@ -261,9 +261,10 @@ backup_prefix = "backup/"
 
 The script itself needs only Python 3.9+ and git 2.20+ (the merge simulation wants 2.38+ and is
 skipped with a note on older git). **Reading `.forkflow.toml` needs Python 3.11+** (`tomllib`): a
-config file that is present but cannot be read is exit 2 for every subcommand, because it carries
-the safety-critical branch names and must never be silently defaulted. Without a config file, 3.9+
-is enough.
+config file that is present and configures something is exit 2 for every subcommand on an older
+Python, because it carries the safety-critical branch names and must never be silently defaulted.
+Without a config file, 3.9+ is enough - so on an older Python `setup` writes no template (it says
+so) and a file of nothing but comments is read as no config at all.
 
 ### Exit codes
 
