@@ -24,8 +24,9 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/forkflow.py" ship --dry-run
    ```
 
-   Nothing is created, rebased, squashed or pushed. Use it to show the user the commits that will
-   become one, and the upstream-tracked WARNING list.
+   Nothing is created, rebased, squashed or pushed (it does fetch). Use it to show the user the
+   commits that will become one, and the upstream-tracked WARNING list it prints where the real
+   run prints it after the squash.
 
 3. **Run it.**
 
@@ -87,7 +88,7 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
 | exit | what happened | what to do |
 |---|---|---|
 | 0 | done, dry run, or "nothing to ship" | nothing to land beyond `origin/<trunk>` |
-| 2 | precondition: on the trunk / the mirror / a `sync/` or `backup/` branch, dirty tree, detached HEAD, rebase already in progress, `--continue` with an unfinished rebase | switch to the feature branch or finish the rebase; the message names it |
+| 2 | precondition: on the trunk / the mirror / a `sync/` or `backup/` branch, dirty tree, detached HEAD, rebase already in progress, `--continue` with an unfinished rebase or with no ship of ours to resume, `origin/<branch>` carrying commits the local branch does not | switch to the feature branch or finish the rebase; the message names it. For the last one the commits that would be lost are listed - take them in (`git pull --rebase origin <branch>`) rather than shipping over them |
 | 3 | `check` failed after the rebase and squash - a `gate` command or the tip check; nothing was pushed | fix it, commit, rerun `ship`; the rollback line is printed |
 | 4 | rebase conflicts | resolve, `git rebase --continue`, `ship --continue` |
 | 5 | rewrite safety: backup not confirmed, tree hash changed by the squash, `--force-with-lease` rejected (someone else pushed to the branch) | do not force past it; report it and use the printed rollback line |

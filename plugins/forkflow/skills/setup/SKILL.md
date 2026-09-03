@@ -35,7 +35,9 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before running it.
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/forkflow.py" setup --dry-run
    ```
 
-   Everything is printed as `would:`; no config, no hook, no template, no branch, no push. (The
+   Every step that would change something is printed as `would:` - the read-only steps (`remote`,
+   `fetch`, `names`, `target`, `mirror`, `trunk`, `platform`) print without it; no config, no hook,
+   no template, no branch, no push. (The
    fetch still runs, and the platform report still runs - every one of its calls is a GET.) A dry
    run that would have to *add* the remote stops there: there is nothing to preview yet.
 
@@ -95,7 +97,7 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before running it.
 | exit 2 | meaning | what to do |
 |---|---|---|
 | mirror "has commits that are not in upstream" | the fork's mirror branch carries its own work - this is a **migration**, not a setup | point at the README section *Adopting forkflow in an existing fork* and stop. Never reset, force-push or delete that branch on the user's behalf; it is done once, by hand, by a Maintainer, after a backup |
-| trunk exists locally but not on origin | the script never pushes the trunk | the user pushes it once themselves (`git push -u origin <trunk>`) or deletes it and reruns setup |
+| trunk exists locally but not on origin | the script never pushes the trunk | the user pushes it once themselves (`git push -u origin <trunk>`) **before the pre-push hook is installed** - once it is, rule 2 refuses every trunk push, creation included - or deletes the branch and reruns setup |
 | `core.hooksPath` is set | the hooks directory is shared with other repositories | say what that means; install it there by hand, or rerun with `--force` if the user accepts it |
 | an existing foreign `pre-push` hook | not forkflow's | rerun with `--force` after the user agrees; the old hook is kept as `pre-push.pre-forkflow` |
 | no remote for the original project | nothing to fetch | ask for the URL, rerun with `--upstream-url` |

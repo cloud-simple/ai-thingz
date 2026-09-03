@@ -158,7 +158,8 @@ main (mirror) ──────●───────●───────
 develop (trunk) ──────────────────────●──●──●   upstream + our work; protected, MR-only
 ```
 
-- **mirror** (`main` by default) is never committed on. `sync` fast-forwards it to the upstream
+- **mirror** (named after upstream's own branch by default - `main` here, `master` on a
+  master-based upstream) is never committed on. `sync` fast-forwards it to the upstream
   branch and pushes it, so teammates and CI can see "theirs vs ours" with `git diff main..develop`
   without configuring the `upstream` remote themselves.
 - **trunk** (`develop` by default) carries every feature and every upstream sync and is reached only
@@ -197,7 +198,7 @@ read is [`plugins/forkflow/references/rules.md`](plugins/forkflow/references/rul
 | skill | say | what it does |
 |---|---|---|
 | `/forkflow:status` | *"where are we vs upstream"*, *"how much has this fork diverged"* | one screen: mirror, trunk, `origin/*` and upstream, divergence and how much of it is upstream-tracked, what the current branch touches, whether the fork is set up. Read-only |
-| `/forkflow:sync` | *"sync upstream"*, *"pull in upstream"* | advance and push the mirror, then bring it into the trunk through `sync/<upstream>-<date>` + one `--no-ff` merge + an MR. Conflicts are resolved in the branch; a "both sides survived" table proves a clean merge is also a correct one |
+| `/forkflow:sync` | *"sync upstream"*, *"pull in upstream"* | advance and push the mirror, then bring it into the trunk through `sync/<upstream>-<date>` + one `--no-ff` merge + an MR. Conflicts are resolved in the branch; a "both sides survived" table flags every file changed on both sides, because a clean merge is not automatically a correct one |
 | `/forkflow:ship` | *"ship this branch"*, *"squash and open the MR"* | take a feature branch to the trunk as **one** squashed commit (tree-hash verified) on top of a fresh `origin/<trunk>`, through an MR |
 | `/forkflow:setup` | *"set up the fork"*, *"protect the trunk locally"* | make the rules mechanical: upstream push URL disabled, pre-push hook, ff-only merge config, trunk bootstrapped on a fresh fork, and a report of the platform's default branch / merge method / protection with the exact command to fix each mismatch |
 
@@ -216,11 +217,15 @@ python3 $S ship [--continue] [--mr] [--title T] [--message-file F]
 python3 $S setup [--upstream NAME] [--upstream-url URL] [--trunk NAME] [--mirror NAME]
 ```
 
-`-C DIR`, `--dry-run` and `--force` work on every subcommand and may be given before or after it.
+`-C DIR`, `--dry-run` and `--force` are accepted on every subcommand and may be given before or
+after it; `--force` only does something in `sync` (recreate the sync branch) and `setup` (replace a
+foreign pre-push hook).
 `check` is the preflight `sync` and `ship` run themselves (upstream-tracked warning, configured gate
 commands, "is this branch on the trunk's tip"); it has no skill of its own - `status` surfaces it for
 humans. `--dry-run` creates no branch, commit, push, config or hook and moves no mirror, and still
-previews the merge that is pending.
+previews the merge that is pending. It is not read-only: it fetches (that is how it knows what is
+pending), so `refs/remotes/*` and `FETCH_HEAD` are refreshed and the merge simulation writes a tree
+object - nothing that changes a branch, a worktree or a setting.
 
 `status` on a fork whose feature branch touches a file upstream also owns:
 
@@ -247,7 +252,7 @@ warning and never a refusal.
 ```toml
 upstream = "upstream"        # remote name of the original project
 upstream_branch = "main"     # its branch we track (default: upstream's HEAD)
-mirror = "main"              # our fast-forward-only copy of upstream_branch
+mirror = "main"              # our fast-forward-only copy of it (default: upstream_branch)
 trunk = "develop"            # protected, MR-only branch carrying our work
 gate = []                    # e.g. ["make test", "terraform fmt -check -recursive"]
 sync_prefix = "sync/"

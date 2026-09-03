@@ -100,7 +100,7 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
 |---|---|---|
 | 0 | done, dry run, or "already in sync" | nothing; the mirror may still have been advanced and pushed |
 | 2 | precondition: dirty tree, detached HEAD, sync branch already exists, mirror checked out in another worktree, mirror diverged, untracked file blocking the mirror fast-forward | fix what the message names; `--force` recreates an existing sync branch, and that is the only thing `--force` does here |
-| 3 | `check` failed after the merge - a `gate` command or the tip check | fix it on the sync branch, then `sync --continue` |
+| 3 | `check` failed after the merge - a `gate` command, or `origin/<trunk>` moved under the branch | read the hint the run printed: a failing gate is fixed with a commit on the sync branch and `sync --continue` (the resume picks up the merge commit, wherever it now sits in the branch); a trunk that moved on means the sync is redone against the new tip with `sync --force` - a sync MR is never rebased |
 | 4 | merge conflicts | resolve, `git add`, `sync --continue` |
 | 5 | rewrite safety: the backup was not confirmed on origin, or a push was rejected | do not work around it; report it - a rejected mirror push usually means the mirror is not a pure copy of upstream |
 

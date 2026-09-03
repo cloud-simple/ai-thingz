@@ -16,7 +16,8 @@ main (mirror) ──────●───────●───────
 develop (trunk) ──────────────────────●──●──●   upstream + our work; protected, MR-only
 ```
 
-- **mirror** (`main` by default) is never committed on. It is only fast-forwarded to the upstream
+- **mirror** (named after upstream's own branch by default: `main` here, `master` on a
+  master-based upstream) is never committed on. It is only fast-forwarded to the upstream
   branch and pushed, so anyone can see "theirs vs ours" with `git diff main..develop` without
   configuring the `upstream` remote.
 - **trunk** (`develop` by default) carries every feature and every upstream sync, and is reached
@@ -65,5 +66,13 @@ never changes them itself. A Maintainer runs the command.
 
 A fork whose mirror branch already carries its own work is a migration, not a setup: it rewrites
 a published branch and is done once, by hand, by a Maintainer. `setup` refuses it and points at
-the README section *Adopting forkflow in an existing fork*. Never reset or force-push that branch
-on the user's behalf.
+the section *Adopting forkflow in an existing fork* of the project README
+(github.com/cloud-simple/ai-thingz, section `forkflow`), which carries the five-step recipe.
+Never reset or force-push that branch on the user's behalf.
+
+## The gate is arbitrary shell
+
+`gate = [...]` in `.forkflow.toml` is run with `sh -c` by `check`, `sync` and `ship`. That file is
+tracked and committed, so a sync can bring a `gate` in from upstream: read the diff of
+`.forkflow.toml` in a sync merge request before the next `sync`/`ship` runs it. A dry run never
+executes a gate.

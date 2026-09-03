@@ -45,9 +45,9 @@ Header:
 ```
 forkflow status  origin=<url>  upstream=<url>  platform=<gitlab|github|unknown>
   as of last fetch: <relative age, or "never">
-  mirror  <mirror> <sha|->  origin/<mirror> <sha|-> (=|unpushed n)  upstream/<ub> <sha|unfetched> (=|mirror behind by n|DIVERGED)
-  trunk   <trunk> <sha|->   origin/<trunk> <sha|missing> (=|+n/-m)  upstream/<ub> (+n/-m vs origin/<trunk>)
-  divergence: <N> files, <M> upstream-tracked
+  mirror  <mirror> <sha|->  origin/<mirror> <sha|-> (=|unpushed n|behind n|-)  upstream/<ub> <sha|unfetched> (=|mirror behind by n|DIVERGED|no mirror|unfetched|?)
+  trunk   <trunk> <sha|->   origin/<trunk> <sha|missing> (=|+n/-m|missing|-)  upstream/<ub> (+n/-m vs origin/<trunk>|vs origin/<trunk>: unknown)
+  divergence: <N> files, <M> upstream-tracked        (or: unknown (fetch upstream and create the trunk first))
 ```
 
 | what you see | what it means |
@@ -58,6 +58,9 @@ forkflow status  origin=<url>  upstream=<url>  platform=<gitlab|github|unknown>
 | `DIVERGED` | the mirror has commits of its own - it is not a mirror; a manual migration, never reset by the plugin |
 | `unfetched` | `upstream/<branch>` is not in this clone yet; rerun with `--fetch` |
 | `missing` on the trunk | the trunk is not on origin; `setup` bootstraps it on a fresh fork |
+| `behind n` on the mirror | `origin/<mirror>` is ahead of the local one (a teammate synced); fetch and fast-forward |
+| `no mirror` | neither a local nor an `origin/` copy of the mirror exists yet; run `setup` |
+| `?` or `unknown` | the two refs cannot be compared (one of them is missing); fetch, then read it again |
 | `divergence: N files, M upstream-tracked` | how big the fork is, and how much of it will cost merge work forever - the M files are the whole conflict surface |
 | branch `n unpushed` / `not on origin` | the current branch against `origin/<branch>` |
 | `touches upstream-tracked files (WARNING, m)` | this branch edits files upstream also owns; a warning, never a blocker |
