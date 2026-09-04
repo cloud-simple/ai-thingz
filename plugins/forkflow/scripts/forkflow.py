@@ -69,10 +69,12 @@ DEFAULT_SYNC_PREFIX = "sync/"
 DEFAULT_BACKUP_PREFIX = "backup/"
 README_POINTER = ("See *Adopting forkflow in an existing fork* in the project README "
                   "(github.com/cloud-simple/ai-thingz, section `forkflow`)")
-GATE_TAIL = 12                       # lines of a failing gate command's output that are shown
+TAIL_LINES = 12                      # last lines of a failed command shown (a gate, the MR tool)
 MERGE_TREE_GIT = (2, 38)             # `git merge-tree --write-tree` - older git skips the simulation
 BOTH_SIDES_SNIFF = 8192              # bytes of a blob looked at for a NUL before it is "binary"
 BOTH_SIDES_WIDTH = 48                # column the both-sides table pads paths to
+MAX_SYNC_RERUNS = 100                # `--force` reruns: `<name>-2` .. `<name>-99` before it gives up
+EXIT_INTERRUPTED = 130               # Ctrl-C, as the module docstring publishes it
 
 # What each backup is for, printed with the rollback line so the restore point is understood.
 BACKUP_PURPOSE = {
@@ -163,6 +165,17 @@ def rev(root: str, spec: str) -> str:
     return git("rev-parse", "--verify", "-q", spec + "^{commit}", cwd=root, check=False)
 
 
+def git_path(root: str, name: str) -> str:
+    """Absolute path of `name` inside this worktree's git directory, "" when git cannot say.
+
+    `--git-path` answers relatively for the main worktree and absolutely for a linked one, so
+    every caller has to join the relative answer with the root before it can be opened."""
+    p = git("rev-parse", "--git-path", name, cwd=root, check=False)
+    if not p:
+        return ""
+    return p if os.path.isabs(p) else os.path.join(root, p)
+
+
 def short(sha: str) -> str:
     return sha[:8] if sha else "-"
 
@@ -200,9 +213,7 @@ def load_config(root: str) -> dict:
     path = os.path.join(root, CONFIG_FILE)
     if not os.path.exists(path):
         return {}
-    try:
-        import tomllib  # Python 3.11+
-    except ImportError:
+    if not have_tomllib():
         # a file of nothing but comments configures nothing: reading it as `{}` is exactly what
         # tomllib would have said, and refusing it would brick every subcommand over the
         # commented template `setup` used to leave behind
@@ -211,6 +222,7 @@ def load_config(root: str) -> dict:
         raise Fail(f"{CONFIG_FILE} needs Python 3.11+ (tomllib) to be read; "
                    f"this is Python {sys.version_info[0]}.{sys.version_info[1]}. "
                    f"Remove the file or run forkflow with a newer Python.")
+    import tomllib  # Python 3.11+, guarded by have_tomllib() above
     try:
         with open(path, "rb") as fh:
             cfg = tomllib.load(fh)
@@ -266,8 +278,6 @@ class Ctx:
     upstream_branch: str = "main"
     trunk: str = DEFAULT_TRUNK
     mirror: str = "main"
-    mirror_diverged: bool = False
-    mirror_ahead: bool = False
     platform: str = "unknown"
     dry_run: bool = False
     sync_prefix: str = DEFAULT_SYNC_PREFIX
@@ -329,19 +339,15 @@ def mirror_from_origin(ctx: Ctx) -> bool:
     return rc == 0
 
 
-def resolve_ctx(cwd: str, args: object = None, need_upstream: bool = True,
-                need_trunk: bool = True, strict_mirror: bool = True) -> Ctx:
-    """Build the Ctx and enforce the preconditions each subcommand needs."""
-    cwd = os.path.abspath(cwd)
-    if not git_ok("rev-parse", "--is-inside-work-tree", cwd=cwd):
-        raise Fail(f"{cwd} is not inside a git repository")
-    root = git("rev-parse", "--show-toplevel", cwd=cwd)
-    cfg = load_config(root)
-    remotes = git("remote", cwd=root).split()
-    if "origin" not in remotes:
-        raise Fail("no `origin` remote: forkflow expects the fork to be `origin`")
+def resolve_upstream_remote(root: str, args: Optional[argparse.Namespace], cfg: dict,
+                            remotes: Sequence[str], need_upstream: bool,
+                            named: Optional[str] = None) -> Tuple[str, str]:
+    """(remote name, URL) of the original project: `named`, the `--upstream` flag, the config,
+    or the one non-origin remote there is.
 
-    name = getattr(args, "upstream", None) or cfg.get("upstream")
+    With none of those, `need_upstream` decides between a failure and a placeholder name -
+    `setup` has to resolve a Ctx before the remote it is about to add exists."""
+    name = named or getattr(args, "upstream", None) or cfg.get("upstream")
     others = [r for r in remotes if r != "origin"]
     if name == "origin":
         raise Fail("`origin` is the fork; the upstream remote is the original project - "
@@ -351,12 +357,13 @@ def resolve_ctx(cwd: str, args: object = None, need_upstream: bool = True,
     if not name or name not in remotes:
         if need_upstream:
             raise Fail(no_upstream_message(name, others))
-        upstream = name or "upstream"
-        upstream_url = ""
-    else:
-        upstream = name
-        upstream_url = git("remote", "get-url", upstream, cwd=root, check=False)
+        return (name or "upstream", "")
+    return (name, git("remote", "get-url", name, cwd=root, check=False))
 
+
+def resolve_upstream_branch(root: str, upstream: str, cfg: dict) -> str:
+    """The branch of the original project the mirror copies: the config, then
+    `<upstream>/HEAD`, then whichever of `main`/`master` is fetched, then `main`."""
     ub = cfg.get("upstream_branch")
     if not ub:
         head = git("symbolic-ref", "-q", f"refs/remotes/{upstream}/HEAD", cwd=root, check=False)
@@ -368,8 +375,28 @@ def resolve_ctx(cwd: str, args: object = None, need_upstream: bool = True,
             if has_ref(root, f"refs/remotes/{upstream}/{cand}"):
                 ub = cand
                 break
-    if not ub:
-        ub = "main"
+    return ub or "main"
+
+
+def resolve_ctx(cwd: str, args: Optional[argparse.Namespace] = None, need_upstream: bool = True,
+                need_trunk: bool = True, strict_mirror: bool = True,
+                upstream: Optional[str] = None) -> Ctx:
+    """Build the Ctx and enforce the preconditions each subcommand needs.
+
+    `upstream` names the remote outright, for the one caller that has just added it and must
+    not wait for the flag or the config to catch up (`setup`)."""
+    cwd = os.path.abspath(cwd)
+    if not git_ok("rev-parse", "--is-inside-work-tree", cwd=cwd):
+        raise Fail(f"{cwd} is not inside a git repository")
+    root = git("rev-parse", "--show-toplevel", cwd=cwd)
+    cfg = load_config(root)
+    remotes = git("remote", cwd=root).split()
+    if "origin" not in remotes:
+        raise Fail("no `origin` remote: forkflow expects the fork to be `origin`")
+
+    upstream, upstream_url = resolve_upstream_remote(root, args, cfg, remotes,
+                                                     need_upstream, upstream)
+    ub = resolve_upstream_branch(root, upstream, cfg)
 
     mirror = getattr(args, "mirror", None) or cfg.get("mirror") or ub
     trunk = getattr(args, "trunk", None) or cfg.get("trunk") or DEFAULT_TRUNK
@@ -403,8 +430,8 @@ def resolve_ctx(cwd: str, args: object = None, need_upstream: bool = True,
             if strict_mirror:
                 raise Fail(f"`{ctx.up()}` is not fetched yet: run `git fetch {upstream}`")
         else:
-            ctx.mirror_diverged, ctx.mirror_ahead = mirror_divergence(ctx)
-            if ctx.mirror_diverged and strict_mirror and not mirror_from_origin(ctx):
+            diverged, _ = mirror_divergence(ctx)
+            if diverged and strict_mirror and not mirror_from_origin(ctx):
                 raise Fail(f"`{ctx.mirror}` carries commits that are in neither `{ctx.up()}` "
                            f"as last fetched nor `{ctx.origin}/{ctx.mirror}`: run "
                            f"`git fetch {upstream}` and try again; if it is still ahead "
@@ -424,10 +451,7 @@ def resolve_ctx(cwd: str, args: object = None, need_upstream: bool = True,
 # --------------------------------------------------------------------------- #
 
 def state_path(ctx: Ctx) -> str:
-    path = git("rev-parse", "--git-path", STATE_FILE, cwd=ctx.root, check=False)
-    if path and not os.path.isabs(path):
-        path = os.path.join(ctx.root, path)
-    return path
+    return git_path(ctx.root, STATE_FILE)
 
 
 def read_state(ctx: Ctx) -> dict:
@@ -484,9 +508,40 @@ def diff_names(ctx: Ctx, *args: str) -> list:
     return [f for f in out.split("\0") if f]
 
 
+def name_status(ctx: Ctx, *args: str) -> list:
+    """`git diff -z --name-status ...` as (status, path, other) triples.
+
+    -z for the same reason as `diff_names`. A rename or a copy carries two paths
+    (`R100 <old> <new>`); everything else carries one and `other` is "". A git that cannot
+    answer reports nothing: this is advisory reading, not a precondition."""
+    rc, out, _ = git_rc("diff", "-z", "--name-status", *args, cwd=ctx.root)
+    if rc != 0:
+        return []
+    fields = out.split("\0")
+    records, i = [], 0
+    while i < len(fields):
+        code = fields[i]
+        if not code:
+            i += 1
+            continue
+        width = 3 if code[0] in ("R", "C") else 2
+        rest = fields[i + 1:i + width]
+        records.append((code, rest[0] if rest else "", rest[1] if len(rest) > 1 else ""))
+        i += width
+    return records
+
+
 def step(label: str, cmd: str, result: str, dry: bool = False) -> None:
     prefix = "  would: " if dry else "  "
     print(f"{prefix}{label}  $ {cmd}  -> {result}")
+
+
+def report_paths(label: str, cmd: str, paths: Sequence[str], noun: str) -> None:
+    """One `step()` line counting the paths, then one line per path - the shape every
+    "these files are in the way" report in this script has."""
+    step(label, cmd, f"{len(paths)} {noun}")
+    for path in paths:
+        print(f"    {path}")
 
 
 def clean_tree(ctx: Ctx) -> bool:
@@ -532,17 +587,17 @@ def divergence(ctx: Ctx) -> Tuple[Optional[int], Optional[int]]:
     return (len(files), len(upstream_tracked(ctx, files)))
 
 
-def branch_files(ctx: Ctx, ref: str = "HEAD") -> list:
+def branch_files(ctx: Ctx) -> list:
     """Files the current branch changed since it left the trunk (upstream when there is no trunk)."""
-    if not rev(ctx.root, ref):
+    if not rev(ctx.root, "HEAD"):
         return []
     for base in (f"refs/remotes/{ctx.origin}/{ctx.trunk}", ctx.up()):
         if not rev(ctx.root, base):
             continue
-        mb = git("merge-base", base, ref, cwd=ctx.root, check=False)
+        mb = git("merge-base", base, "HEAD", cwd=ctx.root, check=False)
         if not mb:
             continue
-        return diff_names(ctx, mb, ref)
+        return diff_names(ctx, mb, "HEAD")
     return []
 
 
@@ -569,10 +624,7 @@ def warn_upstream_tracked(ctx: Ctx, touched: Optional[Sequence[str]] = None) -> 
 
 def hooks_path(root: str) -> str:
     """Absolute hooks directory of this worktree (follows core.hooksPath)."""
-    p = git("rev-parse", "--git-path", "hooks", cwd=root, check=False)
-    if not p:
-        return ""
-    return p if os.path.isabs(p) else os.path.join(root, p)
+    return git_path(root, "hooks")
 
 
 def hook_state(ctx: Ctx) -> str:
@@ -618,12 +670,16 @@ def _rel_age(seconds: float) -> str:
 
 
 def last_fetch(ctx: Ctx) -> str:
-    path = git("rev-parse", "--git-path", "FETCH_HEAD", cwd=ctx.root, check=False)
-    if path and not os.path.isabs(path):
-        path = os.path.join(ctx.root, path)
+    path = git_path(ctx.root, "FETCH_HEAD")
     if not path or not os.path.exists(path):
         return "never"
     return _rel_age(max(0.0, time.time() - os.path.getmtime(path)))
+
+
+def plus_minus(ctx: Ctx, a: str, b: str) -> str:
+    """`+<ahead>/-<behind>` of a against b - the header's two count cells."""
+    ahead, behind = ahead_behind(ctx, a, b)
+    return f"+{ahead}/-{behind}"
 
 
 def header(ctx: Ctx, sub: str) -> None:
@@ -671,12 +727,11 @@ def header(ctx: Ctx, sub: str) -> None:
     elif local_t == origin_t:
         vs_origin_t = "="
     else:
-        ahead, behind = ahead_behind(ctx, f"refs/heads/{ctx.trunk}",
-                                     f"refs/remotes/{ctx.origin}/{ctx.trunk}")
-        vs_origin_t = f"+{ahead}/-{behind}"
+        vs_origin_t = plus_minus(ctx, f"refs/heads/{ctx.trunk}",
+                                 f"refs/remotes/{ctx.origin}/{ctx.trunk}")
     if origin_t and up_sha:
-        ahead, behind = ahead_behind(ctx, ctx.up(), f"refs/remotes/{ctx.origin}/{ctx.trunk}")
-        vs_up_t = f"+{ahead}/-{behind} vs {ctx.origin}/{ctx.trunk}"
+        vs_up_t = (plus_minus(ctx, ctx.up(), f"refs/remotes/{ctx.origin}/{ctx.trunk}")
+                   + f" vs {ctx.origin}/{ctx.trunk}")
     else:
         vs_up_t = f"vs {ctx.origin}/{ctx.trunk}: unknown"
     print(f"  trunk   {ctx.trunk} {short(local_t)}   "
@@ -688,6 +743,28 @@ def header(ctx: Ctx, sub: str) -> None:
         print("  divergence: unknown (fetch upstream and create the trunk first)")
     else:
         print(f"  divergence: {n_files} files, {n_tracked} upstream-tracked")
+
+
+def fetch(ctx: Ctx, remotes: Sequence[str],
+          refs: Sequence[str] = ()) -> Tuple[int, str, str, str]:
+    """Refresh `remotes` and say what moved: (returncode, command, result, stderr).
+
+    `result` is the `step()` line a successful fetch deserves - one `<ref> <old>..<new>` (or
+    `<ref> unchanged`) per named ref, or "remote-tracking refs refreshed" when the caller
+    names none. Nothing is printed and nothing is raised here: whether a failure stops the run
+    or is only reported is the caller's, and `status` still has the refs on disk to report."""
+    args = ["fetch"] + (["--multiple"] if len(remotes) > 1 else []) + list(remotes)
+    cmd = "git " + " ".join(args)
+    before = dict((r, rev(ctx.root, r)) for r in refs)
+    rc, _, err = git_rc(*args, cwd=ctx.root)
+    if rc != 0:
+        return (rc, cmd, "", err)
+    moved = []
+    for r in refs:
+        now = rev(ctx.root, r)
+        moved.append(f"{r} unchanged" if now == before[r]
+                     else f"{r} {short(before[r])}..{short(now)}")
+    return (0, cmd, ", ".join(moved) if moved else "remote-tracking refs refreshed", err)
 
 
 # --------------------------------------------------------------------------- #
@@ -747,9 +824,15 @@ def push_mirror(ctx: Ctx, target: str = "") -> str:
     mirror, so without it the ancestry check would judge a tip the real push never sends and
     refuse the ordinary state a teammate's sync leaves behind."""
     m = ctx.mirror
+    refspec = f"refs/heads/{m}:refs/heads/{m}"
+    if target and rev(ctx.root, f"refs/remotes/{ctx.origin}/{m}") == target:
+        # nothing to send: `origin/<mirror>` is already the commit this run moves it to
+        cmd = f"git push {ctx.origin} {refspec}"
+        step("mirror push", cmd, "up to date")
+        return cmd
     if not has_ref(ctx.root, f"refs/heads/{m}"):
         if ctx.dry_run:              # advance_mirror would have created it; nothing to inspect
-            cmd = f"git push {ctx.origin} refs/heads/{m}:refs/heads/{m}"
+            cmd = f"git push {ctx.origin} {refspec}"
             step("mirror push", cmd, f"not run (dry run: `{m}` is created by this run)", dry=True)
             return cmd
         raise Fail(f"no local `{m}` to push")
@@ -768,7 +851,7 @@ def push_mirror(ctx: Ctx, target: str = "") -> str:
         if rc != 0:
             raise Fail(f"`{ctx.origin}/{m}` is not an ancestor of {what}: fetch and "
                        f"fast-forward first - the mirror is never forced")
-    args = ["push", ctx.origin, f"refs/heads/{m}:refs/heads/{m}"]
+    args = ["push", ctx.origin, refspec]
     cmd = "git " + " ".join(args)
     if ctx.dry_run:
         step("mirror push", cmd, "not run (dry run)", dry=True)
@@ -910,7 +993,12 @@ def backup(ctx: Ctx, reason: str, from_ref: str) -> str:
 def simulate_merge(ctx: Ctx, target: str) -> Optional[Tuple[bool, list]]:
     """Predict the sync merge without touching the worktree: (clean, conflicting paths).
 
-    None when git is too old to simulate - the merge itself is then the first answer."""
+    None when git is too old to simulate - the merge itself is then the first answer.
+
+    The only path-reading site that is not `-z` (see `diff_names`): `merge-tree`'s `-z` also
+    changes how the sections themselves are terminated, and these paths are printed and put in
+    the merge-request body, never handed back to git - so a C-quoted non-ASCII name is a
+    display wart here, not a wrong pathspec."""
     cmd = f"git merge-tree --write-tree --name-only {ctx.origin}/{ctx.trunk} {short(target)}"
     if git_version() < MERGE_TREE_GIT:
         step("simulate", cmd, "simulation needs git 2.38+, skipping")
@@ -929,9 +1017,7 @@ def simulate_merge(ctx: Ctx, target: str) -> Optional[Tuple[bool, list]]:
             if not line.strip():
                 break
             conflicts.append(line.strip())
-        step("simulate", cmd, f"{len(conflicts)} conflicting file(s)")
-        for f in conflicts:
-            print(f"    {f}")
+        report_paths("simulate", cmd, conflicts, "conflicting file(s)")
         return (False, conflicts)
     raise Fail(f"merge simulation failed: {(err or out).strip()}")
 
@@ -1000,7 +1086,7 @@ def open_mr(ctx: Ctx, branch: str, title: str, body: str, run_it: bool) -> str:
     out = p.stdout.decode("utf-8", "replace").strip()
     if p.returncode != 0:
         step("mr", shown, f"FAILED (exit {p.returncode}) - open it yourself")
-        for line in tail_lines(p.stderr.decode("utf-8", "replace"), GATE_TAIL):
+        for line in tail_lines(p.stderr.decode("utf-8", "replace"), TAIL_LINES):
             print(f"      {line}")
         print(f"    description: {path}")
         return shown
@@ -1021,19 +1107,16 @@ def open_mr(ctx: Ctx, branch: str, title: str, body: str, run_it: bool) -> str:
 def cmd_status(args: argparse.Namespace) -> int:
     """Read-only. Without --fetch it makes no network call and writes nothing."""
     ctx = resolve_ctx(args.dir, args, need_upstream=True, need_trunk=False, strict_mirror=False)
-    fetch_result = None
+    fetch_step = None
     if getattr(args, "fetch", False):
-        rc, _, err = git_rc("fetch", "--multiple", ctx.origin, ctx.upstream, cwd=ctx.root)
+        rc, cmd, result, err = fetch(ctx, (ctx.origin, ctx.upstream))
         tail = err.strip().splitlines()[-1] if err.strip() else "see git output"
-        fetch_result = ("remote-tracking refs refreshed" if rc == 0
-                        else f"FAILED, reporting the refs on disk: {tail}")
-        # resolve_ctx judged the mirror against the refs as they were *before* this fetch:
-        # reporting that verdict next to a table built from the refreshed refs contradicts it
-        ctx.mirror_diverged, ctx.mirror_ahead = mirror_divergence(ctx)
+        fetch_step = (cmd, result if rc == 0
+                      else f"FAILED, reporting the refs on disk: {tail}")
 
     header(ctx, "status")
-    if fetch_result:
-        step("fetch", f"git fetch --multiple {ctx.origin} {ctx.upstream}", fetch_result)
+    if fetch_step:
+        step("fetch", fetch_step[0], fetch_step[1])
 
     branch = current_branch(ctx)
     modified = [ln for ln in git("status", "--porcelain", "--untracked-files=no",
@@ -1076,11 +1159,14 @@ def cmd_status(args: argparse.Namespace) -> int:
         todo.append("ff-only merge config not set")
     if todo:
         print("  hint     run `forkflow setup`: " + "; ".join(todo))
-    if ctx.mirror_ahead:
+    # judged here rather than carried on the Ctx: with --fetch the refs `resolve_ctx` read
+    # are a fetch old, and this verdict has to agree with the table printed above
+    diverged, ahead = mirror_divergence(ctx)
+    if ahead:
         print(f"  hint     mirror `{ctx.mirror}` is ahead of `{ctx.up()}` as last fetched: "
               f"run `git fetch {ctx.upstream}`; if it is still ahead afterwards it carries "
               f"commits that are not upstream's. {README_POINTER}")
-    elif ctx.mirror_diverged:
+    elif diverged:
         print(f"  hint     mirror `{ctx.mirror}` has commits that are not in `{ctx.up()}`. "
               f"{README_POINTER}")
     return 0
@@ -1088,10 +1174,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def gate_commands(ctx: Ctx) -> list:
     """`gate = [...]` from the config - load_config has already refused every other shape."""
-    gate = ctx.cfg.get("gate") or []
-    if not isinstance(gate, list) or any(not isinstance(c, str) for c in gate):
-        raise Fail(f"{CONFIG_FILE}: `gate` must be a list of shell commands")
-    return [c for c in gate if c.strip()]
+    return [c for c in (ctx.cfg.get("gate") or []) if c.strip()]
 
 
 def run_check(ctx: Ctx, touched: Optional[Sequence[str]] = None) -> int:
@@ -1115,7 +1198,7 @@ def run_check(ctx: Ctx, touched: Optional[Sequence[str]] = None) -> int:
             step("gate", shown, "passed")
             continue
         step("gate", shown, f"FAILED (exit {rc})")
-        for line in tail_lines(out, GATE_TAIL):
+        for line in tail_lines(out, TAIL_LINES):
             print(f"      {line}")
         failures.append(f"gate `{cmd}` exited {rc}")
         break                                 # the first failure is the one to fix
@@ -1156,19 +1239,13 @@ def sync_branch(ctx: Ctx) -> str:
 
 def fetch_both(ctx: Ctx) -> None:
     """Refresh both remotes and report what moved; every later step reads these refs."""
-    refs = [ctx.up(), f"{ctx.origin}/{ctx.trunk}", f"{ctx.origin}/{ctx.mirror}"]
-    before = dict((r, rev(ctx.root, r)) for r in refs)
-    cmd = f"git fetch --multiple {ctx.origin} {ctx.upstream}"
-    rc, _, err = git_rc("fetch", "--multiple", ctx.origin, ctx.upstream, cwd=ctx.root)
+    rc, cmd, result, err = fetch(ctx, (ctx.origin, ctx.upstream),
+                                 [ctx.up(), f"{ctx.origin}/{ctx.trunk}",
+                                  f"{ctx.origin}/{ctx.mirror}"])
     if rc != 0:
         step("fetch", cmd, "FAILED")
         raise Fail(f"fetch failed: {err.strip()}")
-    moved = []
-    for r in refs:
-        now = rev(ctx.root, r)
-        moved.append(f"{r} unchanged" if now == before[r]
-                     else f"{r} {short(before[r])}..{short(now)}")
-    step("fetch", cmd, ", ".join(moved))
+    step("fetch", cmd, result)
 
 
 def blob(ctx: Ctx, ref: str, path: str) -> Optional[str]:
@@ -1261,19 +1338,9 @@ def both_sides_survived(ctx: Ctx, ours: str, theirs: str) -> list:
     changed, renamed = [], set()
     for side in (ours, theirs):
         changed.append(set(diff_names(ctx, "--no-renames", mb, side)))
-        _, status, _ = git_rc("diff", "-z", "--name-status", "--find-renames", mb, side,
-                              cwd=ctx.root)
-        fields = status.split("\0")           # -z: <status> NUL <path> [NUL <new path>] NUL
-        i = 0
-        while i < len(fields):
-            code = fields[i]
-            if not code:
-                i += 1
-                continue
-            width = 3 if code[0] in ("R", "C") else 2
+        for code, path, other in name_status(ctx, "--find-renames", mb, side):
             if code[0] in ("R", "C"):
-                renamed.update(f for f in fields[i + 1:i + width] if f)
-            i += width
+                renamed.update(f for f in (path, other) if f)
     files = sorted(changed[0] & changed[1])
     if not files:
         step("verify", cmd, "no file was changed on both sides")
@@ -1316,7 +1383,7 @@ def free_sync_name(ctx: Ctx, name: str) -> str:
     taken = {line.split("\t")[-1].strip() for line in out.splitlines() if "\t" in line}
     if f"refs/heads/{name}" not in taken:
         return name
-    for n in range(2, 100):
+    for n in range(2, MAX_SYNC_RERUNS):
         candidate = f"{name}-{n}"
         if (f"refs/heads/{candidate}" not in taken
                 and not has_ref(ctx.root, f"refs/heads/{candidate}")):
@@ -1325,8 +1392,8 @@ def free_sync_name(ctx: Ctx, name: str) -> str:
             print(f"    close the merge request of `{name}`: it is the stale one this rerun "
                   f"replaces (a sync MR is never rebased or force-pushed)")
             return candidate
-    raise Fail(f"`{name}` and every `{name}-N` up to 99 are already on {ctx.origin}: "
-               f"delete the stale sync branches there first")
+    raise Fail(f"`{name}` and every `{name}-N` up to {MAX_SYNC_RERUNS - 1} are already on "
+               f"{ctx.origin}: delete the stale sync branches there first")
 
 
 def make_sync_branch(ctx: Ctx, name: str, force: bool) -> None:
@@ -1366,9 +1433,7 @@ def merge_upstream(ctx: Ctx, name: str, target: str, commits: Sequence[str]) -> 
     unmerged = unmerged_paths(ctx)
     if not unmerged:
         raise Fail(f"merge of {short(target)} failed:\n{(err or out).strip()}")
-    step("merge", cmd, f"{len(unmerged)} conflicting file(s)")
-    for f in unmerged:
-        print(f"    {f}")
+    report_paths("merge", cmd, unmerged, "conflicting file(s)")
     raise Fail(f"resolve the conflicts on `{name}`, `git add` them, "
                f"then run `forkflow sync --continue`", 4)
 
@@ -1401,9 +1466,7 @@ def sync_body(ctx: Ctx, commits: Sequence[str], both: Sequence[Tuple[str, str]],
 
 def merge_in_progress(ctx: Ctx) -> bool:
     """True while a merge is resolved but not committed (`MERGE_HEAD` still there)."""
-    path = git("rev-parse", "--git-path", "MERGE_HEAD", cwd=ctx.root, check=False)
-    if path and not os.path.isabs(path):
-        path = os.path.join(ctx.root, path)
+    path = git_path(ctx.root, "MERGE_HEAD")
     return bool(path) and os.path.exists(path)
 
 
@@ -1464,10 +1527,8 @@ def cmd_sync_continue(ctx: Ctx, args: argparse.Namespace) -> int:
 
     unmerged = unmerged_paths(ctx)
     if unmerged:
-        step("continue", "git diff --name-only --diff-filter=U",
-             f"{len(unmerged)} file(s) still unmerged")
-        for f in unmerged:
-            print(f"    {f}")
+        report_paths("continue", "git diff --name-only --diff-filter=U", unmerged,
+                     "file(s) still unmerged")
         raise Fail("resolve the conflicts and `git add` them, "
                    "then run `forkflow sync --continue` again")
 
@@ -1540,10 +1601,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     # leaves the trunk untouched. Everything after this reads `target`, not the mirror branch,
     # so a dry run previews the pending merge even though it moves nothing.
     mirror_move = advance_mirror(ctx, target)
-    if rev(ctx.root, f"refs/remotes/{ctx.origin}/{ctx.mirror}") == target:
-        step("mirror push", f"git push {ctx.origin} {ctx.mirror}", "up to date")
-    else:
-        push_mirror(ctx, target)
+    push_mirror(ctx, target)
 
     trunk_ref = f"refs/remotes/{ctx.origin}/{ctx.trunk}"
     rc, _, _ = git_rc("merge-base", "--is-ancestor", target, trunk_ref, cwd=ctx.root)
@@ -1578,9 +1636,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
 def rebase_in_progress(ctx: Ctx) -> bool:
     """True while `git rebase` is stopped on a conflict or an edit."""
     for name in ("rebase-merge", "rebase-apply"):
-        path = git("rev-parse", "--git-path", name, cwd=ctx.root, check=False)
-        if path and not os.path.isabs(path):
-            path = os.path.join(ctx.root, path)
+        path = git_path(ctx.root, name)
         if path and os.path.exists(path):
             return True
     return False
@@ -1630,20 +1686,18 @@ def rebase_onto(ctx: Ctx, branch: str, trunk_ref: str) -> None:
     if not rebase_in_progress(ctx):
         raise Fail(f"rebase of `{branch}` onto {trunk_ref} failed:\n{(err or out).strip()}")
     unmerged = unmerged_paths(ctx)
-    step("rebase", cmd, f"{len(unmerged)} conflicting file(s)")
-    for f in unmerged:
-        print(f"    {f}")
+    report_paths("rebase", cmd, unmerged, "conflicting file(s)")
     raise Fail(f"resolve the conflicts, `git add` them, run `git rebase --continue`, "
                f"then `forkflow ship --continue`", 4)
 
 
-def commit_records(ctx: Ctx, base: str, ref: str = "HEAD") -> list:
-    """(sha, subject, body) of `base..ref`, oldest first - what the squash message is built of.
+def commit_records(ctx: Ctx, base: str) -> list:
+    """(sha, subject, body) of `base..HEAD`, oldest first - what the squash message is built of.
 
     Read through git_rc: the separators are ASCII whitespace to Python, so `git()`'s strip()
     would eat the last record's field separator and lose that commit."""
     rc, out, _ = git_rc("log", "--reverse", "--format=%H%x1f%s%x1f%b%x1e",
-                        f"{base}..{ref}", cwd=ctx.root)
+                        f"{base}..HEAD", cwd=ctx.root)
     if rc != 0:
         return []
     records = []
@@ -1656,7 +1710,7 @@ def commit_records(ctx: Ctx, base: str, ref: str = "HEAD") -> list:
     return records
 
 
-def squash_message(ctx: Ctx, records: Sequence[Tuple[str, str, str]],
+def squash_message(records: Sequence[Tuple[str, str, str]],
                    message_file: Optional[str] = None) -> str:
     """--message-file verbatim; a single commit keeps its own message; otherwise the oldest
     subject with every squashed commit listed under it, oldest first."""
@@ -1744,7 +1798,7 @@ def finish_ship(ctx: Ctx, args: argparse.Namespace, branch: str,
     for sha, subject, _ in records:
         print(f"    {short(sha)} {subject}")
 
-    message = squash_message(ctx, records, getattr(args, "message_file", None))
+    message = squash_message(records, getattr(args, "message_file", None))
     rollback = f"  rollback: git reset --hard {ctx.origin}/{backup_ref}" if backup_ref else ""
     touched = upstream_tracked(ctx, branch_files(ctx))
     try:
@@ -1831,15 +1885,11 @@ def cmd_ship(args: argparse.Namespace) -> int:
         step("continue", cmd, "the rebase completed - resuming at the squash")
         return finish_ship(ctx, args, branch, state["backup"], state.get("lease", ""))
 
-    cmd = f"git fetch {ctx.origin}"
-    before = rev(ctx.root, trunk_ref)
-    rc, _, err = git_rc("fetch", ctx.origin, cwd=ctx.root)
+    rc, cmd, result, err = fetch(ctx, (ctx.origin,), [trunk_ref])
     if rc != 0:
         step("fetch", cmd, "FAILED")
         raise Fail(f"fetch failed: {err.strip()}")
-    now = rev(ctx.root, trunk_ref)
-    step("fetch", cmd, f"{trunk_ref} unchanged" if now == before
-         else f"{trunk_ref} {short(before)}..{short(now)}")
+    step("fetch", cmd, result)
 
     rc, _, _ = git_rc("merge-base", "--is-ancestor", "HEAD", trunk_ref, cwd=ctx.root)
     if rc == 0:
@@ -1999,12 +2049,11 @@ def setup_upstream_remote(ctx: Ctx, args: argparse.Namespace) -> Optional[str]:
 
 def setup_fetch(ctx: Ctx, upstream: str) -> None:
     """Both remotes, then their HEADs. A failure here has changed nothing yet."""
-    cmd = f"git fetch --multiple {ctx.origin} {upstream}"
-    rc, _, err = git_rc("fetch", "--multiple", ctx.origin, upstream, cwd=ctx.root)
+    rc, cmd, result, err = fetch(ctx, (ctx.origin, upstream))
     if rc != 0:
         step("fetch", cmd, "FAILED")
         raise Fail(f"fetch failed - nothing has been changed yet:\n{err.strip()}")
-    step("fetch", cmd, "remote-tracking refs refreshed")
+    step("fetch", cmd, result)
     for remote in (ctx.origin, upstream):
         sub = f"git remote set-head {remote} -a"
         if ctx.dry_run:                      # set-head writes config: not in a dry run
@@ -2151,7 +2200,11 @@ exit $status
 def sh_quote(value: str) -> str:
     """`value` as one single-quoted shell word. Always quoted, unlike `shlex.quote`, so the
     hook reads the same whatever the name is - and a value carrying `'` or `$` cannot end
-    the word early and turn the rest of it into code."""
+    the word early and turn the rest of it into code.
+
+    Used for the generated hook and for the platform report's fix commands, which are pasted
+    into a shell by hand; `open_mr` renders an argv list it also runs itself, and quotes that
+    with `shlex.quote` so what is shown is exactly the argv that ran."""
     return "'" + value.replace("'", "'\\''") + "'"
 
 
@@ -2247,16 +2300,6 @@ def setup_git_config(ctx: Ctx) -> None:
 # this plugin exists to prevent. So every call here is a GET: what is wrong is reported with the
 # command that fixes it, and a human runs it.
 # --------------------------------------------------------------------------- #
-
-# The four keys GitHub's protection PUT insists on, plus the two settings that matter here:
-# force-push off, and a pull request required - without the latter a protected branch still
-# takes a direct push from anyone with write access, which is rule 2.
-GITHUB_PROTECTION = ('{"required_status_checks":null,"enforce_admins":true,'
-                     '"required_pull_request_reviews":{"dismiss_stale_reviews":false,'
-                     '"require_code_owner_reviews":false,'
-                     '"required_approving_review_count":0},"restrictions":null,'
-                     '"allow_force_pushes":false}')
-
 
 @dataclass
 class Reply:
@@ -2428,7 +2471,7 @@ def gitlab_report(ctx: Ctx) -> None:
     gitlab_protection(ctx, "mirror", ctx.mirror)
 
 
-def _names(items: object, *keys: str) -> list:
+def names(items: object, *keys: str) -> list:
     """The logins/slugs of a `restrictions` list, as the PUT wants them."""
     out = []
     for item in items if isinstance(items, list) else []:
@@ -2442,16 +2485,16 @@ def _names(items: object, *keys: str) -> list:
     return out
 
 
-def _actors(current: object) -> Optional[dict]:
+def actors(current: object) -> Optional[dict]:
     """A `{users, teams, apps}` block of the GET, in the shape the PUT wants it back."""
     if not isinstance(current, dict):
         return None
-    return {"users": _names(current.get("users"), "login"),
-            "teams": _names(current.get("teams"), "slug", "name"),
-            "apps": _names(current.get("apps"), "slug", "name")}
+    return {"users": names(current.get("users"), "login"),
+            "teams": names(current.get("teams"), "slug", "name"),
+            "apps": names(current.get("apps"), "slug", "name")}
 
 
-def _flag(current: dict, key: str) -> bool:
+def flag(current: dict, key: str) -> bool:
     """One boolean of the protection object - most of them are wrapped as `{"enabled": ...}`."""
     value = current.get(key)
     return bool(value.get("enabled")) if isinstance(value, dict) else bool(value)
@@ -2476,37 +2519,40 @@ def github_protection_body(current: Optional[dict], require_pr: bool = False) ->
     if isinstance(reviews, dict):
         prr = {"dismiss_stale_reviews": bool(reviews.get("dismiss_stale_reviews")),
                "require_code_owner_reviews": bool(reviews.get("require_code_owner_reviews")),
-               "require_last_push_approval": _flag(reviews, "require_last_push_approval"),
+               "require_last_push_approval": flag(reviews, "require_last_push_approval"),
                "required_approving_review_count":
                    int(reviews.get("required_approving_review_count") or 0)}
-        dismissal = _actors(reviews.get("dismissal_restrictions"))
+        dismissal = actors(reviews.get("dismissal_restrictions"))
         if dismissal is not None:
             prr["dismissal_restrictions"] = dismissal
-        bypass = _actors(reviews.get("bypass_pull_request_allowances"))
+        bypass = actors(reviews.get("bypass_pull_request_allowances"))
         if bypass is not None:
             prr["bypass_pull_request_allowances"] = bypass
     elif require_pr:            # rule 2: a protected branch without this takes a direct push
         prr = {"dismiss_stale_reviews": False, "require_code_owner_reviews": False,
                "required_approving_review_count": 0}
     body = {"required_status_checks": status,
-            "enforce_admins": _flag(cur, "enforce_admins"),
+            "enforce_admins": flag(cur, "enforce_admins"),
             "required_pull_request_reviews": prr,
-            "restrictions": _actors(cur.get("restrictions")),
+            "restrictions": actors(cur.get("restrictions")),
             "allow_force_pushes": False,
-            "allow_deletions": _flag(cur, "allow_deletions"),
-            "block_creations": _flag(cur, "block_creations"),
-            "required_conversation_resolution": _flag(cur, "required_conversation_resolution"),
-            "required_linear_history": _flag(cur, "required_linear_history"),
-            "lock_branch": _flag(cur, "lock_branch"),
-            "allow_fork_syncing": _flag(cur, "allow_fork_syncing")}
+            "allow_deletions": flag(cur, "allow_deletions"),
+            "block_creations": flag(cur, "block_creations"),
+            "required_conversation_resolution": flag(cur, "required_conversation_resolution"),
+            "required_linear_history": flag(cur, "required_linear_history"),
+            "lock_branch": flag(cur, "lock_branch"),
+            "allow_fork_syncing": flag(cur, "allow_fork_syncing")}
     return json.dumps(body, separators=(",", ":"))
 
 
 def github_protection(ctx: Ctx, role: str, branch: str) -> None:
-    path = "repos/{owner}/{repo}/branches/%s/protection" % urllib.parse.quote(branch, safe="")
+    # concatenated, not an f-string: `{owner}`/`{repo}` are gh's own placeholders, which an
+    # f-string would read as fields of its own
+    path = ("repos/{owner}/{repo}/branches/"
+            + urllib.parse.quote(branch, safe="") + "/protection")
     reply = api_get(ctx, "gh", path)
     if reply.ok():
-        force = _flag(reply.data, "allow_force_pushes")
+        force = flag(reply.data, "allow_force_pushes")
         # a protected branch without a required pull request still takes a direct push
         direct = reply.data.get("required_pull_request_reviews") is None
     elif reply.status == 404:                       # GitHub: "Branch not protected"
@@ -2517,7 +2563,11 @@ def github_protection(ctx: Ctx, role: str, branch: str) -> None:
     if not protection_finding(role, branch, force, direct):
         return
     if force is None:
-        fix_cmd(f"echo '{GITHUB_PROTECTION}' | gh api -X PUT {path} --input -")
+        # nothing to carry over: a fresh protection object, admins included and a pull request
+        # required - without the latter a protected branch still takes a direct push from
+        # anyone with write access, which is rule 2
+        body = github_protection_body({"enforce_admins": True}, require_pr=True)
+        fix_cmd(f"echo {sh_quote(body)} | gh api -X PUT {path} --input -")
         return
     finding("the PUT below replaces the whole protection object: it carries over the "
             "settings the read above returned - check them before you run it")
@@ -2600,20 +2650,20 @@ def cmd_setup(args: argparse.Namespace) -> int:
     ctx = resolve_ctx(args.dir, args, need_upstream=False, need_trunk=False, strict_mirror=False)
     header(ctx, "setup")
 
-    named_upstream = getattr(args, "upstream", None)   # the flag, before `name` overwrites it
     name = setup_upstream_remote(ctx, args)
     if name is None:                                   # dry run: the remote is not there yet
         print("  the rest of `setup` needs the upstream remote - rerun without --dry-run")
         return 0
-    args.upstream = name
     setup_fetch(ctx, name)
-    # the upstream branch (and with it the default mirror name) is only known after the fetch
-    ctx = resolve_ctx(ctx.root, args, need_upstream=True, need_trunk=False, strict_mirror=False)
+    # the upstream branch (and with it the default mirror name) is only known after the fetch;
+    # `upstream=name` because a remote this run has just added is in neither flag nor config
+    ctx = resolve_ctx(ctx.root, args, need_upstream=True, need_trunk=False,
+                      strict_mirror=False, upstream=name)
     step("names", "-", f"upstream={ctx.up()}  mirror={ctx.mirror}  trunk={ctx.trunk}")
 
     pairs = [(key, getattr(ctx, key)) for key in ("trunk", "mirror")
              if getattr(args, key, None)]
-    if named_upstream:
+    if getattr(args, "upstream", None):
         # a repo with more than one non-origin remote cannot infer it: without this every
         # later subcommand would exit 2 asking for the flag again
         pairs.append(("upstream", ctx.upstream))
@@ -2635,6 +2685,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# main
+# --------------------------------------------------------------------------- #
+
 COMMANDS = {
     "status": cmd_status,
     "check": cmd_check,
@@ -2643,10 +2697,6 @@ COMMANDS = {
     "setup": cmd_setup,
 }
 
-
-# --------------------------------------------------------------------------- #
-# main
-# --------------------------------------------------------------------------- #
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     # SUPPRESS keeps a subparser from clobbering a flag given before the subcommand
@@ -2702,16 +2752,16 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv[:1] == ["--test"]:           # only as the first word: `ship --title --test` is a title
-        run_tests()                      # exits
     try:
+        if argv[:1] == ["--test"]:       # only as the first word: `ship --title --test` is a title
+            run_tests()                  # exits through SystemExit, which this does not catch
         args = parse_args(argv)
         return COMMANDS[args.cmd](args)
     except Fail as exc:
         print(f"forkflow: {exc}", file=sys.stderr)
         return exc.code
     except KeyboardInterrupt:
-        return 130
+        return EXIT_INTERRUPTED
 
 
 # --------------------------------------------------------------------------- #
@@ -2722,8 +2772,6 @@ def run_tests() -> None:
     """Run the embedded unit tests (`forkflow.py --test`) and exit."""
     import contextlib
     import io
-    import tempfile
-    import time
     import unittest
     from unittest import mock
 
@@ -3079,7 +3127,7 @@ def run_tests() -> None:
             self.assertEqual(ctx.upstream, "upstream")
             self.assertEqual(ctx.up(), "upstream/main")
             self.assertEqual(ctx.platform, "unknown")
-            self.assertFalse(ctx.mirror_diverged)
+            self.assertFalse(mirror_divergence(ctx)[0])
 
         @needs_tomllib
         def test_names_from_config(self):
@@ -3132,7 +3180,7 @@ def run_tests() -> None:
             self.assertEqual(cm.exception.code, 2)
             self.assertIn("Adopting forkflow", str(cm.exception))
             ctx = ctx_for(fork, strict_mirror=False)
-            self.assertTrue(ctx.mirror_diverged)
+            self.assertTrue(mirror_divergence(ctx)[0])
 
         def test_an_origin_mirror_ahead_of_an_unfetched_upstream_is_not_divergence(self):
             """A teammate's sync legitimately puts `origin/<mirror>` ahead of an `upstream/*`
@@ -3144,7 +3192,7 @@ def run_tests() -> None:
             sh("git", "fetch", "origin", cwd=fork)          # ... and we fetched only origin
             self.assertNotEqual(rev(fork, "refs/remotes/origin/main"),
                                 rev(fork, "refs/remotes/upstream/main"))
-            self.assertFalse(ctx_for(fork).mirror_diverged)
+            self.assertFalse(mirror_divergence(ctx_for(fork))[0])
 
             code, out, err = run("-C", fork, "status")
             self.assertEqual(code, 0, err)
@@ -3175,7 +3223,7 @@ def run_tests() -> None:
             themselves; refusing before that fetch fails them all in an ordinary team state."""
             fork = self.synced_by_a_teammate()
             ctx = ctx_for(fork)                       # strict: no longer a hard failure
-            self.assertTrue(ctx.mirror_ahead)
+            self.assertTrue(mirror_divergence(ctx)[1])
             self.assertTrue(mirror_from_origin(ctx))
             for argv in (("status",), ("check",)):
                 code, out, err = run("-C", fork, *argv)
@@ -3209,7 +3257,7 @@ def run_tests() -> None:
                 ctx_for(fork)
             self.assertEqual(cm.exception.code, 2)
             self.assertIn("not fetched", str(cm.exception))
-            self.assertFalse(ctx_for(fork, strict_mirror=False).mirror_diverged)
+            self.assertFalse(mirror_divergence(ctx_for(fork, strict_mirror=False))[0])
 
         def test_trunk_missing_on_origin(self):
             fork = make_fresh_fork(self.tmp)
@@ -3261,7 +3309,7 @@ def run_tests() -> None:
                 ctx_for(fork)
             self.assertEqual(cm.exception.code, 2)
             self.assertIn("exists neither locally nor on origin", str(cm.exception))
-            self.assertFalse(ctx_for(fork, strict_mirror=False).mirror_diverged)
+            self.assertFalse(mirror_divergence(ctx_for(fork, strict_mirror=False))[0])
 
         @needs_tomllib
         def test_the_prefix_and_upstream_keys_come_from_the_config(self):
@@ -4201,7 +4249,7 @@ def run_tests() -> None:
 
         @needs_tomllib
         def test_only_the_last_lines_of_a_failing_gate_are_shown(self):
-            self.assertEqual(GATE_TAIL, 12)          # pinned: what a failing gate is judged by
+            self.assertEqual(TAIL_LINES, 12)         # pinned: what a failing gate is judged by
             fork = make_fork(self.tmp, config='gate = ["seq 1 40; exit 2"]\n')
             self.feature(fork)
             code, out, err = run("-C", fork, "check")
@@ -6090,14 +6138,19 @@ def run_tests() -> None:
             out = self.report("github")
             self.assertIn("trunk `develop`: NOT protected", out)
             self.assertIn("mirror `main`: not protected (advisory", out)
+            body = github_protection_body({"enforce_admins": True}, require_pr=True)
             self.assertEqual(self.fixes(out), [
                 "echo '%s' | gh api -X PUT "
-                "repos/{owner}/{repo}/branches/develop/protection --input -"
-                % GITHUB_PROTECTION])
+                "repos/{owner}/{repo}/branches/develop/protection --input -" % body])
+            # the body the fix pastes, pinned against the output rather than against the
+            # function that built it: force-push off, admins included, and a required review
             self.assertIn('"allow_force_pushes":false', out)
+            self.assertIn('"enforce_admins":true', out)
             # a protected branch with no required review still takes a direct push (rule 2)
-            self.assertIn('"required_pull_request_reviews":{', GITHUB_PROTECTION)
-            self.assertNotIn('"required_pull_request_reviews":null', GITHUB_PROTECTION)
+            self.assertIn('"required_pull_request_reviews":'
+                          '{"dismiss_stale_reviews":false,"require_code_owner_reviews":false,'
+                          '"required_approving_review_count":0}', out)
+            self.assertNotIn('"required_pull_request_reviews":null', out)
 
         def test_a_protected_trunk_without_a_required_pr_is_a_finding(self):
             """"Protected" with force-push off still lets everyone with write access push
@@ -6565,7 +6618,4 @@ def run_tests() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        sys.exit(130)
+    sys.exit(main())
