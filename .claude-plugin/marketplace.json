@@ -8,6 +8,11 @@
       "name": "nocomment",
       "source": "./plugins/nocomment",
       "description": "Code-only review branches - nocomment/<branch> with documentation files left out and comment changes undone"
+    },
+    {
+      "name": "forkflow",
+      "source": "./plugins/forkflow",
+      "description": "Fork <-> upstream workflow - a pristine mirror of upstream, a protected MR-only trunk, and status/sync/ship/setup helpers that never push or rebase the trunk"
     }
   ]
 }

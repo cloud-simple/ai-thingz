@@ -6,6 +6,7 @@ in the `ai-thingz` plugin marketplace.
 | skill | what it does |
 |---|---|
 | [`nocomment`](#nocomment) | turns the current feature branch into a code-only, comment-free review branch `nocomment/<branch>` |
+| [`forkflow`](#forkflow) | works a fork of a moving project: a pristine mirror of upstream, a protected MR-only trunk, and `status` / `sync` / `ship` / `setup` |
 
 ## Install
 
@@ -14,6 +15,7 @@ From inside Claude Code:
 ```
 /plugin marketplace add cloud-simple/ai-thingz
 /plugin install nocomment@ai-thingz
+/plugin install forkflow@ai-thingz
 ```
 
 Or link a single skill as a plain user skill, no plugin machinery:
@@ -22,6 +24,9 @@ Or link a single skill as a plain user skill, no plugin machinery:
 ln -s "$PWD/plugins/nocomment/skills/nocomment" ~/.claude/skills/nocomment
 ```
 
+That symlink install does **not** apply to `forkflow`: its four skills reach their script and their
+rules through `${CLAUDE_PLUGIN_ROOT}`, which only exists when the plugin is installed as a plugin.
+
 Layout:
 
 ```
@@ -29,8 +34,13 @@ Layout:
 plugins/<plugin>/.claude-plugin/plugin.json    one directory per plugin, named after it
 plugins/<plugin>/skills/<skill>/SKILL.md       the plugin's skills
 plugins/<plugin>/skills/<skill>/scripts/       a skill's tooling
+plugins/<plugin>/scripts/                      tooling shared by all of a plugin's skills
+plugins/<plugin>/references/                   material the skills read
 tests/                                         python -m unittest discover -s tests
 ```
+
+`tests/` no longer covers every plugin: `forkflow.py` carries its own suite and runs it with
+`--test` (see [Tests](#tests-1)).
 
 ---
 
@@ -131,3 +141,206 @@ Covers each language scanner, the diff-aware merge (dropped / restored / reverte
 collapsing, CRLF and missing-final-newline preservation), classification and overrides, and the
 git flow end to end on throwaway repositories (dry run, creation, refusal on the default branch,
 `--force`, exit 3, `.nocomment.toml`).
+
+---
+
+## forkflow
+
+Develop in a fork (`origin`) of a project that keeps moving (`upstream`) without ever committing on
+the mirror of upstream or pushing the fork's trunk directly. Two remotes, two long-lived branches -
+the names are configurable, the layout is not:
+
+```
+upstream/main ────●───────●───────●          theirs; read-only (push URL disabled)
+                   \
+main (mirror) ──────●───────●───────●        pristine copy of upstream/main,
+                                     \       fast-forward only, pushed to origin
+develop (trunk) ──────────────────────●──●──●   upstream + our work; protected, MR-only
+```
+
+- **mirror** (named after upstream's own branch by default - `main` here, `master` on a
+  master-based upstream) is never committed on. `sync` fast-forwards it to the upstream
+  branch and pushes it, so teammates and CI can see "theirs vs ours" with `git diff main..develop`
+  without configuring the `upstream` remote themselves.
+- **trunk** (`develop` by default) carries every feature and every upstream sync and is reached only
+  through merge requests. Features arrive as one squashed commit, syncs as one merge commit - so
+  `git log --merges develop` is the record of when upstream was taken.
+
+The trunk is protected and published, which makes every history rewrite on it a force-push plus a
+protection change. So every push in the script goes through three helpers - `push()` refuses the
+trunk and the mirror, `push_mirror()` can only fast-forward the mirror to upstream,
+`bootstrap_trunk()` runs only when the trunk does not exist yet - and there is no rebase of the
+trunk anywhere. The mistake is impossible, not merely discouraged.
+
+### The six hard rules
+
+1. **Never push to `upstream`** - its push URL is set to `DISABLED` and the pre-push hook refuses
+   that remote by name *and* by URL, in any spelling: it normalises both sides before comparing,
+   so a trailing `/`, a `file://` prefix, a `user@`, a default port, an added or dropped `.git`
+   and a differently-cased host are all the same repository - and a local path is canonicalised
+   as well, so `../upstream.git`, a `/.` suffix, a symlink to it and `file://localhost/...` reach
+   the repository they name. The rule is about the repository, not
+   the remote name: an `origin` whose `pushurl` points at the original project is refused by every
+   subcommand.
+2. **Never push the trunk** - only merge requests move `origin/<trunk>`; `push()` and the hook both
+   refuse it, deletion included.
+3. **Never rebase the trunk** - upstream comes in by merge only.
+4. **Force-push only a feature branch**, only with `--force-with-lease`, and only after a backup
+   branch is confirmed on `origin`.
+5. **Sync MRs are merged as merges; ship MRs fast-forward.** GitLab: merge the sync MR (the sync
+   branch's tip *is* the merge commit), `merge_method=ff` for ship MRs. GitHub: "Create a merge
+   commit" for sync, "Rebase and merge" for ship - which rewrites the SHA, so delete the local
+   feature branch afterwards. Never squash or rebase a sync MR: that rewrites upstream's SHAs out of
+   the trunk's ancestry and every later sync re-conflicts on the same hunks.
+6. **Never commit on the mirror** - it is only ever fast-forwarded to the upstream branch and pushed,
+   never with force. The hook rejects a mirror push that is not an ancestor of the last-fetched
+   upstream ref, and rejects it when that ref is missing.
+
+Sequence rule: **sync first, then ship; rebase locally, merge globally.** The full text the skills
+read is [`plugins/forkflow/references/rules.md`](plugins/forkflow/references/rules.md).
+
+### The four skills
+
+| skill | say | what it does |
+|---|---|---|
+| `/forkflow:status` | *"where are we vs upstream"*, *"how much has this fork diverged"* | one screen: mirror, trunk, `origin/*` and upstream, divergence and how much of it is upstream-tracked, what the current branch touches, whether the fork is set up. Read-only |
+| `/forkflow:sync` | *"sync upstream"*, *"pull in upstream"* | advance and push the mirror, then bring it into the trunk through `sync/<upstream>-<date>` + one `--no-ff` merge + an MR. Conflicts are resolved in the branch; a "both sides survived" table flags every file changed on both sides, because a clean merge is not automatically a correct one |
+| `/forkflow:ship` | *"ship this branch"*, *"squash and open the MR"* | take a feature branch to the trunk as **one** squashed commit (tree-hash verified) on top of a fresh `origin/<trunk>`, through an MR |
+| `/forkflow:setup` | *"set up the fork"*, *"protect the trunk locally"* | make the rules mechanical: upstream push URL disabled, pre-push hook, ff-only merge config, trunk bootstrapped on a fresh fork, and a report of the platform's default branch / merge method / protection with the exact command to fix each mismatch |
+
+The script does the mechanical, testable work - divergence numbers, mirror advance, merge simulation,
+backups, merges, squash and tree-hash check, invariant checks, pushes, the MR command. Claude does
+the judgment: conflict resolution and MR wording. Nothing about it is specific to any one fork.
+
+Directly:
+
+```bash
+S=plugins/forkflow/scripts/forkflow.py
+python3 $S status [--fetch]
+python3 $S check
+python3 $S sync [--continue] [--mr] [--title T]
+python3 $S ship [--continue] [--mr] [--title T] [--message-file F]
+python3 $S setup [--upstream NAME] [--upstream-url URL] [--trunk NAME] [--mirror NAME]
+```
+
+`-C DIR`, `--dry-run` and `--force` are accepted on every subcommand and may be given before or
+after it; `--force` only does something in `sync` (recreate the sync branch) and `setup` (replace a
+foreign pre-push hook).
+`check` is the preflight `sync` and `ship` run themselves (upstream-tracked warning, configured gate
+commands, "is this branch on the trunk's tip"); it has no skill of its own - `status` surfaces it for
+humans. `--dry-run` creates no branch, commit, push, config or hook and moves no mirror, and still
+previews the merge that is pending. It is not read-only: it fetches (that is how it knows what is
+pending), so `refs/remotes/*` and `FETCH_HEAD` are refreshed and the merge simulation writes a tree
+object - nothing that changes a branch, a worktree or a setting.
+
+`status` on a fork whose feature branch touches a file upstream also owns:
+
+```
+forkflow status  origin=git@gitlab.example.com:team/fork.git  upstream=https://example.org/project.git  platform=gitlab
+  as of last fetch: 4m ago
+  mirror  main 7ced8d72   origin/main 7ced8d72 (=)   upstream/main 59c508e3 (mirror behind by 1)
+  trunk   develop 9d369dc7   origin/develop 9d369dc7 (=)   upstream/main (+1/-1 vs origin/develop)
+  divergence: 2 files, 1 upstream-tracked
+  branch   feat/retention  not on origin  tree: clean
+  touches upstream-tracked files (WARNING, 1):
+    shared.tf
+  backups  0 (refs/remotes/origin/backup/*)
+  setup    upstream push: DISABLED   pre-push hook: installed   ff-only: develop yes, main yes
+```
+
+Editing an upstream-tracked file is a permanent merge cost but sometimes necessary, so it is a
+warning and never a refusal.
+
+### Configuration
+
+`.forkflow.toml` at the repo root, all keys optional - `setup` drops in a commented template:
+
+```toml
+upstream = "upstream"        # remote name of the original project
+upstream_branch = "main"     # its branch we track (default: upstream's HEAD)
+mirror = "main"              # our fast-forward-only copy of it (default: upstream_branch)
+trunk = "develop"            # protected, MR-only branch carrying our work
+gate = []                    # e.g. ["make test", "terraform fmt -check -recursive"]
+sync_prefix = "sync/"
+backup_prefix = "backup/"
+```
+
+`gate` is the one key that is *run* rather than read - `sh -c` in the repo root, on every `check`,
+`sync` and `ship` - and `.forkflow.toml` is a tracked file a sync is designed to bring in from the
+original project. So a sync that changes it says so with a `CHECK` line pointing at
+`git diff <merge>^1 HEAD -- .forkflow.toml`, a run whose own merge changed the `gate` prints the
+commands that arrived instead of obeying them (`gate - NOT RUN`), and a `check` whose gate comes
+from a file upstream also tracks says that out loud. Read the diff before merging such a sync MR.
+A `gate` the merge left alone still runs: the guard is keyed on the commands, not on the file.
+
+`setup` leaves `.forkflow.toml` untracked, so a sync that brings upstream's copy of it in would
+have to write over it - which git refuses. `sync` says so and names the file before it pushes
+anything, so there is nothing to clean up: remove it, or get it into `origin/<trunk>` first.
+
+The script itself needs only Python 3.9+ and git 2.20+ (the merge simulation wants 2.38+ and is
+skipped with a note on older git). **Reading `.forkflow.toml` needs Python 3.11+** (`tomllib`): a
+config file that is present and configures something is exit 2 for every subcommand on an older
+Python, because it carries the safety-critical branch names and must never be silently defaulted.
+Without a config file, 3.9+ is enough - so on an older Python `setup` writes no template (it says
+so) and a file of nothing but comments is read as no config at all.
+
+### Exit codes
+
+| code | meaning |
+|---|---|
+| `0` | done, dry run, or nothing to do (already in sync; nothing to ship). Also `--mr` when the tool is missing or fails - the branch is pushed and the command is printed |
+| `1` | `--test` had failures |
+| `2` | precondition: dirty tree, detached HEAD, missing remote, unfetched upstream, unreadable `.forkflow.toml`, mirror diverged from upstream, trunk missing on origin, foreign pre-push hook, ... |
+| `3` | invariant checked by `check`: a gate command failed, or the branch is not on the trunk's tip |
+| `4` | conflicts - resolve them, then rerun with `--continue` |
+| `5` | rewrite safety: backup not confirmed on origin, tree hash differs after the squash, push rejected |
+| `130` | interrupted |
+
+### After the MR is merged
+
+The plugin never moves the local trunk. Once the MR has merged, catch up by hand - `setup`'s
+`--ff-only` config guarantees this cannot silently become a merge commit:
+
+```bash
+git fetch origin && git switch develop && git merge --ff-only origin/develop
+```
+
+After a GitHub "Rebase and merge" of a ship MR, also delete the local feature branch: its commit SHA
+was rewritten.
+
+### Adopting forkflow in an existing fork
+
+`setup` bootstraps, it never migrates. A fork whose `main` already carries its own work is refused
+with a pointer here, because fixing it rewrites a published branch - done once, by hand, by a
+Maintainer:
+
+1. Take `backup/<YYYYMMDD-HHMMSS>-pre-adoption` of the old `main` and push it.
+2. Create `develop` from `main` and push it.
+3. Make `develop` the platform default branch and protect it - `setup`'s platform report prints the
+   exact `glab api` / `gh api` command for each mismatch it finds.
+4. Make `main` a pure copy of `upstream/main`: either force-push it with protection temporarily
+   allowing force-pushes, or unprotect, delete and recreate `main` from `upstream/main` and
+   re-protect it.
+5. Run `/forkflow:setup` and commit `.forkflow.toml`.
+
+On GitLab there is a variant with no rewrite of your own: once `main` has been reset, configure
+project **pull mirroring** of the upstream repository into `main` and let the platform keep it
+current.
+
+A project applying this recipe should keep its own step-by-step document, with its real branch names
+and SHAs, with that project - not in this plugin.
+
+### Tests
+
+```bash
+python3 plugins/forkflow/scripts/forkflow.py --test
+```
+
+The suite lives inside `forkflow.py` and needs no network and no `glab`/`gh`: it builds throwaway
+`upstream.git` / `origin.git` / work-clone triples, exercises every subcommand end to end, produces
+push rejections with a real `pre-receive` hook and stale leases with a narrowed refspec, drives the
+installed pre-push hook with real `git push` invocations, and fakes the platform CLIs on `PATH`. A
+source-invariant test parses the script with `ast`, maps every line to the function it sits in, and
+asserts that the git argument `push` appears only in the three push helpers, `update-ref` and
+`merge --ff-only` only in `advance_mirror`, `rebase` only in `rebase_onto`, `--force-with-lease` only
+in `push()`, and that no git call anywhere passes `--force` or `--no-verify`.
