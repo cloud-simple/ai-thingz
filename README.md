@@ -175,7 +175,8 @@ trunk anywhere. The mistake is impossible, not merely discouraged.
 ### The six hard rules
 
 1. **Never push to `upstream`** - its push URL is set to `DISABLED` and the pre-push hook refuses
-   that remote by name *and* by URL.
+   that remote by name *and* by URL. The rule is about the repository, not the remote name: an
+   `origin` whose `pushurl` points at the original project is refused by every subcommand.
 2. **Never push the trunk** - only merge requests move `origin/<trunk>`; `push()` and the hook both
    refuse it, deletion included.
 3. **Never rebase the trunk** - upstream comes in by merge only.

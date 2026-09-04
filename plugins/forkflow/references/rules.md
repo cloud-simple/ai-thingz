@@ -28,7 +28,9 @@ develop (trunk) ─────────────────────�
 ## The six hard rules
 
 1. **Never push to `upstream`.** Its push URL is set to `DISABLED` and the pre-push hook refuses
-   the remote by name *and* by URL.
+   the remote by name *and* by URL. The rule is about the repository, not the remote name: an
+   `origin` whose `pushurl` points at the original project is refused by every subcommand
+   (`git config --unset-all remote.origin.pushurl`).
 2. **Never push the trunk.** Only merge requests move `origin/<trunk>`. `push()` refuses it and
    the hook refuses it, deletion included.
 3. **Never rebase the trunk.** Upstream comes in by merge only.
