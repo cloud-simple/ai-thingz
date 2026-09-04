@@ -31,7 +31,8 @@ develop (trunk) ─────────────────────�
    the remote by name *and* by URL - in any spelling, because it normalises both sides before
    comparing (trailing `/`, `file://`, `user@`, a default port, `.git`, host case; a local path
    is canonicalised too, so `..`, a `/.` suffix, a symlink and `file://localhost/...` all fold
-   onto the repository they reach). The rule is
+   onto one repository - but a path keeps its case where a host does not, so a differently-cased
+   spelling of a local path is not recognised as the same repository). The rule is
    about the repository, not the remote name: an `origin` whose `pushurl` points at the original
    project is refused by every subcommand (`git config --unset-all remote.origin.pushurl`), the
    same normalisation deciding what "the original project" is.

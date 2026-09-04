@@ -178,8 +178,11 @@ trunk anywhere. The mistake is impossible, not merely discouraged.
    that remote by name *and* by URL, in any spelling: it normalises both sides before comparing,
    so a trailing `/`, a `file://` prefix, a `user@`, a default port, an added or dropped `.git`
    and a differently-cased host are all the same repository - and a local path is canonicalised
-   as well, so `../upstream.git`, a `/.` suffix, a symlink to it and `file://localhost/...` reach
-   the repository they name. The rule is about the repository, not
+   as well, so `../upstream.git`, a `/.` suffix, a symlink to it and `file://localhost/...`
+   (`localhost` in any case) all fold onto one repository. A path itself keeps its case, which a
+   host does not: on a case-insensitive filesystem `/srv/UPSTREAM.git` reaches the same
+   repository as `/srv/upstream.git` and is **not** recognised as it, so use one spelling of a
+   local upstream. The rule is about the repository, not
    the remote name: an `origin` whose `pushurl` points at the original project is refused by every
    subcommand.
 2. **Never push the trunk** - only merge requests move `origin/<trunk>`; `push()` and the hook both
