@@ -77,6 +77,10 @@ MAX_SYNC_RERUNS = 100                # `--force` reruns: `<name>-2` .. `<name>-9
 EXIT_INTERRUPTED = 130               # Ctrl-C, as the module docstring publishes it
 PUBLISHED_KEEP = 100                 # remembered (branch, commit) pushes - see record_published
 
+# The port each scheme reaches without being told: `ssh://host:22/o/r` and `host:o/r` are one
+# repository, and rule 1 is about the repository. Kept in step with `ff_repo_id` in the hook.
+DEFAULT_PORTS = {"ssh": "22", "git+ssh": "22", "git": "9418", "http": "80", "https": "443"}
+
 # The names git resolves *before* `refs/heads/<name>`: `git rev-parse HEAD` is the pseudo-ref in
 # $GIT_DIR, never the branch, and `origin/HEAD` is the remote's default branch. A trunk or mirror
 # called one of these makes every unqualified name in this script mean something else.
@@ -363,19 +367,30 @@ def push_urls(root: str, remote: str) -> list:
 def repo_id(url: str) -> str:
     """`host/path` of a git URL, so two spellings of one repository compare equal.
 
-    `https://git@host/o/r.git`, `ssh://host/o/r` and `git@host:o/r.git` are the same project;
-    a local path is left as it is, case included, because a path is not case-folded the way a
-    host name is."""
+    `https://git@host/o/r.git`, `ssh://host:22/o/r` and `git@host:o/r.git` are the same
+    project. A URL with a host is folded whole: GitHub and GitLab both resolve `Owner/Repo`
+    case-insensitively, so a spelling that differs only in case is a live alias onto the same
+    repository. A local path - `/srv/repo.git`, or the `file:///srv/repo.git` spelling of it -
+    keeps its case, because a path is not case-folded the way a host name is.
+
+    The generated hook's `ff_repo_id` applies the same rules, so what this script refuses and
+    what the hook refuses are the same set of URLs."""
     u = (url or "").strip().rstrip("/")
-    host = False
+    scheme, host = "", False
     if "://" in u:
-        u, host = u.split("://", 1)[1], True
+        scheme, _, u = u.partition("://")
+        scheme, host = scheme.lower(), True
     elif ":" in u and "/" not in u.split(":", 1)[0]:      # scp-like [user@]host:path
         head, _, path = u.partition(":")
-        u, host = head + "/" + path.lstrip("/"), True
+        u, scheme, host = head + "/" + path.lstrip("/"), "ssh", True
     if host:
-        first, _, rest = u.partition("/")
-        u = first.split("@")[-1].lower() + ("/" + rest if rest else "")
+        first, sep, rest = u.partition("/")
+        authority = first.split("@")[-1]                  # a `user@` names no repository
+        name, _, port = authority.rpartition(":")
+        if name and port.isdigit() and port == DEFAULT_PORTS.get(scheme, ""):
+            authority = name                              # `host:443` under https is `host`
+        if authority:                                     # empty for `file:///path`: a path
+            u = (authority + sep + rest).lower()
     return u[:-4] if u.endswith(".git") else u
 
 
@@ -492,7 +507,11 @@ def resolve_ctx(cwd: str, args: Optional[argparse.Namespace] = None, need_upstre
     local_mirror = has_ref(root, f"refs/heads/{ctx.mirror}")
     remote_mirror = has_ref(root, f"refs/remotes/{ctx.origin}/{ctx.mirror}")
     if strict_mirror and not (local_mirror or remote_mirror):
-        raise Fail(f"mirror `{mirror}` exists neither locally nor on origin - run `forkflow setup`")
+        # "not in this clone" is all a remote-tracking ref can say: a narrowed fetch refspec
+        # hides an `origin/<mirror>` that is really there, and `setup` is what asks origin
+        raise Fail(f"mirror `{mirror}` is in this clone neither as a branch nor as "
+                   f"`{ctx.origin}/{mirror}` (a narrowed fetch refspec can hide one that is "
+                   f"on origin) - run `forkflow setup`")
     if local_mirror:
         if not has_ref(root, f"refs/remotes/{upstream}/{ub}"):
             if strict_mirror:
@@ -1282,16 +1301,45 @@ def gate_commands(ctx: Ctx) -> list:
     return [c for c in (ctx.cfg.get("gate") or []) if c.strip()]
 
 
-def run_check(ctx: Ctx, touched: Optional[Sequence[str]] = None) -> int:
+def config_arrived_in_merge(ctx: Ctx) -> bool:
+    """True when the merge commit at HEAD is what brought `.forkflow.toml` in.
+
+    A `gate` is arbitrary shell run with `sh -c`, and `.forkflow.toml` is a tracked file a
+    sync is designed to bring in from the original project - so the one run that must not
+    obey it is the one whose own merge just wrote it."""
+    rc, _, _ = git_rc("rev-parse", "--verify", "--quiet", "HEAD^2", cwd=ctx.root)
+    if rc != 0:
+        return False                      # not a merge commit: nothing arrived through one
+    changed = git("diff", "--name-only", "HEAD^1", "HEAD", "--", CONFIG_FILE,
+                  cwd=ctx.root, check=False)
+    return bool(changed.strip())
+
+
+def run_check(ctx: Ctx, touched: Optional[Sequence[str]] = None,
+              config_merged: bool = False) -> int:
     """The preflight `sync` and `ship` run, and what `status` surfaces for humans.
 
     Read-only. 0 when every invariant holds, 3 when one does not; the upstream-tracked
-    warning is advisory and never changes the code."""
+    warning is advisory and never changes the code. `config_merged` says the `.forkflow.toml`
+    this ran with arrived in the merge this run just made - its `gate` is then upstream's
+    shell command, not this fork's, and it is shown rather than run."""
     failures = []
     warn_upstream_tracked(ctx, touched)
 
     gate = gate_commands(ctx)
-    if not gate:
+    if gate and upstream_tracked(ctx, [CONFIG_FILE]):
+        # not a failure: a fork whose upstream uses forkflow too inherits the file honestly.
+        # It is said out loud because `gate` is the one key that is run rather than read
+        step("gate", "-", f"WARNING: `{CONFIG_FILE}` is tracked by `{ctx.up()}` too - a sync "
+                          f"can change what these commands are")
+    if gate and config_merged:
+        step("gate", "-", f"NOT RUN: the merge this run made brought `{CONFIG_FILE}` with it")
+        for cmd in gate:
+            print(f"      would have run: sh -c '{cmd}'")
+        print(f"      a `gate` is arbitrary shell run by every `check`, `sync` and `ship`: "
+              f"read it, and once it is what you want: forkflow check")
+        gate = []
+    elif not gate:
         step("gate", "-", f"none configured ({CONFIG_FILE} gate = [...])")
     for cmd in gate:
         shown = f"sh -c '{cmd}'"
@@ -1622,9 +1670,18 @@ def finish_sync(ctx: Ctx, args: argparse.Namespace, name: str, commits: Sequence
                 rows: Sequence[Tuple[str, str]], mirror_move: Tuple[str, str],
                 backup_ref: str) -> int:
     """check -> push -> merge request: the tail both `sync` and `sync --continue` run."""
+    # `.forkflow.toml` names the branches every safety check depends on and holds `gate`,
+    # which is run with `sh -c`: a sync that brings it in from the original project is a
+    # change to how this fork is governed, and the reviewer of the MR has to see that
+    config_merged = not ctx.dry_run and config_arrived_in_merge(ctx)
+    if config_merged:
+        print(f"  CHECK    this sync changes `{CONFIG_FILE}` - it names the branches and "
+              f"holds `gate`, which forkflow runs with `sh -c`:")
+        print(f"    git diff HEAD^1 HEAD -- {sh_arg(CONFIG_FILE)}")
+
     if ctx.dry_run:
         step("check", "forkflow check", "not run (dry run)", dry=True)
-    elif run_check(ctx) == 3:
+    elif run_check(ctx, config_merged=config_merged) == 3:
         print(check_failure_hint(ctx, name))
         return 3
 
@@ -1774,12 +1831,34 @@ def rebase_in_progress(ctx: Ctx) -> bool:
     return False
 
 
+def rebasing_branch(ctx: Ctx) -> str:
+    """The branch a stopped rebase is rewriting, or "" - HEAD is detached while it runs."""
+    for name in ("rebase-merge", "rebase-apply"):
+        path = git_path(ctx.root, os.path.join(name, "head-name"))
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            with open(path) as fh:
+                head = fh.read().strip()
+        except OSError:
+            return ""
+        prefix = "refs/heads/"
+        return head[len(prefix):] if head.startswith(prefix) else ""
+    return ""
+
+
 def ship_preflight(ctx: Ctx) -> str:
     """The branch `ship` may rewrite, or Fail(2). Everything else is refused by name:
     ship rebases and squashes what it is on, and only a feature branch may be rewritten."""
     if rebase_in_progress(ctx):
-        raise Fail("a rebase is in progress: finish it with `git rebase --continue` and then "
-                   "`forkflow ship --continue`, or start over with `git rebase --abort`")
+        # `--continue` only resumes a ship *this clone* started: naming it after a rebase
+        # that is not one (a `git pull --rebase` this run's own advice asked for, say) sends
+        # the user to a command that refuses them
+        being = rebasing_branch(ctx)
+        resume = ("forkflow ship --continue" if being and resumable(ctx, "ship", being)
+                  else "forkflow ship")
+        raise Fail(f"a rebase is in progress: finish it with `git rebase --continue` and then "
+                   f"`{resume}`, or start over with `git rebase --abort`")
     branch = current_branch(ctx)
     if not branch:
         raise Fail("HEAD is detached: switch to the feature branch you want to ship")
@@ -2266,6 +2345,54 @@ def setup_fetch(ctx: Ctx, upstream: str) -> None:
         step("set-head", sub, f"{remote}/HEAD set" if rc == 0 else f"not set ({tail})")
 
 
+def origin_mirror_tip(ctx: Ctx, m: str) -> str:
+    """What `origin/<mirror>` really is, asked of origin rather than of this clone.
+
+    Remote-tracking refs are not authoritative: a narrowed fetch refspec (`clone
+    --single-branch`) hides `origin/<mirror>` here even though the fork has one, and it may
+    be a mirror that carries the fork's own work - the migration `setup` must refuse."""
+    confirm = f"git ls-remote --heads {sh_arg(ctx.origin)} {sh_arg(m)}"
+    rc, out, err = git_rc("ls-remote", "--heads", ctx.origin, f"refs/heads/{m}", cwd=ctx.root)
+    if rc != 0:
+        # a failed question is not a "no": creating a mirror on that silence makes a branch
+        # the next `sync` cannot push, and hides a published mirror that carries work
+        step("mirror", confirm, "FAILED")
+        tail = (tail_lines(err or out, 1) or ["see git output"])[0]
+        raise Fail(f"cannot ask {ctx.origin} whether `{m}` is there ({tail}): refusing to "
+                   f"create the mirror on a guess - fix the connection and rerun "
+                   f"`forkflow setup`")
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 2 and parts[1].strip() == f"refs/heads/{m}":
+            return parts[0].strip()
+    return ""
+
+
+def check_published_mirror(ctx: Ctx, m: str, published: str, target: str) -> None:
+    """Refuse a published mirror this clone cannot prove is a pure copy of upstream."""
+    confirm = f"git ls-remote --heads {sh_arg(ctx.origin)} {sh_arg(m)}"
+    widen = (f"git config --add {sh_arg(f'remote.{ctx.origin}.fetch')} "
+             f"{sh_arg(f'+refs/heads/{m}:refs/remotes/{ctx.origin}/{m}')} && "
+             f"git fetch {sh_arg(ctx.origin)}")
+    rc, _, _ = git_rc("merge-base", "--is-ancestor", published, target, cwd=ctx.root)
+    if rc == 1:
+        step("mirror", confirm, f"on {ctx.origin} at {short(published)}: REFUSED")
+        raise Fail(f"`{ctx.origin}/{m}` is at {short(published)}, which is not in "
+                   f"`{ctx.up()}`: it carries commits that are not upstream's, so it cannot "
+                   f"be the mirror, and forkflow never resets a published branch. "
+                   f"{README_POINTER}")
+    if rc != 0:
+        step("mirror", confirm, f"on {ctx.origin} at {short(published)}: not in this clone")
+        raise Fail(f"`{ctx.origin}/{m}` is at {short(published)}, a commit this clone does "
+                   f"not have, so it cannot be checked against `{ctx.up()}` - and a mirror "
+                   f"that carries the fork's own work is a migration, not a `setup`. Widen "
+                   f"the refspec and fetch ({widen}), then rerun `forkflow setup`. "
+                   f"{README_POINTER}")
+    step("mirror", confirm, f"already on {ctx.origin} at {short(published)} and in "
+                            f"`{ctx.up()}`, but this clone does not fetch it")
+    print(f"    widen the refspec and fetch: {widen}")
+
+
 def setup_mirror(ctx: Ctx, target: str) -> None:
     """Check the mirror, or create it in a single-branch clone. It is never reset:
     a `<mirror>` that carries work is a migration, and that is done by hand."""
@@ -2273,6 +2400,9 @@ def setup_mirror(ctx: Ctx, target: str) -> None:
     local = has_ref(ctx.root, f"refs/heads/{m}")
     remote = has_ref(ctx.root, f"refs/remotes/{ctx.origin}/{m}")
     if not (local or remote):
+        published = origin_mirror_tip(ctx, m)
+        if published:
+            check_published_mirror(ctx, m, published, target)
         cmd = f"git branch --no-track {sh_arg(m)} {short(target)}"
         if ctx.dry_run:
             step("mirror", cmd, f"would create the mirror at {short(target)}", dry=True)
@@ -2356,14 +2486,67 @@ def setup_push_url(ctx: Ctx) -> None:
     step("push url", cmd, f"pushes to `{ctx.upstream}` now fail")
 
 
+# `repo_id()` as POSIX sh, for the hook. Rule 1 is about a repository, and a repository has many
+# spellings: `<url>/`, `file://<url>`, `<url>.git`, `user@host:...`, an explicit default port and
+# a capitalised host all reach the same place. Comparing the raw strings refuses one spelling and
+# waves the rest through, so both sides are normalised here - the same way `repo_id()` does, and
+# kept in step with it by `test_the_hooks_url_normaliser_matches_repo_id`.
+# It is spliced into HOOK_TEMPLATE rather than written inside it: this string is never
+# %-formatted, so sh's `${x%y}` expansions read as themselves.
+HOOK_REPO_ID = """ff_repo_id() {
+    r=$1
+    while :; do
+        case "$r" in
+        */) r=${r%/} ;;
+        *) break ;;
+        esac
+    done
+    s=
+    case "$r" in
+    *://*)
+        s=${r%%://*}
+        r=${r#*://}
+        ;;
+    *:*)
+        case "${r%%:*}" in
+        */*) ;;                                 # a path with a colon in it, not host:path
+        *)
+            s=ssh                               # scp-like [user@]host:path
+            p=${r#*:}
+            while :; do
+                case "$p" in
+                /*) p=${p#/} ;;
+                *) break ;;
+                esac
+            done
+            r="${r%%:*}/$p"
+            ;;
+        esac
+        ;;
+    esac
+    if [ -n "$s" ]; then
+        a=${r%%/*}                              # [user@]host[:port]
+        rest=${r#"$a"}
+        a=${a##*@}
+        case "$s:${a##*:}" in
+        ssh:22|git+ssh:22|git:9418|http:80|https:443) a=${a%:*} ;;
+        esac
+        [ -n "$a" ] && r=$(printf '%s%s' "$a" "$rest" | tr 'A-Z' 'a-z')
+    fi
+    case "$r" in
+    *.git) r=${r%.git} ;;
+    esac
+    printf '%s' "$r"
+}"""
+
 # The hook is the second half of the guarantee: the script routes every push through the three
 # helpers, and this refuses the forbidden pushes even when git is driven by hand. Every name and
-# the upstream URL are baked in at install time, so the hook needs no config of its own.
+# every upstream URL are baked in at install time, so the hook needs no config of its own.
 HOOK_TEMPLATE = """#!/bin/sh
 %(mark)s - written by `forkflow setup`; `forkflow setup --force` replaces it.
 #
 # Refuses the pushes the workflow forbids, however git is driven:
-#   - anything to the original project (remote `%(upstream)s` or its URL)
+#   - anything to the original project (remote `%(upstream)s`, or any spelling of its URL)
 #   - anything to the trunk `%(trunk)s`, deletion included: merge requests only
 #   - any push of the mirror `%(mirror)s` that is not a pure copy of upstream
 #
@@ -2371,15 +2554,23 @@ HOOK_TEMPLATE = """#!/bin/sh
 # fetch before pushing the mirror.
 
 up_remote=%(upstream_q)s
-up_url=%(upstream_url_q)s
 up_ref=%(up_ref_q)s
+origin_remote=%(origin_q)s
 trunk_ref=%(trunk_ref_q)s
 mirror_ref=%(mirror_ref_q)s
 zero='0000000000000000000000000000000000000000'
 
+%(repo_id_fn)s
+
 to_upstream=no
 [ "$1" = "$up_remote" ] && to_upstream=yes
-[ -n "$up_url" ] && [ "$2" = "$up_url" ] && to_upstream=yes
+if [ "$to_upstream" = no ] && [ -n "$2" ]; then
+    dest=$(ff_repo_id "$2")
+    for u in %(up_urls_q)s; do
+        [ -n "$u" ] || continue
+        [ "$dest" = "$(ff_repo_id "$u")" ] && to_upstream=yes
+    done
+fi
 if [ "$to_upstream" = yes ]; then
     echo "forkflow: never push to upstream (rule 1) - it is the original project" >&2
     exit 1
@@ -2401,8 +2592,13 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         fi
         if [ "$remote_sha" != "$zero" ]; then
             git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null
-            if [ $? -eq 1 ]; then
+            rc=$?
+            if [ "$rc" -eq 1 ]; then
                 echo "forkflow: the mirror only moves forward (rule 6) - $remote_sha is not in $local_sha" >&2
+                status=1
+                continue
+            elif [ "$rc" -ne 0 ]; then
+                echo "forkflow: cannot verify that the mirror only moves forward (rule 6) - $remote_sha is not in this clone; run: git fetch $origin_remote" >&2
                 status=1
                 continue
             fi
@@ -2445,19 +2641,44 @@ def sh_quote(value: str) -> str:
     return "'" + value.replace("'", "'\\''") + "'"
 
 
+def upstream_urls(ctx: Ctx) -> list:
+    """Every URL that reaches the original project, for the hook to refuse.
+
+    `remote.<name>.url` and `remote.<name>.pushurl` are both multi-valued, and `setup` has
+    already replaced the push URL with `DISABLED` by the time the hook is written - so the
+    fetch URLs are what is left, and every one of them is a way to reach upstream (rule 1)."""
+    urls = [ctx.upstream_url]
+    urls += git("remote", "get-url", "--all", ctx.upstream, cwd=ctx.root,
+                check=False).splitlines()
+    urls += push_urls(ctx.root, ctx.upstream)
+    seen, out = set(), []
+    for url in urls:
+        url = (url or "").strip()
+        if not url or url == "DISABLED" or url in seen:
+            continue
+        seen.add(url)
+        out.append(url)
+    return out
+
+
 def hook_text(ctx: Ctx) -> str:
-    """The pre-push hook for this fork - names and upstream URL substituted in.
+    """The pre-push hook for this fork - names and upstream URLs substituted in.
 
     Every value the shell reads is quoted: the names come from `.forkflow.toml`, a tracked
     file a sync can bring in from upstream, and this text is run by `sh` on every push."""
     up_ref = f"refs/remotes/{ctx.upstream}/{ctx.upstream_branch}"
+    urls = [sh_quote(u) for u in upstream_urls(ctx)]
     return HOOK_TEMPLATE % {
         "mark": HOOK_MARK,
         "upstream": ctx.upstream,
         "upstream_q": sh_quote(ctx.upstream),
-        "upstream_url_q": sh_quote(ctx.upstream_url),
+        # one empty word rather than nothing: `for u in ; do` is a syntax error, and a hook
+        # that will not parse refuses nothing at all
+        "up_urls_q": " ".join(urls) or "''",
+        "repo_id_fn": HOOK_REPO_ID,
         "up_ref": up_ref,
         "up_ref_q": sh_quote(up_ref),
+        "origin_q": sh_quote(ctx.origin),
         "trunk": ctx.trunk,
         "trunk_ref_q": sh_quote(f"refs/heads/{ctx.trunk}"),
         "mirror": ctx.mirror,
@@ -2504,7 +2725,8 @@ def setup_hook(ctx: Ctx, force: bool) -> None:
     done = {"missing": "installed", "installed": "rewritten with the current names",
             "foreign": "installed; the previous hook is kept as `pre-push.pre-forkflow`"}
     step("hook", cmd, done[state])
-    print(f"    it refuses every push to `{ctx.upstream}` (by name or URL) and to `{ctx.trunk}`, "
+    print(f"    it refuses every push to `{ctx.upstream}` (by name, and by any spelling of its "
+          f"URL) and to `{ctx.trunk}`, "
           f"and any `{ctx.mirror}` push that is not a copy of `{ctx.up()}` as last fetched - "
           f"so `git fetch {sh_arg(ctx.upstream)}` before pushing the mirror")
 
@@ -3585,7 +3807,9 @@ def run_tests() -> None:
             with self.assertRaises(Fail) as cm:
                 ctx_for(fork)
             self.assertEqual(cm.exception.code, 2)
-            self.assertIn("exists neither locally nor on origin", str(cm.exception))
+            self.assertIn("is in this clone neither as a branch nor as", str(cm.exception))
+            # not "it is not on origin": this clone cannot know that (a narrowed refspec)
+            self.assertIn("narrowed fetch refspec", str(cm.exception))
             self.assertFalse(mirror_divergence(ctx_for(fork, strict_mirror=False))[0])
 
         @needs_tomllib
@@ -3677,6 +3901,32 @@ def run_tests() -> None:
             self.assertNotEqual(repo_id("https://github.com/o/r"),
                                 repo_id("https://github.com/o/fork"))
             self.assertEqual(repo_id("/tmp/Case/origin.git"), "/tmp/Case/origin")
+
+        def test_repo_id_folds_the_case_and_the_default_port_of_a_hosted_url(self):
+            """A forge resolves `Owner/Repo` case-insensitively and `:443` is `https`: both
+            are live aliases onto the same repository, and rule 1 is about the repository."""
+            cased = ["https://GitHub.com/Owner/Repo.git", "https://github.com/owner/repo",
+                     "ssh://git@github.com:22/Owner/repo", "git@GITHUB.com:owner/Repo.git",
+                     "https://github.com:443/owner/repo/"]
+            self.assertEqual({repo_id(u) for u in cased}, {"github.com/owner/repo"})
+            # a port that is not the scheme's default names another service, not an alias
+            self.assertNotEqual(repo_id("https://github.com:8080/o/r"),
+                                repo_id("https://github.com/o/r"))
+            # a path is not case-folded the way a host is - `file://` spells one too
+            self.assertEqual(repo_id("file:///tmp/Case/upstream.git"), "/tmp/Case/upstream")
+            self.assertEqual(repo_id("/tmp/Case/upstream.git/"), "/tmp/Case/upstream")
+
+        def test_an_origin_push_url_that_differs_only_in_case_is_refused(self):
+            """The false negative this closes: a `pushurl` spelled with another case is an
+            alias onto the original project, and `push()` would write to it."""
+            fork = make_fork(self.tmp)
+            sh("git", "remote", "set-url", "upstream", "https://github.com/o/r.git", cwd=fork)
+            sh("git", "config", "remote.origin.pushurl",
+               "https://GitHub.com/O/R", cwd=fork)
+            with self.assertRaises(Fail) as cm:
+                ctx_for(fork)
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("pushes to", str(cm.exception))
 
     class TestShQuote(unittest.TestCase):
         """`sh_quote` is what keeps a branch name out of the shell's syntax: the names come
@@ -5140,6 +5390,32 @@ def run_tests() -> None:
             self.assertEqual(rev(fork, "refs/heads/main"), rev(fork, "upstream/main"))
             self.assertEqual(origin_sha(fork, "main"), rev(fork, "upstream/main"))
 
+        @needs_tomllib
+        def test_a_gate_that_arrived_in_the_merge_is_shown_and_not_run(self):
+            """`gate` is the one config key that is *run* (`sh -c`), and `.forkflow.toml` is a
+            tracked file a sync is designed to bring in from the original project. The run
+            whose own merge wrote it prints the commands instead of obeying them."""
+            fork = self.conflicting_fork()
+            flag = os.path.join(self.tmp, "gate-ran")
+            commit_upstream(self.tmp, CONFIG_FILE, 'gate = ["touch %s"]\n' % flag,
+                            "theirs: a gate")
+            self.assertEqual(run("-C", fork, "sync")[0], 4)          # shared.tf conflicts
+            self.resolve(fork, self.BASE_TF.replace("count = 1", "count = 4"))
+
+            code, out, err = run("-C", fork, "sync", "--continue")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("this sync changes `%s`" % CONFIG_FILE, out)
+            self.assertIn("NOT RUN", out)
+            self.assertIn("would have run: sh -c 'touch %s'" % flag, out)
+            self.assertFalse(os.path.exists(flag))
+
+            # and it is only that run: a gate the fork now carries runs like any other, with
+            # the provenance of the file it comes from said out loud
+            code, out, err = run("-C", fork, "check")
+            self.assertEqual(code, 0, err + out)
+            self.assertTrue(os.path.exists(flag))
+            self.assertIn("is tracked by `upstream/main` too", out)
+
         def test_continue_after_a_resolution_that_keeps_both_sides(self):
             fork = self.appending_fork()
             self.assertEqual(run("-C", fork, "sync")[0], 4)
@@ -5615,10 +5891,12 @@ def run_tests() -> None:
             self.assertEqual(origin_sha(fork, name), "")
             self.assertTrue(self.backup_branch(fork))
 
-            # a second `ship` while the rebase is stopped refuses to do anything
+            # a second `ship` while the rebase is stopped refuses to do anything, and this
+            # clone does have a ship to resume - so the hint names `--continue`
             code, out, err = run("-C", fork, "ship")
             self.assertEqual(code, 2)
             self.assertIn("rebase is in progress", err)
+            self.assertIn("forkflow ship --continue", err)
 
             write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"))
             sh("git", "add", "shared.tf", cwd=fork)
@@ -5630,6 +5908,43 @@ def run_tests() -> None:
             self.assertEqual(origin_sha(fork, name), rev(fork, "HEAD"))
             self.assertEqual(origin_sha(fork, "develop"), before_trunk)
             self.assertIn("count = 2", sh("git", "show", "HEAD:shared.tf", cwd=fork))
+
+        def test_the_rebase_hint_names_plain_ship_when_there_is_no_ship_to_resume(self):
+            """`ship`'s own advice sends the user into `git pull --rebase` when a teammate's
+            commit is on `origin/<branch>`. That rebase is not a ship: `--continue` has no
+            backup and no lease to resume from and refuses, so the hint must not name it."""
+            fork = make_fork(self.tmp)
+            name = self.feature(fork, commits=0)
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "ours: shared", push=True)
+            second_clone_commit(self.tmp, branch=name, path="shared.tf",
+                                content=self.BASE_TF.replace("count = 1", "count = 9"))
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 5"),
+                        "ours: shared again")
+
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("git pull --rebase origin " + name, err)
+
+            sh("git", "pull", "--rebase", "origin", name, cwd=fork, check=False)
+            self.assertTrue(rebase_in_progress(ctx_for(fork)))
+            self.assertEqual(rebasing_branch(ctx_for(fork)), name)
+
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("rebase is in progress", err)
+            self.assertIn("`forkflow ship`", err)
+            self.assertNotIn("ship --continue", err)      # `git rebase --continue` is fine
+            # and the tool agrees: `--continue` is not the command this state resumes
+            self.resolve_conflict(fork)
+            sh("git", "rebase", "--continue", cwd=fork)
+            code, out, err = run("-C", fork, "ship", "--continue")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("no ship to continue", err)
+
+        def resolve_conflict(self, fork: str, count: str = "5") -> None:
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = " + count))
+            sh("git", "add", "shared.tf", cwd=fork)
 
         def test_continue_on_the_trunk_is_exit_2(self):
             fork = make_fork(self.tmp)
@@ -6156,20 +6471,69 @@ def run_tests() -> None:
             self.assertEqual(self.cfg(fork, "branch.develop.remote"), "")     # --no-track
             self.assertEqual(self.cfg(fork, "branch.develop.merge"), "")
 
-        def test_a_single_branch_clone_gets_a_local_mirror(self):
-            make_fork(self.tmp)
-            thin = os.path.join(self.tmp, "thin")
-            sh("git", "clone", "--single-branch", "--branch", "develop",
+        def thin_clone(self, name: str = "thin") -> str:
+            """A `clone --single-branch -b develop` of the fork: `origin/main` is on origin,
+            but this clone's fetch refspec hides it.
+
+            `--no-local`: a local clone hardlinks the whole object database, so only a real
+            transfer leaves this clone without the objects the other branches carry."""
+            thin = os.path.join(self.tmp, name)
+            sh("git", "clone", "--no-local", "--single-branch", "--branch", "develop",
                os.path.join(self.tmp, "origin.git"), thin)
             identity(thin)
             sh("git", "remote", "add", "upstream", os.path.join(self.tmp, "upstream.git"), cwd=thin)
             self.assertEqual(rev(thin, "refs/heads/main"), "")
             self.assertEqual(rev(thin, "refs/remotes/origin/main"), "")
+            return thin
+
+        def test_a_single_branch_clone_gets_a_local_mirror(self):
+            make_fork(self.tmp)
+            thin = self.thin_clone()
 
             code, out, err = run("-C", thin, "setup")
             self.assertEqual(code, 0, err + out)
             self.assertEqual(rev(thin, "refs/heads/main"), rev(thin, "refs/remotes/upstream/main"))
             self.assertEqual(self.cfg(thin, "branch.main.remote"), "")        # --no-track
+            # origin was asked, and answered with a mirror that is a pure copy of upstream
+            self.assertIn("git ls-remote --heads origin main", out)
+            self.assertIn("widen the refspec", out)
+
+        def test_a_published_mirror_that_carries_work_is_refused_in_a_thin_clone(self):
+            """`origin/<mirror>` missing here is not proof the fork has no mirror: creating
+            one on that silence accepts a fork whose published mirror carries its own work,
+            and defers the migration to a `sync` that dies on a non-fast-forward push."""
+            fork = make_fork(self.tmp)
+            sh("git", "switch", "main", cwd=fork)
+            commit_fork(fork, "ours/local.txt", "ours\n", "ours: on the mirror", push=True)
+            thin = self.thin_clone()
+            self.assertEqual(sh("git", "cat-file", "-t", origin_sha(fork, "main"),
+                                cwd=thin, check=False), "")   # a single-branch clone lacks it
+
+            code, out, err = run("-C", thin, "setup")
+            self.assertEqual(code, 2, out)
+            self.assertIn("Adopting forkflow", err)
+            self.assertIn("does not have", err)
+            self.assertIn("Widen the refspec and fetch (git config --add "
+                          "remote.origin.fetch +refs/heads/main:refs/remotes/origin/main", err)
+            self.assertEqual(rev(thin, "refs/heads/main"), "")
+            self.untouched(thin)
+
+        def test_a_published_mirror_ahead_of_upstream_is_refused_when_it_is_known(self):
+            """The same refusal with the commit in hand: `origin/<mirror>` is not in
+            `upstream/<branch>`, so it is not a mirror - and forkflow never resets it."""
+            fork = make_fork(self.tmp)
+            commit_fork(fork, "ours/feature.txt", "ours\n", "ours: on the trunk", push=True)
+            sh("git", "push", "origin", "develop:refs/heads/main", cwd=fork)
+            thin = self.thin_clone()
+            self.assertEqual(sh("git", "cat-file", "-t", origin_sha(fork, "main"),
+                                cwd=thin, check=False), "commit")   # develop's tip, fetched
+
+            code, out, err = run("-C", thin, "setup")
+            self.assertEqual(code, 2, out)
+            self.assertIn("Adopting forkflow", err)
+            self.assertIn("never resets", err)
+            self.assertEqual(rev(thin, "refs/heads/main"), "")
+            self.untouched(thin)
 
         def test_a_mirror_that_carries_work_is_refused(self):
             fork = make_fork(self.tmp)
@@ -6263,6 +6627,40 @@ def run_tests() -> None:
     # ------------------------------------------------------------------- #
     # setup: the pre-push hook, exercised as a hook by real `git push` runs
     # ------------------------------------------------------------------- #
+
+    class TestHookUrlNormaliser(Base):
+        """`ff_repo_id` (sh, in the hook) and `repo_id` (here) must read a URL the same way.
+
+        The hook is the only layer that sees a `git push <url>` typed by hand, and rule 1 is
+        about the repository: if the two normalisers drift, one spelling is refused by the
+        script and waved through by the hook, or the other way round."""
+
+        SPELLINGS = ["https://github.com/o/r.git", "https://GitHub.com/O/R",
+                     "https://git@github.com/o/r/", "git@github.com:o/r.git",
+                     "ssh://git@github.com:22/o/r", "ssh://github.com/o/r",
+                     "git://github.com:9418/o/r", "http://github.com:80/o/r",
+                     "https://github.com:443/o/r", "https://github.com:8080/o/r",
+                     "/tmp/Case/upstream.git", "/tmp/Case/upstream.git/",
+                     "file:///tmp/Case/upstream.git", "/srv/a b/repo.git",
+                     "host:o/r", "host:/abs/path.git", "../Other.git", "DISABLED", ""]
+
+        def norm(self, url: str) -> str:
+            path = os.path.join(self.tmp, "ff-repo-id.sh")
+            with open(path, "w") as fh:
+                fh.write("#!/bin/sh\n" + HOOK_REPO_ID + '\nff_repo_id "$1"\n')
+            return sh("sh", path, url)
+
+        def test_the_hooks_url_normaliser_matches_repo_id(self):
+            for url in self.SPELLINGS:
+                self.assertEqual(self.norm(url), repo_id(url), url)
+
+        def test_it_folds_the_spellings_of_one_repository_together(self):
+            same = ["https://github.com/o/r.git", "https://GitHub.com/O/R",
+                    "git@github.com:o/r.git", "ssh://git@github.com:22/o/r",
+                    "https://github.com:443/o/r"]
+            self.assertEqual({self.norm(u) for u in same}, {"github.com/o/r"})
+            self.assertNotEqual(self.norm("https://github.com/o/r"),
+                                self.norm("https://github.com/o/fork"))
 
     class HookBase(SetupBase):
         def hook_path(self, repo: str) -> str:
@@ -6387,6 +6785,22 @@ def run_tests() -> None:
             self.assertEqual(rc, 1, out)
             self.assertIn("never push to upstream", out)
 
+        def test_every_spelling_of_the_upstream_url_is_refused(self):
+            """Rule 1 is about the repository. A byte-for-byte compare refuses one spelling
+            and lets `<url>/` and `file://<url>` through - both really did create refs on the
+            original project before the hook normalised what it compares."""
+            url = self.upstream_url(self.fork)
+            sh("git", "switch", "-c", "feat/x", cwd=self.fork)
+            commit_fork(self.fork, "ours/feature.txt", "ours\n", "ours: a feature")
+            spellings = [url + "/", url + "//", "file://" + url, "file://" + url + "/"]
+            for spelling in spellings:
+                rc, out = self.push(self.fork, spelling, "feat/x:refs/heads/probe")
+                self.assertEqual(rc, 1, "%s: %s" % (spelling, out))
+                self.assertIn("never push to upstream", out)
+            up = os.path.join(self.tmp, "upstream.git")
+            self.assertEqual(sh("git", "--git-dir=" + up, "for-each-ref",
+                                "--format=%(refname)", "refs/heads/probe"), "")
+
         def test_the_trunk_cannot_be_pushed(self):
             before = origin_sha(self.fork, "develop")
             commit_fork(self.fork, "ours/feature.txt", "ours\n", "ours: on the trunk")
@@ -6429,6 +6843,30 @@ def run_tests() -> None:
             self.assertEqual(rc, 1, out)
             self.assertIn("only moves forward (rule 6)", out)
             self.assertEqual(origin_sha(self.fork, "main"), forward)
+
+        def test_the_mirror_cannot_be_rewound_onto_a_tip_this_clone_lacks(self):
+            """The state a teammate's `sync` leaves behind: `origin/<mirror>` is at an
+            upstream commit this clone has never fetched, so `merge-base --is-ancestor`
+            cannot answer. An unanswerable question is not a yes - the older local mirror is
+            still a pure copy of upstream, so nothing else in the hook catches the rewind."""
+            self.advance_mirror_to_upstream(self.fork)
+            rc, out = self.push(self.fork, "origin", "main")
+            self.assertEqual(rc, 0, out)
+            forward = origin_sha(self.fork, "main")
+
+            # upstream moves again and reaches origin/main through another clone; this one
+            # never fetches it, so origin's tip is not an object here
+            ahead = commit_upstream(self.tmp, "src/app.py", "def main():\n    return 5\n")
+            push_upstream_into_origin(self.tmp)
+            self.assertEqual(origin_sha(self.fork, "main"), ahead)
+            self.assertEqual(sh("git", "cat-file", "-t", ahead, cwd=self.fork, check=False), "")
+
+            rc, out = self.push(self.fork, "--force", "origin", "main")
+            self.assertEqual(rc, 1, out)
+            self.assertIn("cannot verify that the mirror only moves forward", out)
+            self.assertIn("git fetch origin", out)
+            self.assertEqual(origin_sha(self.fork, "main"), ahead)
+            self.assertNotEqual(ahead, forward)
 
         def test_the_mirror_is_refused_when_upstream_is_not_fetched(self):
             self.advance_mirror_to_upstream(self.fork)

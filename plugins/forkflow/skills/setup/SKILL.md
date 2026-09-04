@@ -48,8 +48,9 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before running it.
    ```
 
    In order: resolve and fetch both remotes and set their HEADs; write `--trunk` / `--mirror` into
-   `.forkflow.toml` if given; check the mirror is a pure copy of upstream (creating it locally in a
-   single-branch clone); bootstrap the trunk if it exists nowhere; disable the upstream push URL;
+   `.forkflow.toml` if given; check the mirror is a pure copy of upstream (in a single-branch clone
+   it asks origin with `ls-remote` first, and creates the local branch only when the published
+   mirror is one); bootstrap the trunk if it exists nowhere; disable the upstream push URL;
    install the pre-push hook; set the ff-only git config; report the platform; write the
    `.forkflow.toml` template if absent. The trunk step runs **before** the hook, because the hook
    refuses every push of the trunk, creation included.
@@ -72,12 +73,16 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before running it.
    unauthenticated, which is not a failure of the setup.
 
 5. **Explain the hook.** It is `pre-push` in this clone's hooks directory and it refuses:
-   any push to the upstream remote (matched by name **and** by URL, so pushing to the URL directly
-   is refused too); any push of the trunk, deletion included; deletion of the mirror; and any
-   mirror push that is not an ancestor of the last-fetched upstream ref. Everything else, including
-   deleting stale `sync/*` branches, is allowed. Say clearly that the mirror check validates
-   against the **last fetch** of upstream - `git fetch <upstream>` before pushing the mirror, and a
-   missing or unfetched upstream ref is a refusal ("cannot verify"), not a pass.
+   any push to the upstream remote (matched by name **and** by URL - both sides normalised, so a
+   trailing `/`, a `file://` prefix, a `user@`, a default port, an added or dropped `.git` and a
+   differently-cased host are all refused as the same repository); any push of the trunk, deletion
+   included; deletion of the mirror; and any mirror push that is not an ancestor of the
+   last-fetched upstream ref. Everything else, including deleting stale `sync/*` branches, is
+   allowed. Say clearly that the mirror check validates against the **last fetch** of upstream -
+   `git fetch <upstream>` before pushing the mirror, and a missing or unfetched upstream ref is a
+   refusal ("cannot verify"), not a pass. The same is true of the mirror's own tip: if
+   `origin/<mirror>` is at a commit this clone does not have, the push is refused with
+   `run: git fetch origin`, never allowed on the strength of an unanswerable question.
 
    Pushes to the upstream remote fail even earlier, on the `DISABLED` push URL, before any hook
    runs.
@@ -97,6 +102,7 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before running it.
 | exit 2 | meaning | what to do |
 |---|---|---|
 | mirror "has commits that are not in upstream" | the fork's mirror branch carries its own work - this is a **migration**, not a setup | point at the README section *Adopting forkflow in an existing fork* and stop. Never reset, force-push or delete that branch on the user's behalf; it is done once, by hand, by a Maintainer, after a backup |
+| `origin/<mirror>` "is at ..., a commit this clone does not have" | a narrowed fetch refspec (`clone --single-branch`) hides the fork's published mirror, so it cannot be checked - and it may be the migration case above | run the `git config --add remote.origin.fetch ... && git fetch origin` command printed with the refusal, then rerun setup; if it then says the mirror carries work, it is a migration |
 | trunk exists locally but not on origin | the script never pushes the trunk | the user pushes it once themselves (`git push -u origin <trunk>`) **before the pre-push hook is installed** - once it is, rule 2 refuses every trunk push, creation included - or deletes the branch and reruns setup |
 | `core.hooksPath` is set | the hooks directory is shared with other repositories | say what that means; install it there by hand, or rerun with `--force` if the user accepts it |
 | an existing foreign `pre-push` hook | not forkflow's | rerun with `--force` after the user agrees; the old hook is kept as `pre-push.pre-forkflow` |

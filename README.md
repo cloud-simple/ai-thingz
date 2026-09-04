@@ -175,8 +175,11 @@ trunk anywhere. The mistake is impossible, not merely discouraged.
 ### The six hard rules
 
 1. **Never push to `upstream`** - its push URL is set to `DISABLED` and the pre-push hook refuses
-   that remote by name *and* by URL. The rule is about the repository, not the remote name: an
-   `origin` whose `pushurl` points at the original project is refused by every subcommand.
+   that remote by name *and* by URL, in any spelling: it normalises both sides before comparing,
+   so a trailing `/`, a `file://` prefix, a `user@`, a default port, an added or dropped `.git`
+   and a differently-cased host are all the same repository. The rule is about the repository, not
+   the remote name: an `origin` whose `pushurl` points at the original project is refused by every
+   subcommand.
 2. **Never push the trunk** - only merge requests move `origin/<trunk>`; `push()` and the hook both
    refuse it, deletion included.
 3. **Never rebase the trunk** - upstream comes in by merge only.
@@ -259,6 +262,13 @@ gate = []                    # e.g. ["make test", "terraform fmt -check -recursi
 sync_prefix = "sync/"
 backup_prefix = "backup/"
 ```
+
+`gate` is the one key that is *run* rather than read - `sh -c` in the repo root, on every `check`,
+`sync` and `ship` - and `.forkflow.toml` is a tracked file a sync is designed to bring in from the
+original project. So a sync that changes it says so with a `CHECK` line pointing at
+`git diff HEAD^1 HEAD -- .forkflow.toml`, the run whose own merge brought it prints the gate
+commands instead of obeying them (`gate - NOT RUN`), and a `check` whose gate comes from a file
+upstream also tracks says that out loud. Read the diff before merging such a sync MR.
 
 The script itself needs only Python 3.9+ and git 2.20+ (the merge simulation wants 2.38+ and is
 skipped with a note on older git). **Reading `.forkflow.toml` needs Python 3.11+** (`tomllib`): a

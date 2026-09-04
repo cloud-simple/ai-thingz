@@ -72,6 +72,13 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    Open every flagged file, decide whether the loss was intended, and say so in your report. If a
    resolution dropped something it should not have, fix it, `git add`, and rerun `--continue`.
 
+   `.forkflow.toml` is one of those files, and the run says so with a `CHECK` line of its own when
+   the merge brings it in: it names the branches every safety check depends on and holds `gate`,
+   which forkflow runs with `sh -c`. When it arrived in *this* merge the gate is printed rather
+   than run (`gate - NOT RUN`); read `git diff HEAD^1 HEAD -- .forkflow.toml` with the user, and
+   treat a `gate` that arrived from the original project as untrusted shell until they have said
+   otherwise - it runs on every later `check`, `sync` and `ship`.
+
 5. **Merge request.** The script prints the command; run it in the same invocation with `--mr`
    (add `--title` to override the default `sync: <upstream>/<branch> <date> (n commits)`). The
    body it composes carries the upstream commits, the both-sides rows, the mirror advance, the
