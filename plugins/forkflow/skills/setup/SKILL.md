@@ -77,7 +77,9 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before running it.
    trailing `/`, a `file://` prefix, a `user@`, a default port, an added or dropped `.git` and a
    differently-cased host are all refused as the same repository, and a local path is
    canonicalised too, so `../upstream.git`, a `/.` suffix, a symlink and `file://localhost/...`
-   are refused as well); any push of the trunk, deletion
+   are refused as well - but a path keeps its case where a host does not, so say plainly that a
+   differently-cased spelling of a *local* upstream path is not recognised); any push of the
+   trunk, deletion
    included; deletion of the mirror; and any mirror push that is not an ancestor of the
    last-fetched upstream ref. Everything else, including deleting stale `sync/*` branches, is
    allowed. Say clearly that the mirror check validates against the **last fetch** of upstream -
