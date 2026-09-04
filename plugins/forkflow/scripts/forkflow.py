@@ -58,7 +58,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, Sequence, Tuple
 
 CONFIG_FILE = ".forkflow.toml"
@@ -208,49 +208,52 @@ def have_tomllib() -> bool:
     return True
 
 
-def configures_nothing(path: str) -> bool:
+def configures_nothing(text: str) -> bool:
     """True when the file holds nothing but blank lines and `#` comments."""
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            text = fh.read()
-    except (OSError, UnicodeDecodeError):
-        return False
     return all(not line.strip() or line.strip().startswith("#") for line in text.splitlines())
 
 
-def load_config(root: str) -> dict:
-    """{} when absent. A config that exists but cannot be read - or carries a value of the
-    wrong type - is a hard failure: it names the branches every safety check depends on."""
-    path = os.path.join(root, CONFIG_FILE)
-    if not os.path.exists(path):
-        return {}
+def parse_config(text: str, where: str) -> dict:
+    """The parsed `.forkflow.toml`, wherever the bytes came from - the working tree, or a
+    `git show <rev>:.forkflow.toml` of what a branch carried before a merge. A value of the
+    wrong type is a hard failure: it names the branches every safety check depends on."""
     if not have_tomllib():
         # a file of nothing but comments configures nothing: reading it as `{}` is exactly what
         # tomllib would have said, and refusing it would brick every subcommand over the
         # commented template `setup` used to leave behind
-        if configures_nothing(path):
+        if configures_nothing(text):
             return {}
-        raise Fail(f"{CONFIG_FILE} needs Python 3.11+ (tomllib) to be read; "
+        raise Fail(f"{where} needs Python 3.11+ (tomllib) to be read; "
                    f"this is Python {sys.version_info[0]}.{sys.version_info[1]}. "
                    f"Remove the file or run forkflow with a newer Python.")
     import tomllib  # Python 3.11+, guarded by have_tomllib() above
     try:
-        with open(path, "rb") as fh:
-            cfg = tomllib.load(fh)
+        cfg = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
-        raise Fail(f"{CONFIG_FILE}: {exc}")
-    except OSError as exc:
-        raise Fail(f"{CONFIG_FILE} cannot be read: {exc}")
+        raise Fail(f"{where}: {exc}")
     # every value ends up in a git command line: a wrong type is a traceback, not a workflow
     for key in CONFIG_STRINGS:
         if key in cfg and not isinstance(cfg[key], str):
-            raise Fail(f"{CONFIG_FILE}: `{key}` must be a string, "
+            raise Fail(f"{where}: `{key}` must be a string, "
                        f"not {type(cfg[key]).__name__}")
     gate = cfg.get("gate")
     if gate is not None and (not isinstance(gate, list)
                              or any(not isinstance(c, str) for c in gate)):
-        raise Fail(f"{CONFIG_FILE}: `gate` must be a list of shell commands")
+        raise Fail(f"{where}: `gate` must be a list of shell commands")
     return cfg
+
+
+def load_config(root: str) -> dict:
+    """{} when absent. A config that is there but cannot be read is a hard failure."""
+    path = os.path.join(root, CONFIG_FILE)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise Fail(f"{CONFIG_FILE} cannot be read: {exc}")
+    return parse_config(text, CONFIG_FILE)
 
 
 # --------------------------------------------------------------------------- #
@@ -364,19 +367,43 @@ def push_urls(root: str, remote: str) -> list:
     return [u.strip() for u in out.splitlines() if u.strip()]
 
 
-def repo_id(url: str) -> str:
+def canonical_path(path: str, base: Optional[str] = None) -> str:
+    """`path` with `.`, `..` and symlinks resolved - when it names a directory that is there.
+
+    A fork whose upstream is a local path or a `file:` URL is an ordinary case (every fixture
+    the test suite builds is one), and `../upstream.git`, `/srv/upstream.git/.` and a symlink
+    to it all reach the repository rule 1 is about. The hook does the same with
+    `CDPATH= cd -P -- "$r" && pwd -P`, which can only succeed on a directory that exists - so
+    a path that does not resolve keeps the spelling it was given, on both sides.
+
+    `base` is what a relative path is resolved against: the hook runs with git's own working
+    directory, the top of the working tree, so every caller here passes the repository root."""
+    if not path:
+        return path
+    try:
+        full = path if os.path.isabs(path) else os.path.join(base or os.getcwd(), path)
+        if os.path.isdir(full):
+            return os.path.realpath(full)
+    except (OSError, ValueError):                         # a NUL, a name too long, a loop
+        pass
+    return path
+
+
+def repo_id(url: str, base: Optional[str] = None) -> str:
     """`host/path` of a git URL, so two spellings of one repository compare equal.
 
     `https://git@host/o/r.git`, `ssh://host:22/o/r` and `git@host:o/r.git` are the same
     project. A URL with a host is folded whole: GitHub and GitLab both resolve `Owner/Repo`
     case-insensitively, so a spelling that differs only in case is a live alias onto the same
-    repository. A local path - `/srv/repo.git`, or the `file:///srv/repo.git` spelling of it -
-    keeps its case, because a path is not case-folded the way a host name is.
+    repository. A local path - `/srv/repo.git`, `file:///srv/repo.git`, `file://localhost/…`
+    or a relative `../repo.git` - keeps its case, because a path is not case-folded the way a
+    host name is, but is canonicalised (see `canonical_path`) so `..`, `/.` and a symlink do
+    not each read as a repository of their own.
 
     The generated hook's `ff_repo_id` applies the same rules, so what this script refuses and
     what the hook refuses are the same set of URLs."""
     u = (url or "").strip().rstrip("/")
-    scheme, host = "", False
+    scheme, host, authority = "", False, ""
     if "://" in u:
         scheme, _, u = u.partition("://")
         scheme, host = scheme.lower(), True
@@ -389,8 +416,11 @@ def repo_id(url: str) -> str:
         name, _, port = authority.rpartition(":")
         if name and port.isdigit() and port == DEFAULT_PORTS.get(scheme, ""):
             authority = name                              # `host:443` under https is `host`
-        if authority:                                     # empty for `file:///path`: a path
-            u = (authority + sep + rest).lower()
+        if scheme == "file" and authority == "localhost":
+            authority = ""                                # `file://localhost/p` is the path
+        u = (authority + sep + rest).lower() if authority else sep + rest
+    if not authority:                                     # a local path, however it is spelled
+        u = canonical_path(u, base)
     return u[:-4] if u.endswith(".git") else u
 
 
@@ -401,12 +431,12 @@ def origin_pushes_to_upstream(root: str, origin: str, upstream: str) -> Optional
     this script looks at that key: an origin whose push URL is the upstream repository turns
     every `push()` here - and the trunk bootstrap `setup` runs before the hook exists - into a
     push to the project we must never write to (rule 1)."""
-    theirs = {repo_id(u) for u in push_urls(root, upstream)}
-    theirs.add(repo_id(git("remote", "get-url", upstream, cwd=root, check=False)))
+    theirs = {repo_id(u, root) for u in push_urls(root, upstream)}
+    theirs.add(repo_id(git("remote", "get-url", upstream, cwd=root, check=False), root))
     theirs.discard("")
-    theirs.discard(repo_id("DISABLED"))     # what `setup` sets, and not a repository
+    theirs.discard(repo_id("DISABLED", root))   # what `setup` sets, and not a repository
     for url in push_urls(root, origin):
-        if repo_id(url) in theirs:
+        if repo_id(url, root) in theirs:
             return url
     return None
 
@@ -1301,18 +1331,60 @@ def gate_commands(ctx: Ctx) -> list:
     return [c for c in (ctx.cfg.get("gate") or []) if c.strip()]
 
 
-def config_arrived_in_merge(ctx: Ctx) -> bool:
-    """True when the merge commit at HEAD is what brought `.forkflow.toml` in.
+def config_text(ctx: Ctx, revision: Optional[str] = None) -> Optional[str]:
+    """`.forkflow.toml` as of `revision`, or from the working tree when `revision` is None.
+    None when it is not there at all."""
+    if revision is None:
+        try:
+            with open(os.path.join(ctx.root, CONFIG_FILE), "r", encoding="utf-8") as fh:
+                return fh.read()
+        except (OSError, UnicodeDecodeError):
+            return None
+    rc, out, _ = git_rc("show", f"{revision}:{CONFIG_FILE}", cwd=ctx.root)
+    return out if rc == 0 else None
+
+
+def gate_at(ctx: Ctx, revision: str) -> Optional[list]:
+    """The `gate` `.forkflow.toml` carried at `revision`; None when it cannot be read.
+
+    Unreadable is not `[]`: an unknown gate is treated as a changed one, which shows rather
+    than runs - the safe direction for a key that is arbitrary shell."""
+    text = config_text(ctx, revision)
+    if text is None:
+        return []                         # no file there: no gate
+    try:
+        cfg = parse_config(text, f"{revision}:{CONFIG_FILE}")
+    except Fail:
+        return None
+    return [c for c in (cfg.get("gate") or []) if c.strip()]
+
+
+def config_changed_in_merge(ctx: Ctx, merge_sha: str) -> bool:
+    """True when `.forkflow.toml` as it now stands is not what this branch carried before
+    the sync merge - the reviewer of the MR has to see that, whatever key changed.
+
+    The merge is not necessarily at HEAD: fixing what `check` refused means a commit on top
+    of it, so the comparison is `<merge>^1` against the working tree rather than
+    `HEAD^1` against `HEAD`."""
+    if not merge_sha:
+        return False
+    before, now = config_text(ctx, f"{merge_sha}^1"), config_text(ctx, None)
+    return (before or "").strip() != (now or "").strip()
+
+
+def gate_arrived_in_merge(ctx: Ctx, merge_sha: str) -> bool:
+    """True when the `gate` this run would obey is not the one the branch had before the
+    sync merge.
 
     A `gate` is arbitrary shell run with `sh -c`, and `.forkflow.toml` is a tracked file a
     sync is designed to bring in from the original project - so the one run that must not
-    obey it is the one whose own merge just wrote it."""
-    rc, _, _ = git_rc("rev-parse", "--verify", "--quiet", "HEAD^2", cwd=ctx.root)
-    if rc != 0:
-        return False                      # not a merge commit: nothing arrived through one
-    changed = git("diff", "--name-only", "HEAD^1", "HEAD", "--", CONFIG_FILE,
-                  cwd=ctx.root, check=False)
-    return bool(changed.strip())
+    obey it is the one whose own merge changed it. Keyed on the `gate`, not on the file:
+    upstream editing an unrelated line must not suppress this fork's own gate, and a commit
+    made on top of the merge must not hide one that did change."""
+    if not merge_sha:
+        return False
+    before = gate_at(ctx, f"{merge_sha}^1")
+    return before is None or gate_commands(ctx) != before
 
 
 def run_check(ctx: Ctx, touched: Optional[Sequence[str]] = None,
@@ -1320,9 +1392,10 @@ def run_check(ctx: Ctx, touched: Optional[Sequence[str]] = None,
     """The preflight `sync` and `ship` run, and what `status` surfaces for humans.
 
     Read-only. 0 when every invariant holds, 3 when one does not; the upstream-tracked
-    warning is advisory and never changes the code. `config_merged` says the `.forkflow.toml`
-    this ran with arrived in the merge this run just made - its `gate` is then upstream's
-    shell command, not this fork's, and it is shown rather than run."""
+    warning is advisory and never changes the code. `config_merged` says the `gate` this
+    ran with is one the merge this run just made changed - it is then upstream's shell
+    command, not the one this branch started with, and it is shown rather than run.
+    `ctx.cfg` must already be the config of the merged tree: see `finish_sync`."""
     failures = []
     warn_upstream_tracked(ctx, touched)
 
@@ -1333,7 +1406,8 @@ def run_check(ctx: Ctx, touched: Optional[Sequence[str]] = None,
         step("gate", "-", f"WARNING: `{CONFIG_FILE}` is tracked by `{ctx.up()}` too - a sync "
                           f"can change what these commands are")
     if gate and config_merged:
-        step("gate", "-", f"NOT RUN: the merge this run made brought `{CONFIG_FILE}` with it")
+        step("gate", "-", f"NOT RUN: the merge this run made changed the `gate` "
+                          f"in `{CONFIG_FILE}`")
         for cmd in gate:
             print(f"      would have run: sh -c '{cmd}'")
         print(f"      a `gate` is arbitrary shell run by every `check`, `sync` and `ship`: "
@@ -1593,6 +1667,28 @@ def make_sync_branch(ctx: Ctx, name: str, force: bool) -> None:
     step("branch", cmd, f"{'recreated' if exists else 'created'} at {short(rev(ctx.root, 'HEAD'))}")
 
 
+def untracked_in_the_way(ctx: Ctx, target: str) -> list:
+    """Untracked working-tree files the sync merge would have to write over.
+
+    git refuses such a merge outright - "untracked working tree files would be overwritten",
+    whatever the file holds - and `setup` leaves exactly one behind: the commented
+    `.forkflow.toml` template, which a forkflow-using upstream may later start tracking.
+    Answered before the backup is pushed, so a sync that cannot run leaves no orphan
+    `backup/*` on origin.
+
+    Only files the merge really writes count: one that was at the merge base and this fork
+    deleted stays deleted, so it is not in the way."""
+    base = f"{ctx.origin}/{ctx.trunk}"
+    added = set(diff_names(ctx, "--diff-filter=A", base, target))
+    merge_base = git("merge-base", base, target, cwd=ctx.root, check=False)
+    if merge_base:
+        added &= set(diff_names(ctx, "--diff-filter=A", merge_base, target))
+    if not added:
+        return []
+    others = git("ls-files", "--others", "--exclude-standard", "-z", cwd=ctx.root, check=False)
+    return sorted(added & {f for f in others.split("\0") if f})
+
+
 def merge_upstream(ctx: Ctx, name: str, target: str, commits: Sequence[str]) -> None:
     """One `--no-ff` merge commit, so `git log --merges <trunk>` is the record of every sync."""
     text = (f"Merge {ctx.mirror} (mirror of {ctx.up()}) into {name}\n\n"
@@ -1611,7 +1707,15 @@ def merge_upstream(ctx: Ctx, name: str, target: str, commits: Sequence[str]) -> 
         return
     unmerged = unmerged_paths(ctx)
     if not unmerged:
-        raise Fail(f"merge of {short(target)} failed:\n{(err or out).strip()}")
+        text = (err or out).strip()
+        if "untracked working tree files would be overwritten" in text:
+            # the preflight in `cmd_sync` answers this before the backup; this is what is
+            # left if the tree changed under the run, and it names the remedy either way
+            raise Fail(f"the merge would overwrite untracked file(s) in the working tree, "
+                       f"which git refuses outright - remove them, or get them into "
+                       f"`{ctx.origin}/{ctx.trunk}` first, then run `forkflow sync` "
+                       f"again:\n{text}")
+        raise Fail(f"merge of {short(target)} failed:\n{text}")
     report_paths("merge", cmd, unmerged, "conflicting file(s)")
     raise Fail(f"resolve the conflicts on `{name}`, `git add` them, "
                f"then run `forkflow sync --continue`", 4)
@@ -1668,20 +1772,29 @@ def check_failure_hint(ctx: Ctx, name: str) -> str:
 
 def finish_sync(ctx: Ctx, args: argparse.Namespace, name: str, commits: Sequence[str],
                 rows: Sequence[Tuple[str, str]], mirror_move: Tuple[str, str],
-                backup_ref: str) -> int:
+                backup_ref: str, merge_sha: str) -> int:
     """check -> push -> merge request: the tail both `sync` and `sync --continue` run."""
+    # `resolve_ctx` read `.forkflow.toml` before the merge this run just made, so on the
+    # clean-merge path `ctx.cfg` is the fork's pre-merge config while the tree `check` runs
+    # against is the merged one. Only `cfg` is refreshed: the branch names this run is
+    # already using must not change under it half way through. A merged config that cannot
+    # be read is exit 2, as it is for every other subcommand - the clone is in that state now
+    if not ctx.dry_run:
+        ctx = replace(ctx, cfg=load_config(ctx.root))
+
     # `.forkflow.toml` names the branches every safety check depends on and holds `gate`,
     # which is run with `sh -c`: a sync that brings it in from the original project is a
     # change to how this fork is governed, and the reviewer of the MR has to see that
-    config_merged = not ctx.dry_run and config_arrived_in_merge(ctx)
+    config_merged = not ctx.dry_run and config_changed_in_merge(ctx, merge_sha)
     if config_merged:
         print(f"  CHECK    this sync changes `{CONFIG_FILE}` - it names the branches and "
               f"holds `gate`, which forkflow runs with `sh -c`:")
-        print(f"    git diff HEAD^1 HEAD -- {sh_arg(CONFIG_FILE)}")
+        print(f"    git diff {short(merge_sha)}^1 HEAD -- {sh_arg(CONFIG_FILE)}")
+    gate_merged = not ctx.dry_run and gate_arrived_in_merge(ctx, merge_sha)
 
     if ctx.dry_run:
         step("check", "forkflow check", "not run (dry run)", dry=True)
-    elif run_check(ctx, config_merged=config_merged) == 3:
+    elif run_check(ctx, config_merged=gate_merged) == 3:
         print(check_failure_hint(ctx, name))
         return 3
 
@@ -1758,7 +1871,7 @@ def cmd_sync_continue(ctx: Ctx, args: argparse.Namespace) -> int:
 
     mirror_sha = rev(ctx.root, f"refs/heads/{ctx.mirror}")
     return finish_sync(ctx, args, name, commits, rows, (mirror_sha, mirror_sha),
-                       resumable(ctx, "sync", name).get("backup", ""))
+                       resumable(ctx, "sync", name).get("backup", ""), merge_sha)
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
@@ -1801,6 +1914,18 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
     simulate_merge(ctx, target)
 
+    # before the backup: git refuses a merge that would write over an untracked file, and a
+    # sync that cannot run must not leave an orphan `backup/*` behind on origin
+    blocked = untracked_in_the_way(ctx, target)
+    if blocked:
+        report_paths("untracked", "git ls-files --others --exclude-standard", blocked,
+                     "untracked file(s) this sync would write over")
+        raise Fail(f"git refuses a merge that would overwrite an untracked file. "
+                   f"`forkflow setup` writes `{CONFIG_FILE}` untracked and an upstream that "
+                   f"uses forkflow too tracks it, which is this collision. Remove the "
+                   f"file(s), or get them into `{ctx.origin}/{ctx.trunk}` first (commit them "
+                   f"on a branch and `forkflow ship` it), then run `forkflow sync` again")
+
     log = git("log", "--oneline", "--no-decorate", f"{ctx.origin}/{ctx.trunk}..{target}",
               cwd=ctx.root, check=False)
     commits = [ln for ln in log.splitlines() if ln]
@@ -1816,10 +1941,11 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
     if ctx.dry_run:
         step("verify", "git diff HEAD^1 / HEAD^2", "not run (dry run)", dry=True)
-        rows = []
+        rows, merge_sha = [], ""
     else:
         rows = both_sides_survived(ctx, "HEAD^1", "HEAD^2")
-    return finish_sync(ctx, args, name, commits, rows, mirror_move, backup_ref)
+        merge_sha = rev(ctx.root, "HEAD")
+    return finish_sync(ctx, args, name, commits, rows, mirror_move, backup_ref, merge_sha)
 
 
 def rebase_in_progress(ctx: Ctx) -> bool:
@@ -2488,9 +2614,11 @@ def setup_push_url(ctx: Ctx) -> None:
 
 # `repo_id()` as POSIX sh, for the hook. Rule 1 is about a repository, and a repository has many
 # spellings: `<url>/`, `file://<url>`, `<url>.git`, `user@host:...`, an explicit default port and
-# a capitalised host all reach the same place. Comparing the raw strings refuses one spelling and
-# waves the rest through, so both sides are normalised here - the same way `repo_id()` does, and
-# kept in step with it by `test_the_hooks_url_normaliser_matches_repo_id`.
+# a capitalised host all reach the same place, and so do `../repo.git`, `<path>/.`, a symlink to
+# it and `file://localhost/<path>` when the repository is a local one. Comparing the raw strings
+# refuses one spelling and waves the rest through, so both sides are normalised here - the same
+# way `repo_id()` does, and kept in step with it by `test_the_hooks_url_normaliser_matches_repo_id`
+# and `test_every_spelling_of_a_local_upstream_is_one_repository`.
 # It is spliced into HOOK_TEMPLATE rather than written inside it: this string is never
 # %-formatted, so sh's `${x%y}` expansions read as themselves.
 HOOK_REPO_ID = """ff_repo_id() {
@@ -2502,16 +2630,20 @@ HOOK_REPO_ID = """ff_repo_id() {
         esac
     done
     s=
+    a=
+    h=
     case "$r" in
     *://*)
-        s=${r%%://*}
+        s=$(printf '%s' "${r%%://*}" | tr 'A-Z' 'a-z')
         r=${r#*://}
+        h=1
         ;;
     *:*)
         case "${r%%:*}" in
         */*) ;;                                 # a path with a colon in it, not host:path
         *)
             s=ssh                               # scp-like [user@]host:path
+            h=1
             p=${r#*:}
             while :; do
                 case "$p" in
@@ -2524,14 +2656,24 @@ HOOK_REPO_ID = """ff_repo_id() {
         esac
         ;;
     esac
-    if [ -n "$s" ]; then
+    if [ -n "$h" ]; then
         a=${r%%/*}                              # [user@]host[:port]
         rest=${r#"$a"}
         a=${a##*@}
         case "$s:${a##*:}" in
         ssh:22|git+ssh:22|git:9418|http:80|https:443) a=${a%:*} ;;
         esac
-        [ -n "$a" ] && r=$(printf '%s%s' "$a" "$rest" | tr 'A-Z' 'a-z')
+        case "$s/$a" in
+        file/localhost) a= ;;                   # `file://localhost/p` is the path `/p`
+        esac
+        if [ -n "$a" ]; then
+            r=$(printf '%s%s' "$a" "$rest" | tr 'A-Z' 'a-z')
+        else
+            r=$rest
+        fi
+    fi
+    if [ -z "$a" ] && [ -n "$r" ]; then          # a local path: `..`, `/.`, symlinks resolved
+        p=$(CDPATH= cd -P -- "$r" 2>/dev/null && pwd -P) && [ -n "$p" ] && r=$p
     fi
     case "$r" in
     *.git) r=${r%.git} ;;
@@ -5313,6 +5455,32 @@ def run_tests() -> None:
             self.assertEqual(rev(fork, self.sync_name() + "^2"), rev(fork, "upstream/main"))
 
         @needs_tomllib
+        def test_an_untracked_file_upstream_tracks_is_refused_before_the_backup(self):
+            """`setup` writes `.forkflow.toml` untracked, and an upstream that uses forkflow
+            too tracks it - the case the gate guard exists for. git refuses a merge that
+            would write over an untracked file, so on the default setup path every later
+            sync died on raw git output and left one more orphan backup on origin."""
+            fork = make_fork(self.tmp)
+            self.assertEqual(run("-C", fork, "setup")[0], 0)
+            self.assertTrue(os.path.exists(os.path.join(fork, CONFIG_FILE)))
+            commit_upstream(self.tmp, CONFIG_FILE, "gate = []\n", "theirs: forkflow too")
+            before_trunk = origin_sha(fork, "develop")
+
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn(CONFIG_FILE, out + err)
+            self.assertIn("untracked", out + err)
+            self.assertNotIn("backup/", local_branches(fork))          # nothing to clean up
+            self.assertEqual(origin_sha(fork, self.sync_name()), "")
+            self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+
+            # the remedy the message names, run literally, unblocks it
+            os.unlink(os.path.join(fork, CONFIG_FILE))
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(fork, self.sync_name() + "^2"), rev(fork, "upstream/main"))
+
+        @needs_tomllib
         def test_failing_gate_is_exit_3_with_the_continue_hint(self):
             fork = make_fork(self.tmp, config='gate = ["exit 2"]\n')
             self.ahead_upstream(fork)
@@ -5322,6 +5490,83 @@ def run_tests() -> None:
             self.assertIn("forkflow sync --continue", out)
             self.assertEqual(origin_sha(fork, self.sync_name()), "")   # nothing was pushed
             self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+
+    @needs_tomllib
+    class TestSyncGateOnACleanMerge(Base):
+        """The `gate` guard on the path where the merge does not conflict.
+
+        `resolve_ctx` reads `.forkflow.toml` before that merge, so everything here is about
+        the config the merge *produced* rather than the one the run started with."""
+
+        def trunk_from_upstream(self, fork: str) -> None:
+            """Publish upstream's tip as the trunk, as a merged sync MR would: the fork then
+            carries upstream's `.forkflow.toml` and the next change to it merges clean."""
+            push_upstream_into_origin(self.tmp, "develop")
+            sh("git", "fetch", "origin", cwd=fork)
+            sh("git", "checkout", "develop", cwd=fork)
+            sh("git", "reset", "--hard", "origin/develop", cwd=fork)
+
+        def test_the_gate_shown_is_the_one_the_merge_brought(self):
+            """The guard exists so nobody runs upstream's unread shell. Showing the fork's
+            own pre-merge command and then naming `forkflow check` - which runs the one that
+            arrived - is that failure, not a display wart."""
+            fork = make_fork(self.tmp)
+            ours = os.path.join(self.tmp, "OLD-ran")
+            theirs = os.path.join(self.tmp, "NEW-ran")
+            commit_upstream(self.tmp, CONFIG_FILE, 'gate = ["touch %s"]\n' % ours,
+                            "theirs: a gate")
+            self.trunk_from_upstream(fork)
+            commit_upstream(self.tmp, CONFIG_FILE, 'gate = ["touch %s"]\n' % theirs,
+                            "theirs: a different gate")
+
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("NOT RUN", out)
+            self.assertIn("would have run: sh -c 'touch %s'" % theirs, out)
+            self.assertNotIn(ours, out)                    # never the pre-merge command
+            self.assertFalse(os.path.exists(ours))
+            self.assertFalse(os.path.exists(theirs))
+
+            # `forkflow check` is the command the guard names: it runs what it showed
+            code, out, err = run("-C", fork, "check")
+            self.assertEqual(code, 0, err + out)
+            self.assertTrue(os.path.exists(theirs))
+            self.assertFalse(os.path.exists(ours))
+
+        def test_a_gate_the_fork_did_not_have_is_shown_and_not_run(self):
+            """The fork has no `gate` at all and upstream's merge adds one: there is nothing
+            to suppress, and the NOT-RUN block is the whole point of the run."""
+            fork = make_fork(self.tmp)
+            flag = os.path.join(self.tmp, "theirs-gate-ran")
+            commit_upstream(self.tmp, CONFIG_FILE, 'gate = ["touch %s"]\n' % flag,
+                            "theirs: a gate")
+
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("NOT RUN", out)
+            self.assertIn("would have run: sh -c 'touch %s'" % flag, out)
+            self.assertNotIn("none configured", out)
+            self.assertFalse(os.path.exists(flag))
+
+        def test_an_unchanged_gate_runs_even_when_upstream_edits_the_file(self):
+            """The inverse mistake: this fork's own preflight silently skipped because
+            upstream touched an unrelated line. The MR would be opened with `check ok`
+            printed and nothing checked."""
+            fork = make_fork(self.tmp)
+            flag = os.path.join(self.tmp, "ours-gate-ran")
+            gate = 'gate = ["touch %s"]\n' % flag
+            commit_upstream(self.tmp, CONFIG_FILE, gate, "theirs: a gate")
+            self.trunk_from_upstream(fork)
+            commit_upstream(self.tmp, CONFIG_FILE, "# upstream added a comment\n" + gate,
+                            "theirs: a comment, and nothing else")
+
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 0, err + out)
+            self.assertNotIn("NOT RUN", out)
+            self.assertIn("sh -c 'touch %s'" % flag, out)
+            self.assertTrue(os.path.exists(flag))
+            # the file did change, so the reviewer is still told to read the diff
+            self.assertIn("this sync changes `%s`" % CONFIG_FILE, out)
 
     class TestSyncConflicts(Base):
         """The conflict path, `sync --continue`, and the both-sides table."""
@@ -5415,6 +5660,28 @@ def run_tests() -> None:
             self.assertEqual(code, 0, err + out)
             self.assertTrue(os.path.exists(flag))
             self.assertIn("is tracked by `upstream/main` too", out)
+
+        @needs_tomllib
+        def test_a_gate_that_arrived_stays_shown_after_a_commit_on_the_merge(self):
+            """`--continue` supports a commit made on top of the merge - that is how a
+            refused `check` is fixed. The merge is then no longer `HEAD`, and the gate it
+            brought must still be shown rather than run."""
+            fork = self.conflicting_fork()
+            flag = os.path.join(self.tmp, "gate-ran")
+            commit_upstream(self.tmp, CONFIG_FILE, 'gate = ["touch %s"]\n' % flag,
+                            "theirs: a gate")
+            self.assertEqual(run("-C", fork, "sync")[0], 4)
+            self.resolve(fork, self.BASE_TF.replace("count = 1", "count = 4"))
+            self.assertEqual(run("-C", fork, "sync", "--continue")[0], 0)
+            self.assertFalse(os.path.exists(flag))
+
+            commit_fork(fork, "ours/fix.txt", "fixed\n", "ours: fix what check refused")
+            code, out, err = run("-C", fork, "sync", "--continue")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("NOT RUN", out)
+            self.assertIn("would have run: sh -c 'touch %s'" % flag, out)
+            self.assertIn("this sync changes `%s`" % CONFIG_FILE, out)
+            self.assertFalse(os.path.exists(flag))
 
         def test_continue_after_a_resolution_that_keeps_both_sides(self):
             fork = self.appending_fork()
@@ -6640,19 +6907,46 @@ def run_tests() -> None:
                      "ssh://git@github.com:22/o/r", "ssh://github.com/o/r",
                      "git://github.com:9418/o/r", "http://github.com:80/o/r",
                      "https://github.com:443/o/r", "https://github.com:8080/o/r",
+                     "HTTPS://GitHub.com:443/O/R",
                      "/tmp/Case/upstream.git", "/tmp/Case/upstream.git/",
-                     "file:///tmp/Case/upstream.git", "/srv/a b/repo.git",
-                     "host:o/r", "host:/abs/path.git", "../Other.git", "DISABLED", ""]
+                     "/tmp/Case/upstream.git/.", "file:///tmp/Case/upstream.git",
+                     "file://localhost/tmp/Case/upstream.git", "/srv/a b/repo.git",
+                     "host:o/r", "host:/abs/path.git", "../Other.git", "./../Other.git",
+                     "DISABLED", ""]
 
-        def norm(self, url: str) -> str:
+        def norm(self, url: str, cwd: Optional[str] = None) -> str:
             path = os.path.join(self.tmp, "ff-repo-id.sh")
             with open(path, "w") as fh:
                 fh.write("#!/bin/sh\n" + HOOK_REPO_ID + '\nff_repo_id "$1"\n')
-            return sh("sh", path, url)
+            return sh("sh", path, url, cwd=cwd)
 
         def test_the_hooks_url_normaliser_matches_repo_id(self):
             for url in self.SPELLINGS:
                 self.assertEqual(self.norm(url), repo_id(url), url)
+
+        def test_every_spelling_of_a_local_upstream_is_one_repository(self):
+            """A fork whose upstream is a local path or a `file:` URL is an ordinary case -
+            every fixture this suite builds is one - and `..`, a `/.` suffix, a symlink and
+            `file://localhost` all reach the same repository. Agreeing with `repo_id` proves
+            nothing on its own if both are wrong, so this asserts what they must *say*."""
+            lab = os.path.join(self.tmp, "lab")
+            here = os.path.join(lab, "sub")
+            real = os.path.join(lab, "upstream.git")
+            os.makedirs(here)
+            os.makedirs(real)
+            link = os.path.join(lab, "up-link.git")
+            os.symlink(real, link)
+            spellings = [real, real + "/", real + "/.", real + "/./", link,
+                         os.path.join(here, "..", "upstream.git"),
+                         "file://" + real, "file://localhost" + real,
+                         "../upstream.git", "./../upstream.git"]
+            for url in spellings:
+                self.assertEqual(self.norm(url, cwd=here), repo_id(url, here), url)
+            self.assertEqual({repo_id(u, here) for u in spellings}, {real[:-len(".git")]})
+            # and a neighbour of it is still a different repository
+            other = os.path.join(lab, "other.git")
+            os.makedirs(other)
+            self.assertNotEqual(repo_id("../other.git", here), repo_id("../upstream.git", here))
 
         def test_it_folds_the_spellings_of_one_repository_together(self):
             same = ["https://github.com/o/r.git", "https://GitHub.com/O/R",
@@ -6788,11 +7082,19 @@ def run_tests() -> None:
         def test_every_spelling_of_the_upstream_url_is_refused(self):
             """Rule 1 is about the repository. A byte-for-byte compare refuses one spelling
             and lets `<url>/` and `file://<url>` through - both really did create refs on the
-            original project before the hook normalised what it compares."""
+            original project before the hook normalised what it compares.
+
+            A relative path, a `/.` suffix, a symlink and `file://localhost` reach it just as
+            well: each of these really did land a ref in `upstream.git` until the hook
+            canonicalised the two sides before comparing them."""
             url = self.upstream_url(self.fork)
+            link = os.path.join(self.tmp, "up-link.git")
+            os.symlink(url, link)
             sh("git", "switch", "-c", "feat/x", cwd=self.fork)
             commit_fork(self.fork, "ours/feature.txt", "ours\n", "ours: a feature")
-            spellings = [url + "/", url + "//", "file://" + url, "file://" + url + "/"]
+            spellings = [url + "/", url + "//", "file://" + url, "file://" + url + "/",
+                         url + "/.", url + "/./", link, "file://localhost" + url,
+                         "../upstream.git", "./../upstream.git"]
             for spelling in spellings:
                 rc, out = self.push(self.fork, spelling, "feat/x:refs/heads/probe")
                 self.assertEqual(rc, 1, "%s: %s" % (spelling, out))

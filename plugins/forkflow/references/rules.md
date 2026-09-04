@@ -29,7 +29,9 @@ develop (trunk) ─────────────────────�
 
 1. **Never push to `upstream`.** Its push URL is set to `DISABLED` and the pre-push hook refuses
    the remote by name *and* by URL - in any spelling, because it normalises both sides before
-   comparing (trailing `/`, `file://`, `user@`, a default port, `.git`, host case). The rule is
+   comparing (trailing `/`, `file://`, `user@`, a default port, `.git`, host case; a local path
+   is canonicalised too, so `..`, a `/.` suffix, a symlink and `file://localhost/...` all fold
+   onto the repository they reach). The rule is
    about the repository, not the remote name: an `origin` whose `pushurl` points at the original
    project is refused by every subcommand (`git config --unset-all remote.origin.pushurl`), the
    same normalisation deciding what "the original project" is.
@@ -80,3 +82,8 @@ Never reset or force-push that branch on the user's behalf.
 tracked and committed, so a sync can bring a `gate` in from upstream: read the diff of
 `.forkflow.toml` in a sync merge request before the next `sync`/`ship` runs it. A dry run never
 executes a gate.
+
+A run whose own merge *changed* the `gate` prints the commands that arrived and does not run them
+(`gate - NOT RUN`), then names `forkflow check` as the way to run them once they have been read -
+so what it shows and what that `check` would run are the same commands. A `gate` the merge left
+alone runs as usual, even when upstream edited some other line of the file.

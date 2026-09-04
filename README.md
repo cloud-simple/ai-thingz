@@ -177,7 +177,9 @@ trunk anywhere. The mistake is impossible, not merely discouraged.
 1. **Never push to `upstream`** - its push URL is set to `DISABLED` and the pre-push hook refuses
    that remote by name *and* by URL, in any spelling: it normalises both sides before comparing,
    so a trailing `/`, a `file://` prefix, a `user@`, a default port, an added or dropped `.git`
-   and a differently-cased host are all the same repository. The rule is about the repository, not
+   and a differently-cased host are all the same repository - and a local path is canonicalised
+   as well, so `../upstream.git`, a `/.` suffix, a symlink to it and `file://localhost/...` reach
+   the repository they name. The rule is about the repository, not
    the remote name: an `origin` whose `pushurl` points at the original project is refused by every
    subcommand.
 2. **Never push the trunk** - only merge requests move `origin/<trunk>`; `push()` and the hook both
@@ -266,9 +268,14 @@ backup_prefix = "backup/"
 `gate` is the one key that is *run* rather than read - `sh -c` in the repo root, on every `check`,
 `sync` and `ship` - and `.forkflow.toml` is a tracked file a sync is designed to bring in from the
 original project. So a sync that changes it says so with a `CHECK` line pointing at
-`git diff HEAD^1 HEAD -- .forkflow.toml`, the run whose own merge brought it prints the gate
-commands instead of obeying them (`gate - NOT RUN`), and a `check` whose gate comes from a file
-upstream also tracks says that out loud. Read the diff before merging such a sync MR.
+`git diff <merge>^1 HEAD -- .forkflow.toml`, a run whose own merge changed the `gate` prints the
+commands that arrived instead of obeying them (`gate - NOT RUN`), and a `check` whose gate comes
+from a file upstream also tracks says that out loud. Read the diff before merging such a sync MR.
+A `gate` the merge left alone still runs: the guard is keyed on the commands, not on the file.
+
+`setup` leaves `.forkflow.toml` untracked, so a sync that brings upstream's copy of it in would
+have to write over it - which git refuses. `sync` says so and names the file before it pushes
+anything, so there is nothing to clean up: remove it, or get it into `origin/<trunk>` first.
 
 The script itself needs only Python 3.9+ and git 2.20+ (the merge simulation wants 2.38+ and is
 skipped with a note on older git). **Reading `.forkflow.toml` needs Python 3.11+** (`tomllib`): a

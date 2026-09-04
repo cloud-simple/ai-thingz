@@ -73,11 +73,14 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    resolution dropped something it should not have, fix it, `git add`, and rerun `--continue`.
 
    `.forkflow.toml` is one of those files, and the run says so with a `CHECK` line of its own when
-   the merge brings it in: it names the branches every safety check depends on and holds `gate`,
-   which forkflow runs with `sh -c`. When it arrived in *this* merge the gate is printed rather
-   than run (`gate - NOT RUN`); read `git diff HEAD^1 HEAD -- .forkflow.toml` with the user, and
-   treat a `gate` that arrived from the original project as untrusted shell until they have said
-   otherwise - it runs on every later `check`, `sync` and `ship`.
+   the merge changes it: it names the branches every safety check depends on and holds `gate`,
+   which forkflow runs with `sh -c`. When *this* merge changed the `gate`, the commands that
+   arrived are printed rather than run (`gate - NOT RUN`) - what is shown is exactly what the
+   `forkflow check` the message names would run. Read the `git diff <merge>^1 HEAD --
+   .forkflow.toml` line the run prints with the user, and treat a `gate` that arrived from the
+   original project as untrusted shell until they have said otherwise - it runs on every later
+   `check`, `sync` and `ship`. A `gate` the merge left alone runs as usual, even when upstream
+   edited another line of the file.
 
 5. **Merge request.** The script prints the command; run it in the same invocation with `--mr`
    (add `--title` to override the default `sync: <upstream>/<branch> <date> (n commits)`). The
@@ -106,7 +109,7 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
 | exit | what happened | what to do |
 |---|---|---|
 | 0 | done, dry run, or "already in sync" | nothing; the mirror may still have been advanced and pushed |
-| 2 | precondition: dirty tree, detached HEAD, sync branch already exists locally or on origin, mirror checked out in another worktree, mirror diverged, untracked file blocking the mirror fast-forward | fix what the message names; `--force` recreates an existing sync branch, and that is the only thing `--force` does here - when that name is already on origin the rerun publishes the next free `<name>-N` instead (a sync branch is never force-pushed), and the stale merge request is closed by hand |
+| 2 | precondition: dirty tree, detached HEAD, sync branch already exists locally or on origin, mirror checked out in another worktree, mirror diverged, untracked file blocking the mirror fast-forward, untracked file the merge would write over (`setup` leaves `.forkflow.toml` untracked, and an upstream that uses forkflow tracks it - commit or remove it; nothing was pushed) | fix what the message names; `--force` recreates an existing sync branch, and that is the only thing `--force` does here - when that name is already on origin the rerun publishes the next free `<name>-N` instead (a sync branch is never force-pushed), and the stale merge request is closed by hand |
 | 3 | `check` failed after the merge - a `gate` command, or `origin/<trunk>` moved under the branch | read the hint the run printed: a failing gate is fixed with a commit on the sync branch and `sync --continue` (the resume picks up the merge commit, wherever it now sits in the branch); a trunk that moved on means the sync is redone against the new tip with `sync --force` - a sync MR is never rebased |
 | 4 | merge conflicts | resolve, `git add`, `sync --continue` |
 | 5 | rewrite safety: the backup was not confirmed on origin, or a push was rejected | do not work around it; report it - a rejected mirror push usually means the mirror is not a pure copy of upstream |

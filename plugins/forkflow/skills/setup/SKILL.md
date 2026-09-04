@@ -75,7 +75,9 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before running it.
 5. **Explain the hook.** It is `pre-push` in this clone's hooks directory and it refuses:
    any push to the upstream remote (matched by name **and** by URL - both sides normalised, so a
    trailing `/`, a `file://` prefix, a `user@`, a default port, an added or dropped `.git` and a
-   differently-cased host are all refused as the same repository); any push of the trunk, deletion
+   differently-cased host are all refused as the same repository, and a local path is
+   canonicalised too, so `../upstream.git`, a `/.` suffix, a symlink and `file://localhost/...`
+   are refused as well); any push of the trunk, deletion
    included; deletion of the mirror; and any mirror push that is not an ancestor of the
    last-fetched upstream ref. Everything else, including deleting stale `sync/*` branches, is
    allowed. Say clearly that the mirror check validates against the **last fetch** of upstream -
@@ -90,7 +92,10 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before running it.
 6. **`.forkflow.toml`.** The template is written commented-out and left **untracked**; tell the
    user to commit it once the branch names and the `gate` list are right, so everyone in the fork
    shares them. Reading it needs Python 3.11+ (`tomllib`); a config that is present but unreadable
-   is exit 2 for every subcommand - it carries the safety-critical branch names.
+   is exit 2 for every subcommand - it carries the safety-critical branch names. Committing it
+   also matters when the upstream project uses forkflow itself: git refuses a merge that would
+   write over an untracked file, so a `sync` bringing upstream's `.forkflow.toml` in stops (exit
+   2, nothing pushed) until the template is committed or removed.
 
 7. **Report** what changed in the clone (push URL, hook, config keys, any branch created), what
    was only reported (the platform findings and their fix commands), and what is left for the
