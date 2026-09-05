@@ -83,7 +83,9 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    edited another line of the file.
 
 5. **Merge request.** The script prints the command; run it in the same invocation with `--mr`
-   (add `--title` to override the default `sync: <upstream>/<branch> <date> (n commits)`). The
+   (add `--title` to override the default `sync: <upstream>/<branch> <date> (n commits)`). It
+   carries `--repo <the fork's URL>`: hand it over exactly as printed, never trimmed - without
+   that flag both tools open the merge request on the original project (`rules.md`). The
    body it composes carries the upstream commits, the both-sides rows, the mirror advance, the
    backup name with its rollback line, and the merge-button note. If the tool is missing or fails,
    the command and its stderr are printed and the exit stays 0 - the branch is pushed, only the MR
