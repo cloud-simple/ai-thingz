@@ -389,6 +389,38 @@ def canonical_path(path: str, base: Optional[str] = None) -> str:
     return path
 
 
+def split_remote(url: str) -> Tuple[str, str, str]:
+    """(scheme, authority, path) of a git URL - one parser for both readers of one.
+
+    `https://git@host:443/o/r.git`, `ssh://host:22/o/r` and the scp-like `git@host:o/r.git`
+    all split the same way: the authority is the host as written, without a `user@` and
+    without a port its scheme implies. It is "" when the URL names no host at all - a local
+    path, however it is spelled, `file://localhost/p` included - and the path is then the
+    whole URL. `repo_id` folds what this returns into one comparable id; `forge_path` reads
+    the project out of it."""
+    u = (url or "").strip().rstrip("/")
+    scheme, host = "", False
+    if "://" in u:
+        scheme, _, u = u.partition("://")
+        scheme, host = scheme.lower(), True
+    elif ":" in u and "/" not in u.split(":", 1)[0]:      # scp-like [user@]host:path
+        head, _, path = u.partition(":")
+        u, scheme, host = head + "/" + path.lstrip("/"), "ssh", True
+    if not host:
+        return "", "", u
+    first, sep, rest = u.partition("/")
+    authority = first.split("@")[-1]                      # a `user@` names no repository
+    name, _, port = authority.rpartition(":")
+    if name and port.isdigit() and port == DEFAULT_PORTS.get(scheme, ""):
+        authority = name                                  # `host:443` under https is `host`
+    # RFC 3986 §3.2.2: a host is case-insensitive and may carry a root-label dot, and git
+    # accepts every one of these spellings - `file://LOCALHOST/p` really did reach the
+    # original project while this compared the authority as it was written
+    if scheme == "file" and authority.lower() in ("localhost", "localhost."):
+        authority = ""                                    # `file://localhost/p` is the path
+    return scheme, authority, sep + rest
+
+
 def repo_id(url: str, base: Optional[str] = None) -> str:
     """`host/path` of a git URL, so two spellings of one repository compare equal.
 
@@ -402,29 +434,35 @@ def repo_id(url: str, base: Optional[str] = None) -> str:
 
     The generated hook's `ff_repo_id` applies the same rules, so what this script refuses and
     what the hook refuses are the same set of URLs."""
-    u = (url or "").strip().rstrip("/")
-    scheme, host, authority = "", False, ""
-    if "://" in u:
-        scheme, _, u = u.partition("://")
-        scheme, host = scheme.lower(), True
-    elif ":" in u and "/" not in u.split(":", 1)[0]:      # scp-like [user@]host:path
-        head, _, path = u.partition(":")
-        u, scheme, host = head + "/" + path.lstrip("/"), "ssh", True
-    if host:
-        first, sep, rest = u.partition("/")
-        authority = first.split("@")[-1]                  # a `user@` names no repository
-        name, _, port = authority.rpartition(":")
-        if name and port.isdigit() and port == DEFAULT_PORTS.get(scheme, ""):
-            authority = name                              # `host:443` under https is `host`
-        # RFC 3986 §3.2.2: a host is case-insensitive and may carry a root-label dot, and git
-        # accepts every one of these spellings - `file://LOCALHOST/p` really did reach the
-        # original project while this compared the authority as it was written
-        if scheme == "file" and authority.lower() in ("localhost", "localhost."):
-            authority = ""                                # `file://localhost/p` is the path
-        u = (authority + sep + rest).lower() if authority else sep + rest
+    _, authority, path = split_remote(url)
     if not authority:                                     # a local path, however it is spelled
-        u = canonical_path(u, base)
+        u = canonical_path(path, base)
+    else:
+        u = (authority + path).lower()
     return u[:-4] if u.endswith(".git") else u
+
+
+def forge_path(url: str) -> str:
+    """The project a hosted URL names - `owner/repo`, or a GitLab `group/subgroup/project`
+    with every segment kept - as it is spelled; "" when the URL names no such project.
+
+    The platform report builds every path it reads or prints out of this, rather than out of
+    gh's `{owner}/{repo}` or glab's `:fullpath`. Those two are resolved by the tool from the
+    repository it is run in, and both answer with the remote named `upstream` when there is
+    one - the original project, which `setup` itself adds. A fix command carrying them reads
+    upstream's settings and, pasted by somebody who has admin there too, writes them: rule 1
+    undone by this tool's own advice.
+
+    The spelling is kept rather than folded the way `repo_id` folds it: a repository
+    addressed in the wrong case answers a GET with a redirect, and a redirect is not followed
+    for the PATCH and PUT these commands are."""
+    _, authority, path = split_remote(url)
+    parts = [p for p in path.split("/") if p]
+    if parts and parts[-1].endswith(".git"):
+        parts[-1] = parts[-1][:-4]
+    if not authority or len(parts) < 2 or not all(parts):
+        return ""                                         # no host, or no project under it
+    return "/".join(parts)
 
 
 def origin_pushes_to_upstream(root: str, origin: str, upstream: str) -> Optional[str]:
@@ -3055,9 +3093,11 @@ def gitlab_push_access(data: dict) -> Optional[bool]:
     return any(level > 0 for level in found)
 
 
-def gitlab_protection(ctx: Ctx, role: str, branch: str) -> None:
+def gitlab_protection(ctx: Ctx, base: str, role: str, branch: str) -> None:
+    """`base` is the fork's own project path, `projects/<encoded full path>` - never
+    `:fullpath`, which glab resolves to the original project (see `forge_path`)."""
     # the name is one path segment: `release/1.0` unencoded would address another endpoint
-    path = f"projects/:fullpath/protected_branches/{urllib.parse.quote(branch, safe='')}"
+    path = f"{base}/protected_branches/{urllib.parse.quote(branch, safe='')}"
     reply = api_get(ctx, "glab", path)
     if reply.ok():
         force = bool(reply.data.get("allow_force_push"))
@@ -3071,30 +3111,31 @@ def gitlab_protection(ctx: Ctx, role: str, branch: str) -> None:
         return
     # every name reaches a shell the user is told to paste: `git check-ref-format` allows `;`,
     # a backtick and `$(`, and these names come from a tracked file a sync can bring in
-    protect = (f"glab api --method POST projects/:fullpath/protected_branches "
+    protect = (f"glab api --method POST {sh_arg(base)}/protected_branches "
                f"-f name={sh_quote(branch)} -F push_access_level=0 -F merge_access_level=40 "
                f"-F allow_force_push=false")
     if force is None:
         fix_cmd(protect)
         return
     if force:
-        fix_cmd(f"glab api --method PATCH {path} -F allow_force_push=false")
+        fix_cmd(f"glab api --method PATCH {sh_arg(path)} -F allow_force_push=false")
     if direct and role == "trunk":
         finding("who may push can only be changed by recreating the rule (GitLab's PATCH takes "
                 "`allowed_to_push` entries by id, not a level): this deletes it and creates it "
                 "again, with merge requests merged by Maintainers")
-        fix_cmd(f"glab api --method DELETE {path} && {protect}")
+        fix_cmd(f"glab api --method DELETE {sh_arg(path)} && {protect}")
 
 
-def gitlab_report(ctx: Ctx) -> None:
-    path = "projects/:fullpath"
+def gitlab_report(ctx: Ctx, project: str) -> None:
+    # the whole path is one id: a subgroup's `/` is part of the project's name here
+    path = "projects/" + urllib.parse.quote(project, safe="")
     reply = api_get(ctx, "glab", path)
     if not reply.ok():
-        step("platform", f"glab api {path}", reply.note)
+        step("platform", f"glab api {sh_arg(path)}", reply.note)
         return
     default = str(reply.data.get("default_branch") or "-")
     method = str(reply.data.get("merge_method") or "-")
-    step("platform", f"glab api {path}",
+    step("platform", f"glab api {sh_arg(path)}",
          f"read-only: default_branch={default}  merge_method={method}")
     fixes = []
     if default_branch_finding(ctx, default):
@@ -3106,9 +3147,9 @@ def gitlab_report(ctx: Ctx) -> None:
                 f"in whole, its tip being the merge commit")
         fixes.append("-f merge_method=ff")
     if fixes:
-        fix_cmd(f"glab api --method PUT {path} " + " ".join(fixes))
-    gitlab_protection(ctx, "trunk", ctx.trunk)
-    gitlab_protection(ctx, "mirror", ctx.mirror)
+        fix_cmd(f"glab api --method PUT {sh_arg(path)} " + " ".join(fixes))
+    gitlab_protection(ctx, path, "trunk", ctx.trunk)
+    gitlab_protection(ctx, path, "mirror", ctx.mirror)
 
 
 def names(items: object, *keys: str) -> list:
@@ -3222,11 +3263,10 @@ def github_direct_push(data: dict) -> Tuple[bool, str]:
     return (False, "")
 
 
-def github_protection(ctx: Ctx, role: str, branch: str) -> None:
-    # concatenated, not an f-string: `{owner}`/`{repo}` are gh's own placeholders, which an
-    # f-string would read as fields of its own
-    path = ("repos/{owner}/{repo}/branches/"
-            + urllib.parse.quote(branch, safe="") + "/protection")
+def github_protection(ctx: Ctx, base: str, role: str, branch: str) -> None:
+    """`base` is the fork's own `repos/<owner>/<repo>` - never gh's `{owner}/{repo}`, which
+    gh resolves to the original project (see `forge_path`)."""
+    path = f"{base}/branches/" + urllib.parse.quote(branch, safe="") + "/protection"
     reply = api_get(ctx, "gh", path)
     why = ""
     if reply.ok():
@@ -3246,24 +3286,24 @@ def github_protection(ctx: Ctx, role: str, branch: str) -> None:
         # required - without the latter a protected branch still takes a direct push from
         # anyone with write access, which is rule 2
         body = github_protection_body({"enforce_admins": True}, require_pr=True)
-        fix_cmd(f"echo {sh_quote(body)} | gh api -X PUT {path} --input -")
+        fix_cmd(f"echo {sh_quote(body)} | gh api -X PUT {sh_arg(path)} --input -")
         return
     finding("the PUT below replaces the whole protection object: it carries over the "
             "settings the read above returned - check them before you run it")
     body = github_protection_body(reply.data, require_pr=bool(direct) and role == "trunk")
-    fix_cmd(f"echo {sh_quote(body)} | gh api -X PUT {path} --input -")
+    fix_cmd(f"echo {sh_quote(body)} | gh api -X PUT {sh_arg(path)} --input -")
 
 
-def github_report(ctx: Ctx) -> None:
-    path = "repos/{owner}/{repo}"
+def github_report(ctx: Ctx, project: str) -> None:
+    path = "repos/" + "/".join(urllib.parse.quote(p, safe="") for p in project.split("/"))
     reply = api_get(ctx, "gh", path)
     if not reply.ok():
-        step("platform", f"gh api {path}", reply.note)
+        step("platform", f"gh api {sh_arg(path)}", reply.note)
         return
     default = str(reply.data.get("default_branch") or "-")
     merge_commit = bool(reply.data.get("allow_merge_commit"))
     rebase = bool(reply.data.get("allow_rebase_merge"))
-    step("platform", f"gh api {path}",
+    step("platform", f"gh api {sh_arg(path)}",
          f"read-only: default_branch={default}  allow_merge_commit={str(merge_commit).lower()}"
          f"  allow_rebase_merge={str(rebase).lower()}")
     fixes = []
@@ -3281,21 +3321,27 @@ def github_report(ctx: Ctx) -> None:
         finding("rebase merges: NOT allowed - a ship MR is merged with `Rebase and merge`")
         fixes.append("-F allow_rebase_merge=true")
     if fixes:
-        fix_cmd(f"gh api -X PATCH {path} " + " ".join(fixes))
-    github_protection(ctx, "trunk", ctx.trunk)
-    github_protection(ctx, "mirror", ctx.mirror)
+        fix_cmd(f"gh api -X PATCH {sh_arg(path)} " + " ".join(fixes))
+    github_protection(ctx, path, "trunk", ctx.trunk)
+    github_protection(ctx, path, "mirror", ctx.mirror)
 
 
 def platform_report(ctx: Ctx) -> None:
     """What the hosting platform has to say - reported, never changed. Runs in a dry run too:
-    every call is a GET."""
-    if ctx.platform == "gitlab":
-        gitlab_report(ctx)
-    elif ctx.platform == "github":
-        github_report(ctx)
+    every call is a GET.
+
+    Every path is built from the origin URL: the placeholders the two tools expand themselves
+    name the original project in a fork that has an upstream remote (see `forge_path`)."""
+    project = forge_path(ctx.origin_url)
+    if ctx.platform == "gitlab" and project:
+        gitlab_report(ctx, project)
+    elif ctx.platform == "github" and project.count("/") == 1:   # `owner/repo`, and no more
+        github_report(ctx, project)
     else:
+        why = ("unknown host" if ctx.platform == "unknown" else
+               f"{ctx.platform}, but `{ctx.origin_url}` names no project there")
         step("platform", f"# origin {ctx.origin_url or '-'}",
-             f"unknown host - check yourself that the default branch is `{ctx.trunk}`, that "
+             f"{why} - check yourself that the default branch is `{ctx.trunk}`, that "
              f"merge requests into it fast-forward, and that it is protected")
 
 
@@ -3718,6 +3764,45 @@ def run_tests() -> None:
             self.assertEqual(detect_platform("/tmp/x/origin.git"), "unknown")
             self.assertEqual(detect_platform("https://git.example.org/x.git"), "unknown")
             self.assertEqual(detect_platform(""), "unknown")
+
+    class TestForgePath(unittest.TestCase):
+        """Which project the platform report addresses.
+
+        gh's `{owner}/{repo}` and glab's `:fullpath` are resolved by the tool from the
+        repository it is run in, and both answer with the remote named `upstream` when there
+        is one - the original project, which `setup` itself adds. The fork's own project has
+        to come out of its origin URL instead."""
+
+        def test_every_spelling_of_one_fork_names_the_same_project(self):
+            for url in ("git@github.com:acme/widget.git",
+                        "https://github.com/acme/widget",
+                        "https://git@github.com/acme/widget.git",
+                        "ssh://git@github.com:22/acme/widget.git",
+                        "https://github.com:443/acme/widget/"):
+                self.assertEqual(forge_path(url), "acme/widget", url)
+
+        def test_a_subgroup_keeps_every_segment(self):
+            """A self-hosted GitLab project lives under any number of groups: dropping one
+            addresses a different project, or none."""
+            self.assertEqual(forge_path("git@gitlab.example.com:group/sub/proj.git"),
+                             "group/sub/proj")
+            self.assertEqual(forge_path("https://gitlab.example.com/g/s/deep/proj.git"),
+                             "g/s/deep/proj")
+
+        def test_the_spelling_is_kept(self):
+            """`repo_id` folds the case to decide whether two URLs are one repository; this
+            is pasted into a command instead. GitHub answers a differently-cased repository
+            with a redirect, and a PATCH or a PUT does not follow one."""
+            self.assertEqual(forge_path("git@github.com:Acme/Widget.git"), "Acme/Widget")
+            self.assertEqual(forge_path("https://GitHub.com/Acme/Widget"), "Acme/Widget")
+
+        def test_a_url_that_names_no_project_gives_nothing(self):
+            """Nothing is better than a guess: the report says so and prints no command."""
+            for url in ("", "/tmp/x/origin.git", "file:///srv/repo.git",
+                        "file://localhost/srv/repo.git", "../repo.git",
+                        "https://github.com/", "git@github.com:", "https://github.com/owner",
+                        "git@github.com:owner/.git"):
+                self.assertEqual(forge_path(url), "", url)
 
     class TestGitVersion(unittest.TestCase):
         def test_parse(self):
@@ -7412,6 +7497,14 @@ def run_tests() -> None:
     # setup: the platform report - fake `glab`/`gh`, no network, no real tool
     # ------------------------------------------------------------------- #
 
+    # the fork's own origin URL - a subgroup on GitLab, so every path in these tests carries
+    # one - and the project path the report has to build out of it. Neither tool's own
+    # placeholder appears: both expand it to the original project (see `forge_path`)
+    GL_ORIGIN = "git@gitlab.example.com:acme/team/widget.git"
+    GL_PROJECT = "projects/acme%2Fteam%2Fwidget"
+    GH_ORIGIN = "https://github.com/acme/widget.git"
+    GH_PROJECT = "repos/acme/widget"
+
     # (stdout or stderr, exit code) of one faked API call
     GL_OK = ('{"default_branch":"develop","merge_method":"ff"}', 0)
     GH_OK = ('{"default_branch":"develop","allow_merge_commit":true,'
@@ -7489,7 +7582,7 @@ def run_tests() -> None:
             self.api_tool("glab", [
                 ("*protected_branches/develop", trunk[0], trunk[1]),
                 ("*protected_branches/main", mirror[0], mirror[1]),
-                ("projects/:fullpath", project[0], project[1]),
+                ("projects/*", project[0], project[1]),
             ])
 
         def github_tool(self, repo=GH_OK, trunk=GH_PROTECTED, mirror=GH_PROTECTED) -> None:
@@ -7503,9 +7596,15 @@ def run_tests() -> None:
             with open(self.log) as fh:
                 return [ln.rstrip("\n") for ln in fh]
 
-        def report(self, platform: str) -> str:
+        def report(self, platform: str, origin: Optional[str] = None) -> str:
+            """The report for a fork whose origin really is a hosted one: the paths it prints
+            are built from that URL, so a Ctx without one proves nothing."""
             ctx = ctx_for(make_fork(self.tmp))
             ctx.platform = platform
+            if origin is not None:
+                ctx.origin_url = origin
+            elif platform in ("gitlab", "github"):
+                ctx.origin_url = GL_ORIGIN if platform == "gitlab" else GH_ORIGIN
             _, out, err = capture(platform_report, ctx)
             self.assertEqual(err, "")
             return out
@@ -7534,8 +7633,8 @@ def run_tests() -> None:
             # the mirror is pushed by `sync` itself: it must stay directly pushable
             self.assertIn("mirror `main`: protected, force-push disallowed: ok", out)
             self.assertEqual(self.fixes(out), [
-                "glab api --method DELETE projects/:fullpath/protected_branches/develop && "
-                "glab api --method POST projects/:fullpath/protected_branches "
+                "glab api --method DELETE projects/acme%2Fteam%2Fwidget/protected_branches/develop && "
+                "glab api --method POST projects/acme%2Fteam%2Fwidget/protected_branches "
                 "-f name='develop' -F push_access_level=0 -F merge_access_level=40 "
                 "-F allow_force_push=false"])
 
@@ -7552,6 +7651,7 @@ def run_tests() -> None:
             self.gitlab_tool(project=('{"default_branch":"main","merge_method":"ff"}', 0),
                              trunk=UNPROTECTED, mirror=UNPROTECTED)
             ctx = ctx_for(make_fork(self.tmp))
+            ctx.origin_url = GL_ORIGIN
             ctx.platform, ctx.trunk = "gitlab", "dev;touch /tmp/pwned"
             _, out, _ = capture(platform_report, ctx)
             self.assertTrue(self.fixes(out))
@@ -7563,9 +7663,9 @@ def run_tests() -> None:
             self.gitlab_tool()
             self.report("gitlab")
             self.assertEqual(self.argv(), [
-                "api", "projects/:fullpath",
-                "api", "projects/:fullpath/protected_branches/develop",
-                "api", "projects/:fullpath/protected_branches/main"])
+                "api", "projects/acme%2Fteam%2Fwidget",
+                "api", "projects/acme%2Fteam%2Fwidget/protected_branches/develop",
+                "api", "projects/acme%2Fteam%2Fwidget/protected_branches/main"])
 
         def test_a_wrong_default_branch_and_merge_method_share_one_fix(self):
             self.gitlab_tool(project=('{"default_branch":"main","merge_method":"merge"}', 0))
@@ -7573,7 +7673,7 @@ def run_tests() -> None:
             self.assertIn("default branch: `main` - it must be the trunk `develop`", out)
             self.assertIn("merge method: `merge` -", out)
             self.assertEqual(self.fixes(out), [
-                "glab api --method PUT projects/:fullpath "
+                "glab api --method PUT projects/acme%2Fteam%2Fwidget "
                 "-f default_branch='develop' -f merge_method=ff"])
 
         def test_an_unprotected_trunk_gets_a_post_and_the_mirror_only_advice(self):
@@ -7582,7 +7682,7 @@ def run_tests() -> None:
             self.assertIn("trunk `develop`: NOT protected", out)
             self.assertIn("mirror `main`: not protected (advisory", out)
             self.assertEqual(self.fixes(out), [
-                "glab api --method POST projects/:fullpath/protected_branches "
+                "glab api --method POST projects/acme%2Fteam%2Fwidget/protected_branches "
                 "-f name='develop' -F push_access_level=0 -F merge_access_level=40 "
                 "-F allow_force_push=false"])
 
@@ -7592,9 +7692,9 @@ def run_tests() -> None:
             self.assertIn("trunk `develop`: protected, but force-push is ALLOWED", out)
             self.assertIn("mirror `main`: protected, but force-push is ALLOWED", out)
             self.assertEqual(self.fixes(out), [
-                "glab api --method PATCH projects/:fullpath/protected_branches/develop "
+                "glab api --method PATCH projects/acme%2Fteam%2Fwidget/protected_branches/develop "
                 "-F allow_force_push=false",
-                "glab api --method PATCH projects/:fullpath/protected_branches/main "
+                "glab api --method PATCH projects/acme%2Fteam%2Fwidget/protected_branches/main "
                 "-F allow_force_push=false"])
 
         def test_output_that_is_not_json_is_not_checked(self):
@@ -7620,11 +7720,11 @@ def run_tests() -> None:
             out = self.report("gitlab")
             self.assertIn("not checked (HTTP 500)", out)
             self.assertNotIn("trunk `develop`", out)
-            self.assertEqual(self.argv(), ["api", "projects/:fullpath"])
+            self.assertEqual(self.argv(), ["api", "projects/acme%2Fteam%2Fwidget"])
 
         def test_a_missing_tool_is_not_checked(self):
             ctx = ctx_for(make_fork(self.tmp))
-            ctx.platform = "gitlab"
+            ctx.origin_url, ctx.platform = GL_ORIGIN, "gitlab"
             missing = FileNotFoundError(2, "No such file or directory")
             with mock.patch.object(subprocess, "run", side_effect=missing):
                 _, out, _ = capture(platform_report, ctx)
@@ -7642,9 +7742,9 @@ def run_tests() -> None:
                           "direct push blocked: ok", out)
             self.assertEqual(self.fixes(out), [])
             self.assertEqual(self.argv(), [
-                "api", "repos/{owner}/{repo}",
-                "api", "repos/{owner}/{repo}/branches/develop/protection",
-                "api", "repos/{owner}/{repo}/branches/main/protection"])
+                "api", "repos/acme/widget",
+                "api", "repos/acme/widget/branches/develop/protection",
+                "api", "repos/acme/widget/branches/main/protection"])
 
         def test_disabled_merge_options_are_fixed_together_with_the_default_branch(self):
             self.github_tool(repo=('{"default_branch":"main","allow_merge_commit":false,'
@@ -7653,7 +7753,7 @@ def run_tests() -> None:
             self.assertIn("merge commits: NOT allowed", out)
             self.assertIn("rebase merges: NOT allowed", out)
             self.assertEqual(self.fixes(out), [
-                "gh api -X PATCH repos/{owner}/{repo} -f default_branch='develop' "
+                "gh api -X PATCH repos/acme/widget -f default_branch='develop' "
                 "-F allow_merge_commit=true -F allow_rebase_merge=true"])
 
         def test_an_unprotected_trunk_gets_the_put_and_the_mirror_only_advice(self):
@@ -7664,7 +7764,7 @@ def run_tests() -> None:
             body = github_protection_body({"enforce_admins": True}, require_pr=True)
             self.assertEqual(self.fixes(out), [
                 "echo '%s' | gh api -X PUT "
-                "repos/{owner}/{repo}/branches/develop/protection --input -" % body])
+                "repos/acme/widget/branches/develop/protection --input -" % body])
             # the body the fix pastes, pinned against the output rather than against the
             # function that built it: force-push off, admins included, and a required review
             self.assertIn('"allow_force_pushes":false', out)
@@ -7782,10 +7882,123 @@ def run_tests() -> None:
             self.assertIn("trunk `develop`: not checked (insufficient rights)", out)
             self.assertEqual(self.fixes(out), [])
 
+    class TestPlatformPathsNameTheFork(PlatformBase):
+        """The one thing a fake `gh`/`glab` cannot show: what a placeholder means to the real
+        tool. `{owner}/{repo}` and `:fullpath` are the *base* repository, and in a fork with
+        an `upstream` remote - the remote `setup` itself adds - that is the original project.
+        A fix command carrying one reads upstream's settings and, pasted by somebody who is a
+        Maintainer there too, writes them: rule 1, undone by this tool's own advice.
+
+        So every assertion here is about the fork's own `owner/repo`, and about neither
+        placeholder surviving anywhere in the output."""
+
+        def printed(self, out: str) -> list:
+            """Every command the report offers: the `$ ...` it ran, and each `fix:`."""
+            ran = [ln.split("  $ ", 1)[1].split("  -> ")[0]
+                   for ln in out.splitlines() if "  $ " in ln]
+            return ran + self.fixes(out)
+
+        def assert_names_the_fork(self, out: str, project: str) -> None:
+            cmds = self.printed(out)
+            self.assertTrue(cmds, "no command printed at all")
+            self.assertTrue(self.fixes(out), "no fix command printed")
+            for cmd in cmds:
+                self.assertIn(project, cmd)
+                for placeholder in ("{owner}", "{repo}", ":fullpath"):
+                    self.assertNotIn(placeholder, cmd)
+
+        def test_github_ssh_origin_reads_and_fixes_the_forks_own_repo(self):
+            self.github_tool(repo=('{"default_branch":"main","allow_merge_commit":false,'
+                                   '"allow_rebase_merge":true}', 0),
+                             trunk=UNPROTECTED, mirror=UNPROTECTED)
+            out = self.report("github", origin="git@github.com:acme/widget.git")
+            self.assert_names_the_fork(out, "repos/acme/widget")
+            self.assertIn("gh api -X PATCH repos/acme/widget -f default_branch=", out)
+            self.assertIn("gh api -X PUT repos/acme/widget/branches/develop/protection", out)
+            # and the reads the findings came from went to the fork as well
+            self.assertEqual(self.argv(), [
+                "api", "repos/acme/widget",
+                "api", "repos/acme/widget/branches/develop/protection",
+                "api", "repos/acme/widget/branches/main/protection"])
+
+        def test_github_https_origin_names_the_same_repo(self):
+            self.github_tool(repo=('{"default_branch":"main","allow_merge_commit":true,'
+                                   '"allow_rebase_merge":true}', 0),
+                             trunk=UNPROTECTED, mirror=UNPROTECTED)
+            out = self.report("github", origin="https://github.com/acme/widget.git")
+            self.assert_names_the_fork(out, "repos/acme/widget")
+
+        def test_the_repository_is_addressed_as_the_origin_spells_it(self):
+            """A GET of a differently-cased repository is answered with a redirect, which the
+            PATCH and PUT below do not follow."""
+            self.github_tool(repo=('{"default_branch":"main","allow_merge_commit":true,'
+                                   '"allow_rebase_merge":true}', 0),
+                             trunk=UNPROTECTED, mirror=UNPROTECTED)
+            out = self.report("github", origin="git@github.com:Acme/Widget.git")
+            self.assert_names_the_fork(out, "repos/Acme/Widget")
+
+        def test_gitlab_addresses_the_fork_with_every_subgroup_kept(self):
+            """`projects/:id` takes one url-encoded full path: every segment of it belongs,
+            and a `/` inside it has to be encoded or it addresses another endpoint."""
+            self.gitlab_tool(project=('{"default_branch":"main","merge_method":"merge"}', 0),
+                             trunk=UNPROTECTED, mirror=UNPROTECTED)
+            out = self.report("gitlab", origin="git@gitlab.example.com:acme/team/widget.git")
+            self.assert_names_the_fork(out, "projects/acme%2Fteam%2Fwidget")
+            self.assertIn("glab api --method PUT projects/acme%2Fteam%2Fwidget ", out)
+            self.assertEqual(self.argv(), [
+                "api", "projects/acme%2Fteam%2Fwidget",
+                "api", "projects/acme%2Fteam%2Fwidget/protected_branches/develop",
+                "api", "projects/acme%2Fteam%2Fwidget/protected_branches/main"])
+
+        def test_gitlab_https_origin_names_the_same_project(self):
+            self.gitlab_tool(project=('{"default_branch":"main","merge_method":"merge"}', 0),
+                             trunk=UNPROTECTED, mirror=UNPROTECTED)
+            out = self.report("gitlab",
+                              origin="https://gitlab.example.com/acme/team/widget.git")
+            self.assert_names_the_fork(out, "projects/acme%2Fteam%2Fwidget")
+
+        def test_it_is_the_origin_url_that_is_read_and_never_the_upstream_one(self):
+            """The fork, not the project it was forked from - which is what both tools would
+            have answered with, and the whole point of building the path here."""
+            self.github_tool(repo=('{"default_branch":"main","allow_merge_commit":true,'
+                                   '"allow_rebase_merge":true}', 0),
+                             trunk=UNPROTECTED, mirror=UNPROTECTED)
+            ctx = ctx_for(make_fork(self.tmp))
+            ctx.platform = "github"
+            ctx.origin_url = "git@github.com:acme/widget.git"
+            ctx.upstream_url = "https://github.com/original/widget.git"
+            _, out, err = capture(platform_report, ctx)
+            self.assertEqual(err, "")
+            self.assert_names_the_fork(out, "repos/acme/widget")
+            self.assertNotIn("original/widget", out)
+
+        def test_an_origin_that_names_no_project_prints_no_command_at_all(self):
+            """Where the placeholder used to stand there is now nothing to put: the report
+            says what it could not address and asks for the check to be done by hand, rather
+            than printing a command that would reach some other repository."""
+            self.gitlab_tool()
+            out = self.report("gitlab", origin="/srv/mirrors/widget.git")
+            self.assertIn("gitlab, but `/srv/mirrors/widget.git` names no project there", out)
+            self.assertIn("check yourself that the default branch is `develop`", out)
+            self.assertEqual(self.fixes(out), [])
+            self.assertFalse(os.path.exists(self.log))     # and nothing was even read
+
+        def test_a_github_url_with_more_than_owner_and_repo_is_not_guessed_at(self):
+            """`repos/` takes exactly two segments; a third would address an endpoint of its
+            own, so the report leaves it to the user instead."""
+            self.github_tool()
+            out = self.report("github", origin="https://github.com/acme/team/widget.git")
+            self.assertIn("names no project there", out)
+            self.assertEqual(self.fixes(out), [])
+            self.assertFalse(os.path.exists(self.log))
+
     class TestPlatformReportInSetup(PlatformBase):
         def as_gitlab(self):
-            return mock.patch.object(sys.modules[__name__], "detect_platform",
-                                     lambda url: "gitlab")
+            """The fork under test pushes to a local origin: pretend it is a GitLab one, both
+            for the host and for the project path the report builds out of it."""
+            return mock.patch.multiple(sys.modules[__name__],
+                                       detect_platform=lambda url: "gitlab",
+                                       forge_path=lambda url: "acme/team/widget")
 
         def test_an_unknown_host_says_check_it_yourself(self):
             out = self.report("unknown")
@@ -7813,9 +8026,9 @@ def run_tests() -> None:
             self.assertIn("trunk `develop`: protected, force-push disallowed, "
                           "direct push blocked: ok", out)
             self.assertEqual(self.argv(), [
-                "api", "projects/:fullpath",
-                "api", "projects/:fullpath/protected_branches/develop",
-                "api", "projects/:fullpath/protected_branches/main"])
+                "api", "projects/acme%2Fteam%2Fwidget",
+                "api", "projects/acme%2Fteam%2Fwidget/protected_branches/develop",
+                "api", "projects/acme%2Fteam%2Fwidget/protected_branches/main"])
 
     # ------------------------------------------------------------------- #
     # merge requests

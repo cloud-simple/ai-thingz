@@ -69,6 +69,14 @@ Server-side settings - default branch, merge method / merge options, branch prot
 project-wide. `forkflow setup` reports them and prints the exact command to fix each mismatch; it
 never changes them itself. A Maintainer runs the command.
 
+Every one of those commands names the fork's own project - `repos/<owner>/<repo>` for `gh`,
+`projects/<group%2Fsubgroup%2Fproject>` for `glab` - and never gh's `{owner}/{repo}` or glab's
+`:fullpath`. Those two placeholders are resolved by the tool from the repository it is run in, and
+both answer with the remote named `upstream` when there is one - which in a forkflow fork is always
+the original project. A command carrying one would read upstream's settings and, run by somebody
+who is a Maintainer there too, write them: rule 1, undone by a pasted fix. Do not "simplify" a
+printed command back to a placeholder.
+
 ## What is never automated
 
 A fork whose mirror branch already carries its own work is a migration, not a setup: it rewrites

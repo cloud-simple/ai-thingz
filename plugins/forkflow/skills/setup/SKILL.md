@@ -57,7 +57,10 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before running it.
 
 4. **Walk through the platform report.** It is read-only and each finding that needs action is
    followed by an exact `fix:` command. Show the user the findings and the commands; a Maintainer
-   runs them (or does it in the web UI). Do not run them yourself unless the user asks.
+   runs them (or does it in the web UI). Do not run them yourself unless the user asks. Pass each
+   command on **exactly as printed**: it names the fork's own project path, because gh's
+   `{owner}/{repo}` and glab's `:fullpath` both resolve to the remote named `upstream` - the
+   original project - in a fork that has one.
 
    | expectation | why |
    |---|---|
