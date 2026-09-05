@@ -1239,14 +1239,52 @@ def merge_button(ctx: Ctx, kind: str) -> str:
     return "merge it fast-forward"
 
 
+def mr_target(ctx: Ctx) -> Tuple[str, str]:
+    """(the fork, spelled as `--repo` takes it; why it cannot be named) - one or the other.
+
+    Both tools work out the repository they act on from the remotes when no repository flag
+    is given, and both answer with the remote named `upstream` when there is one - the remote
+    `setup` itself adds. A merge request command without `--repo` therefore opens the merge
+    request on the ORIGINAL project: printed, it does that to whoever pastes it; with `--mr`
+    this script does it itself. Rule 1, performed rather than merely advised.
+
+    The value carries the host as well as the project - `https://github.com/acme/widget`,
+    `ssh://gitlab.example.com/acme/team/widget` - because a bare `owner/repo` is resolved
+    against the tool's *default* host and not against the one the fork is on: `glab --repo
+    acme/team/widget` in a clone of a self-hosted GitLab asks gitlab.com, and `gh --repo
+    acme/widget` asks github.com. Both accept a URL and read the host out of it (`glab mr
+    create -R/--repo`: "OWNER/REPO or GROUP/NAMESPACE/REPO. The full URL or Git URL is also
+    accepted"; `gh pr create -R/--repo`: "[HOST/]OWNER/REPO", a URL too). The scheme is the
+    origin's own, so an ssh port stays an ssh port rather than becoming a web one.
+
+    `forge_path` reads the project and `split_remote` the host - the same two readers the
+    platform report's paths are built from, and no second URL parser. When the origin names
+    no project there is nothing to aim at and no command to print: a local path, an
+    unrecognised URL, or more than `owner/repo` on GitHub, which gh refuses outright
+    ("invalid path"). `open_mr` says which URL it could not address instead."""
+    if ctx.platform not in ("gitlab", "github"):
+        return "", "unknown host"
+    project = forge_path(ctx.origin_url)
+    if not project or (ctx.platform == "github" and project.count("/") != 1):
+        return "", f"{ctx.platform}, but `{ctx.origin_url or '-'}` names no project there"
+    scheme, authority, _ = split_remote(ctx.origin_url)
+    return f"{scheme or 'https'}://{authority}/{project}", ""
+
+
 def mr_command(ctx: Ctx, branch: str, title: str, body_file: str) -> list:
-    """The platform's MR command, or [] when the platform is unknown."""
+    """The platform's MR command, or [] when the fork cannot be named (see `mr_target`).
+
+    `--repo` is not optional and not a nicety: without it both tools aim at the original
+    project. Anything that edits this command keeps it."""
+    target, _ = mr_target(ctx)
+    if not target:
+        return []
     if ctx.platform == "gitlab":
-        return ["glab", "mr", "create",
+        return ["glab", "mr", "create", "--repo", target,
                 "--source-branch", branch, "--target-branch", ctx.trunk,
                 "--title", title, "--description-file", body_file, "--remove-source-branch"]
     if ctx.platform == "github":
-        return ["gh", "pr", "create",
+        return ["gh", "pr", "create", "--repo", target,
                 "--head", branch, "--base", ctx.trunk,
                 "--title", title, "--body-file", body_file]
     return []
@@ -1258,8 +1296,10 @@ def open_mr(ctx: Ctx, branch: str, title: str, body: str, run_it: bool) -> str:
     path = "<description file>" if ctx.dry_run else write_temp(body, "mr-body.md")
     cmd = mr_command(ctx, branch, title, path)
     if not cmd:
-        step("mr", f"# platform {ctx.platform}",
-             f"open the merge request manually: {branch} -> {ctx.trunk}", dry=ctx.dry_run)
+        # the same wording the platform report uses for the same origin URL
+        step("mr", f"# origin {ctx.origin_url or '-'}",
+             f"{mr_target(ctx)[1]} - open the merge request manually: "
+             f"{branch} -> {ctx.trunk}", dry=ctx.dry_run)
         print(f"    title: {title}")
         if not ctx.dry_run:
             print(f"    description: {path}")
@@ -8046,6 +8086,7 @@ def run_tests() -> None:
             self.assertEqual(
                 mr_command(ctx, "sync/upstream-20260101", "sync: title", "/tmp/body.md"),
                 ["glab", "mr", "create",
+                 "--repo", "ssh://gitlab.com/group/proj",
                  "--source-branch", "sync/upstream-20260101",
                  "--target-branch", "develop",
                  "--title", "sync: title",
@@ -8057,6 +8098,7 @@ def run_tests() -> None:
             self.assertEqual(
                 mr_command(ctx, "feat/x", "ship: title", "/tmp/body.md"),
                 ["gh", "pr", "create",
+                 "--repo", "https://github.com/owner/repo",
                  "--head", "feat/x", "--base", "develop",
                  "--title", "ship: title", "--body-file", "/tmp/body.md"])
 
@@ -8079,6 +8121,94 @@ def run_tests() -> None:
             self.assertIn("fast-forward", merge_button(gitlab, "ship"))
             self.assertIn("Rebase and merge", merge_button(github, "ship"))
 
+    class TestMrCommandsNameTheFork(unittest.TestCase):
+        """Every merge request command names the fork itself.
+
+        Without `--repo` both tools resolve the repository from the remotes and answer with
+        the one named `upstream` - the original project (verified on a real fork: `gh repo
+        view --json nameWithOwner` in `aws-simple/tutorials` answers `antonputra/tutorials`).
+        A printed command would then open the merge request there, and `--mr` would open it
+        there itself: rule 1. The fake `gh`/`glab` of the end-to-end tests never resolves a
+        base repository, so only the argv itself can prove this."""
+
+        def ctx(self, origin: str, platform: str = "", upstream: str = "") -> Ctx:
+            c = Ctx(root="/repo", origin_url=origin, upstream_url=upstream)
+            c.platform = platform or detect_platform(origin)
+            return c
+
+        def target_of(self, cmd: Sequence[str]) -> str:
+            self.assertIn("--repo", cmd)
+            return cmd[list(cmd).index("--repo") + 1]
+
+        def command(self, origin: str, platform: str = "", upstream: str = "") -> list:
+            return mr_command(self.ctx(origin, platform, upstream), "feat/x", "t", "/b.md")
+
+        def test_the_fork_is_named_however_the_origin_is_spelled(self):
+            for origin, target in (
+                    ("git@github.com:acme/widget.git", "ssh://github.com/acme/widget"),
+                    ("https://github.com/acme/widget.git", "https://github.com/acme/widget"),
+                    ("ssh://git@github.com/acme/widget", "ssh://github.com/acme/widget"),
+                    ("git@gitlab.example.com:acme/team/widget.git",
+                     "ssh://gitlab.example.com/acme/team/widget"),
+                    ("https://gitlab.example.com/acme/team/widget.git",
+                     "https://gitlab.example.com/acme/team/widget")):
+                cmd = self.command(origin)
+                self.assertEqual(self.target_of(cmd), target, origin)
+
+        def test_it_is_the_fork_and_never_the_project_it_was_forked_from(self):
+            """What both tools would have answered with, and the whole point of the flag."""
+            for origin, upstream, project in (
+                    ("git@github.com:acme/widget.git",
+                     "https://github.com/original/widget.git", "acme/widget"),
+                    ("https://gitlab.example.com/acme/team/widget.git",
+                     "git@gitlab.example.com:original/widget.git", "acme/team/widget")):
+                cmd = self.command(origin, upstream=upstream)
+                self.assertIn(project, self.target_of(cmd))
+                self.assertNotIn("original/widget", " ".join(cmd))
+
+        def test_the_host_is_part_of_it(self):
+            """A bare `owner/repo` is resolved against the tool's own default host, not the
+            fork's: on a self-hosted GitLab `glab --repo acme/team/widget` asks gitlab.com
+            (verified with glab 1.109), which is a different project altogether."""
+            cmd = self.command("git@gitlab.example.com:acme/team/widget.git")
+            self.assertTrue(self.target_of(cmd).startswith("ssh://gitlab.example.com/"), cmd)
+
+        def test_a_subgroup_keeps_every_segment(self):
+            cmd = self.command("https://gitlab.example.com/g/s/deep/proj.git")
+            self.assertEqual(self.target_of(cmd), "https://gitlab.example.com/g/s/deep/proj")
+
+        def test_the_spelling_of_the_project_is_kept(self):
+            cmd = self.command("git@github.com:Acme/Widget.git")
+            self.assertEqual(self.target_of(cmd), "ssh://github.com/Acme/Widget")
+
+        def test_a_port_the_scheme_does_not_imply_is_kept(self):
+            for origin, target in (
+                    ("ssh://git@gitlab.example.com:2222/acme/widget.git",
+                     "ssh://gitlab.example.com:2222/acme/widget"),
+                    ("https://gitlab.example.com:8443/acme/widget.git",
+                     "https://gitlab.example.com:8443/acme/widget")):
+                self.assertEqual(self.target_of(self.command(origin, "gitlab")), target)
+
+        def test_an_origin_that_names_no_project_gets_no_command_at_all(self):
+            """A command without `--repo` is not merely unhelpful - it is aimed at the
+            original project, so there is nothing safe left to print."""
+            for origin, platform in (("/srv/mirrors/widget.git", "gitlab"),
+                                     ("file:///srv/mirrors/widget.git", "github"),
+                                     ("https://github.com/", "github"),
+                                     ("", "gitlab")):
+                self.assertEqual(self.command(origin, platform), [], origin)
+
+        def test_a_github_url_with_more_than_owner_and_repo_is_not_guessed_at(self):
+            """gh reads a third segment as a host (`-R a/b/c` asks `https://a/`) and refuses
+            the same path in a URL outright ("invalid path"); GitLab nests, GitHub does not."""
+            self.assertEqual(self.command("https://github.com/acme/team/widget.git"), [])
+
+        def test_the_reason_names_the_url_that_could_not_be_addressed(self):
+            self.assertEqual(mr_target(self.ctx("/srv/mirrors/widget.git", "gitlab")),
+                             ("", "gitlab, but `/srv/mirrors/widget.git` names no project "
+                                  "there"))
+            self.assertEqual(mr_target(self.ctx("/srv/mirrors/widget.git"))[1], "unknown host")
+
     class TestOpenMr(Base):
         def test_unknown_platform_prints_the_manual_note(self):
             fork = make_fork(self.tmp)
@@ -8088,14 +8218,45 @@ def run_tests() -> None:
             self.assertIn("open the merge request manually: feat/x -> develop", out)
             self.assertIn("a title", out)
 
+        def test_what_is_shown_and_what_is_run_both_name_the_fork(self):
+            """One command, printed and executed - and it names the fork, not the remote
+            called `upstream`, which is what glab and gh resolve to by themselves."""
+            ctx = ctx_for(make_fork(self.tmp))
+            ctx.platform = "gitlab"
+            ctx.origin_url = "git@gitlab.example.com:acme/team/widget.git"
+            ctx.upstream_url = "git@gitlab.example.com:original/widget.git"
+            done = subprocess.CompletedProcess([], 0, b"https://gitlab.example.com/mr/1\n", b"")
+            with mock.patch.object(subprocess, "run", return_value=done) as ran:
+                shown, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+            argv = list(ran.call_args[0][0])
+            self.assertEqual(argv[argv.index("--repo") + 1],
+                             "ssh://gitlab.example.com/acme/team/widget")
+            self.assertNotIn("original/widget", " ".join(argv))
+            self.assertIn("--repo ssh://gitlab.example.com/acme/team/widget", shown)
+            self.assertIn("created", out)
+
+        def test_a_known_platform_that_names_no_project_runs_nothing(self):
+            """--mr with nothing to aim at: the manual note, and no tool run at all - a
+            command without the flag would have gone to the original project."""
+            ctx = ctx_for(make_fork(self.tmp))
+            ctx.platform = "github"          # every fixture fork pushes to a local origin
+            with mock.patch.object(subprocess, "run") as ran:
+                shown, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+            ran.assert_not_called()
+            self.assertEqual(shown, "")
+            self.assertIn("names no project there", out)
+            self.assertIn("open the merge request manually: feat/x -> develop", out)
+
         def test_missing_tool_is_reported_and_never_raises(self):
             fork = make_fork(self.tmp)
             ctx = ctx_for(fork)
             ctx.platform = "gitlab"
+            ctx.origin_url = "git@gitlab.example.com:acme/team/widget.git"
             missing = FileNotFoundError(2, "No such file or directory")
             with mock.patch.object(subprocess, "run", side_effect=missing):
                 shown, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
-            self.assertIn("glab mr create", shown)
+            self.assertIn("glab mr create --repo ssh://gitlab.example.com/acme/team/widget",
+                          shown)
             self.assertIn("glab unavailable", out)
             self.assertIn("No such file or directory", out)
 
@@ -8107,9 +8268,10 @@ def run_tests() -> None:
             fork = make_fork(self.tmp)
             ctx = ctx_for(fork, dry_run=True)
             ctx.platform = "github"
+            ctx.origin_url = "https://github.com/acme/widget.git"
             before = self.temp_files()
             shown, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
-            self.assertIn("gh pr create", shown)
+            self.assertIn("gh pr create --repo https://github.com/acme/widget", shown)
             self.assertIn("<description file>", shown)
             self.assertIn("not run (dry run)", out)
             self.assertEqual(self.temp_files(), before)      # nothing was written anywhere
@@ -8141,13 +8303,22 @@ def run_tests() -> None:
             with open(self.body_copy) as fh:
                 return fh.read()
 
+        # the fixture fork really does push to a local origin, so the platform and the fork
+        # it names are both supplied here; `TestMrCommandsNameTheFork` proves the URL these
+        # stand for is built from the origin. What these tests prove is that the argv the
+        # tool receives carries it - the fake `gh`/`glab` resolves no base repository itself
+        GL_FORK = "ssh://gitlab.example.com/acme/team/widget"
+        GH_FORK = "https://github.com/acme/widget"
+
         def as_gitlab(self):
-            return mock.patch.object(sys.modules[__name__], "detect_platform",
-                                     lambda url: "gitlab")
+            return mock.patch.multiple(sys.modules[__name__],
+                                       detect_platform=lambda url: "gitlab",
+                                       mr_target=lambda ctx: (self.GL_FORK, ""))
 
         def as_github(self):
-            return mock.patch.object(sys.modules[__name__], "detect_platform",
-                                     lambda url: "github")
+            return mock.patch.multiple(sys.modules[__name__],
+                                       detect_platform=lambda url: "github",
+                                       mr_target=lambda ctx: (self.GH_FORK, ""))
 
         def test_sync_mr_runs_glab_with_the_sync_body(self):
             fork = make_fork(self.tmp)
@@ -8165,6 +8336,9 @@ def run_tests() -> None:
             argv = self.argv(log)
             self.assertEqual(argv[:2], ["mr", "create"])
             self.assertIn("--remove-source-branch", argv)
+            # the merge request is opened on the fork; without this glab would resolve the
+            # project from the remotes and answer with `upstream` - the original project
+            self.assertEqual(self.value(argv, "--repo"), self.GL_FORK)
             self.assertEqual(self.value(argv, "--source-branch"), name)
             self.assertEqual(self.value(argv, "--target-branch"), "develop")
             self.assertEqual(self.value(argv, "--title"),
@@ -8194,6 +8368,7 @@ def run_tests() -> None:
 
             argv = self.argv(log)
             self.assertEqual(argv[:2], ["pr", "create"])
+            self.assertEqual(self.value(argv, "--repo"), self.GH_FORK)   # fork, not upstream
             self.assertEqual(self.value(argv, "--head"), "feat/x")
             self.assertEqual(self.value(argv, "--base"), "develop")
             self.assertEqual(self.value(argv, "--title"), "ours: bump app")

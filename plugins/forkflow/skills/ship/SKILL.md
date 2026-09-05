@@ -67,7 +67,9 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
 
 7. **Merge request.** `--mr` runs the printed command. The body is the squashed commit message
    plus the WARNING list and the merge-button note. Tool missing or failing -> the command and its
-   stderr are printed, exit stays 0; hand the user the command.
+   stderr are printed, exit stays 0; hand the user the command exactly as printed - its
+   `--repo <the fork's URL>` is what keeps the merge request off the original project
+   (`rules.md`).
 
 8. **Report.** The one commit (SHA and subject) replacing the n originals, the tree hash check,
    the backup name and its rollback line, the rebase result, any WARNING files, the MR URL or

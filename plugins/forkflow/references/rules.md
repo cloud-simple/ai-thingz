@@ -77,6 +77,15 @@ the original project. A command carrying one would read upstream's settings and,
 who is a Maintainer there too, write them: rule 1, undone by a pasted fix. Do not "simplify" a
 printed command back to a placeholder.
 
+The merge request command that `sync` and `ship` print names the fork the same way, with
+`--repo <the fork's URL>`. Without it `gh pr create` and `glab mr create` work the repository out
+from the remotes and answer with `upstream` as well - so a command missing the flag opens the merge
+request **on the original project**, and `--mr` opens it there itself rather than merely advising
+it. The URL carries the host as well as the project, because a bare `owner/repo` is resolved
+against the tool's own default host (github.com, gitlab.com) and not the one the fork is on. Pass
+the command on exactly as printed. When the origin URL names no project at all, forkflow prints no
+command and says which URL it could not address: open that merge request in the web UI.
+
 ## What is never automated
 
 A fork whose mirror branch already carries its own work is a migration, not a setup: it rewrites
