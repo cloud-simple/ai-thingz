@@ -22,7 +22,7 @@ Hard rules, enforced by this script and by the pre-push hook it installs:
 Sequence rule: sync first, then ship; rebase locally, merge globally.
 
 Usage:
-    forkflow.py status [--fetch] [-C DIR]
+    forkflow.py status [--fetch | --offline] [-C DIR]
     forkflow.py check [-C DIR]
     forkflow.py sync [--continue] [--mr] [--title T] [-C DIR] [--dry-run] [--force]
     forkflow.py ship [--continue] [--mr] [--title T] [--message-file F] [-C DIR] [--dry-run] [--force]
@@ -860,10 +860,38 @@ def _rel_age(seconds: float) -> str:
 
 
 def last_fetch(ctx: Ctx) -> str:
+    """Age of the last `git fetch`, and which of the two remotes it reached.
+
+    FETCH_HEAD is rewritten by every fetch, so its age alone only says "something was
+    fetched": right after `ship`'s `git fetch origin` it reads seconds old while the upstream
+    ref may be a day stale. Its lines name the remote each ref came from - in git's own
+    spelling of the URL, without `user@` or `.git` - so `repo_id` tells which remotes the
+    last fetch actually covered, and the header can say `(origin only - upstream not in it)`."""
     path = git_path(ctx.root, "FETCH_HEAD")
     if not path or not os.path.exists(path):
         return "never"
-    return _rel_age(max(0.0, time.time() - os.path.getmtime(path)))
+    age = _rel_age(max(0.0, time.time() - os.path.getmtime(path)))
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return age
+    wanted = [(name, repo_id(url, ctx.root)) for name, url in
+              ((ctx.origin, ctx.origin_url), (ctx.upstream, ctx.upstream_url)) if name and url]
+    reached = set()
+    for ln in lines:
+        head, sep, src = ln.rpartition(" of ")
+        if not sep:
+            continue
+        rid = repo_id(src.strip(), ctx.root)
+        reached.update(name for name, want in wanted if rid == want)
+    if not reached:
+        return age
+    names = ", ".join(name for name, _ in wanted if name in reached)
+    missing = [name for name, _ in wanted if name not in reached]
+    if missing:
+        return f"{age} ({names} only - {', '.join(missing)} not in it)"
+    return f"{age} ({names})"
 
 
 def plus_minus(ctx: Ctx, a: str, b: str) -> str:
@@ -872,7 +900,10 @@ def plus_minus(ctx: Ctx, a: str, b: str) -> str:
     return f"+{ahead}/-{behind}"
 
 
-def header(ctx: Ctx, sub: str) -> None:
+def header(ctx: Ctx, sub: str, server: Optional[str] = None) -> None:
+    """The common header. `server` is the upstream branch's tip as `status` just read it
+    from the server, when it did: a fetched ref that no longer matches it is reported as
+    such in the mirror line, so `(=)` never quietly means "= as of some earlier fetch"."""
     print(f"forkflow {sub}  origin={ctx.origin_url or '-'}  "
           f"upstream={ctx.upstream_url or '-'}  platform={ctx.platform}")
     print(f"  as of last fetch: {last_fetch(ctx)}")
@@ -896,6 +927,8 @@ def header(ctx: Ctx, sub: str) -> None:
             vs_up = f"mirror behind by {behind}"
         else:
             vs_up = "="
+    if server and server != up_sha:
+        vs_up = f"{vs_up} as fetched, server moved" if up_sha else "unfetched, on the server"
     if not origin_m or not local_m:
         vs_origin = "-"
     elif origin_m != local_m:
@@ -955,6 +988,25 @@ def fetch(ctx: Ctx, remotes: Sequence[str],
         moved.append(f"{r} unchanged" if now == before[r]
                      else f"{r} {short(before[r])}..{short(now)}")
     return (0, cmd, ", ".join(moved) if moved else "remote-tracking refs refreshed", err)
+
+
+def upstream_server_tip(ctx: Ctx) -> Tuple[Optional[str], str]:
+    """The upstream branch's tip on the server, without fetching: (sha or None, why not).
+
+    `git ls-remote` is one round-trip and writes nothing - no refs, no objects - which is
+    what lets a read-only `status` still say whether upstream has moved since the last
+    fetch. What it cannot say is by how many commits: those objects are not here until
+    a fetch, so the answer is "moved" and a pointer at `--fetch`, never a count."""
+    ref = f"refs/heads/{ctx.upstream_branch}"
+    rc, out, err = git_rc("ls-remote", "--heads", ctx.upstream, ref, cwd=ctx.root)
+    if rc != 0:
+        tail = err.strip().splitlines()[-1] if err.strip() else f"exit {rc}"
+        return (None, tail)
+    for ln in out.splitlines():
+        sha, _, name = ln.partition("\t")
+        if name.strip() == ref:
+            return (sha.strip(), "")
+    return (None, f"{ref} is not on the server")
 
 
 # --------------------------------------------------------------------------- #
@@ -1340,18 +1392,44 @@ def open_mr(ctx: Ctx, branch: str, title: str, body: str, run_it: bool) -> str:
 # --------------------------------------------------------------------------- #
 
 def cmd_status(args: argparse.Namespace) -> int:
-    """Read-only. Without --fetch it makes no network call and writes nothing."""
+    """Read-only: writes nothing. Without --fetch the numbers are as of the last fetch,
+    and one `ls-remote` says whether the upstream server has moved since - the stale
+    `(=)` that read as "in sync" for a day on the first real fork is what that round-trip
+    buys. --offline skips it and makes no network call at all."""
     ctx = resolve_ctx(args.dir, args, need_upstream=True, need_trunk=False, strict_mirror=False)
     fetch_step = None
+    server = None
+    server_step = None
     if getattr(args, "fetch", False):
         rc, cmd, result, err = fetch(ctx, (ctx.origin, ctx.upstream))
         tail = err.strip().splitlines()[-1] if err.strip() else "see git output"
         fetch_step = (cmd, result if rc == 0
                       else f"FAILED, reporting the refs on disk: {tail}")
+    elif getattr(args, "offline", False):
+        server_step = ("-", "not asked (--offline): the numbers are as of the last fetch")
+    else:
+        ref = f"refs/heads/{ctx.upstream_branch}"
+        cmd = f"git ls-remote --heads {sh_arg(ctx.upstream)} {sh_arg(ref)}"
+        sha, why = upstream_server_tip(ctx)
+        fetched = rev(ctx.root, ctx.up())
+        if sha is None:
+            server_step = (cmd, f"server not reachable ({why}); the numbers are as of the last fetch")
+        elif sha == fetched:
+            server_step = (cmd, f"server at {short(sha)} = fetched")
+        elif fetched:
+            server = sha
+            server_step = (cmd, f"server at {short(sha)}, fetched {short(fetched)} - upstream moved "
+                                f"since the last fetch: `status --fetch` for the numbers, "
+                                f"`forkflow sync` to take it")
+        else:
+            server = sha
+            server_step = (cmd, f"server at {short(sha)}, not fetched here yet: `status --fetch`")
 
-    header(ctx, "status")
+    header(ctx, "status", server=server)
     if fetch_step:
         step("fetch", fetch_step[0], fetch_step[1])
+    if server_step:
+        step("upstream", server_step[0], server_step[1])
 
     branch = current_branch(ctx)
     modified = [ln for ln in git("status", "--porcelain", "--untracked-files=no",
@@ -3483,6 +3561,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
     s = sub.add_parser("status", parents=[common], help="where mirror, trunk and upstream stand")
     s.add_argument("--fetch", action="store_true", help="refresh remote-tracking refs first")
+    s.add_argument("--offline", action="store_true",
+                   help="no network at all: skip asking the upstream server for its tip")
 
     sub.add_parser("check", parents=[common], help="preflight invariants (gate, trunk tip)")
 
@@ -5034,7 +5114,8 @@ def run_tests() -> None:
             self.assertEqual(_rel_age(36 * 3600), "1d ago")
             fork = make_fork(self.tmp)
             ctx = ctx_for(fork)
-            self.assertRegex(last_fetch(ctx), r"^\d+[smhd] ago$")
+            # the bucketed age comes first; which remotes the fetch reached follows in parentheses
+            self.assertRegex(last_fetch(ctx), r"^\d+[smhd] ago( \([^)]*\))?$")
             path = git("rev-parse", "--git-path", "FETCH_HEAD", cwd=fork)
             os.remove(path if os.path.isabs(path) else os.path.join(fork, path))
             self.assertEqual(last_fetch(ctx), "never")
@@ -5050,7 +5131,7 @@ def run_tests() -> None:
             self.assertEqual(rev(fork, "refs/remotes/upstream/main"), moved)
             self.assertIn("mirror behind by 1", out)
 
-        def test_no_network_and_no_writes_without_fetch(self):
+        def test_no_writes_without_fetch(self):
             fork = make_fork(self.tmp)
             commit_upstream(self.tmp, "src/app.py", "def main():\n    return 5\n")
             push_upstream_into_origin(self.tmp)
@@ -5059,6 +5140,54 @@ def run_tests() -> None:
             self.assertEqual(code, 0, err)
             self.assertEqual(sh("git", "for-each-ref", cwd=fork), before)
             self.assertNotIn("git fetch", out)
+
+        def test_status_asks_the_server_and_reports_a_moved_upstream(self):
+            # the GET fork, 2026-09-09: `(=)` printed from a 6h-old fetch while upstream had
+            # moved, and the advice built on it was wrong. One ls-remote, no writes, no fetch.
+            fork = make_fork(self.tmp)
+            moved = commit_upstream(self.tmp, "src/app.py", "def main():\n    return 5\n")
+            before = sh("git", "for-each-ref", cwd=fork)
+            code, out, err = run("-C", fork, "status")
+            self.assertEqual(code, 0, err)
+            self.assertIn(f"server at {short(moved)}", out)
+            self.assertIn("upstream moved since the last fetch", out)
+            self.assertIn("as fetched, server moved", out)      # the mirror cell no longer says (=)
+            self.assertNotIn("git fetch", out)
+            self.assertEqual(sh("git", "for-each-ref", cwd=fork), before)
+
+        def test_status_reports_the_server_in_step_with_the_fetch(self):
+            fork = make_fork(self.tmp)
+            code, out, err = run("-C", fork, "status")
+            self.assertEqual(code, 0, err)
+            self.assertIn("= fetched", out)
+            self.assertNotIn("server moved", out)
+
+        def test_offline_status_makes_no_network_call(self):
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "src/app.py", "def main():\n    return 5\n")
+            # an unreachable server proves which runs ask it and which do not
+            sh("git", "remote", "set-url", "upstream", os.path.join(self.tmp, "nowhere.git"), cwd=fork)
+            code, out, err = run("-C", fork, "status")
+            self.assertEqual(code, 0, err)
+            self.assertIn("server not reachable", out)
+            code, out, err = run("-C", fork, "status", "--offline")
+            self.assertEqual(code, 0, err)
+            self.assertIn("not asked (--offline)", out)
+            self.assertNotIn("ls-remote", out)
+            self.assertNotIn("server moved", out)
+
+        def test_the_age_line_names_the_remotes_the_last_fetch_reached(self):
+            # FETCH_HEAD is rewritten by any fetch: after ship's `git fetch origin` the age
+            # reads seconds while the upstream ref is as old as ever - say so
+            fork = make_fork(self.tmp)
+            sh("git", "fetch", "origin", cwd=fork)
+            _, out, _ = run("-C", fork, "status", "--offline")
+            age = next(ln for ln in out.splitlines() if "as of last fetch" in ln)
+            self.assertIn("(origin only - upstream not in it)", age)
+            sh("git", "fetch", "--multiple", "origin", "upstream", cwd=fork)
+            _, out, _ = run("-C", fork, "status", "--offline")
+            age = next(ln for ln in out.splitlines() if "as of last fetch" in ln)
+            self.assertIn("(origin, upstream)", age)
 
         def test_mirror_unpushed_after_a_local_advance(self):
             fork = make_fork(self.tmp)
