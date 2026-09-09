@@ -8,7 +8,9 @@ allowed-tools: Bash, Read
 
 Read-only. The script never pushes or rebases the trunk and never commits on the mirror - and
 neither may you: do not push, rebase, reset or merge anything while answering a status question.
-Without `--fetch` this makes no network call and writes nothing.
+It writes nothing. Without `--fetch` the numbers are as of the last fetch, and one `ls-remote`
+asks the upstream server whether its branch has moved since - that is the only network call, and
+`--offline` skips it for a clone with no route to the server.
 
 Script: `${CLAUDE_PLUGIN_ROOT}/scripts/forkflow.py` (Python 3.9+, stdlib only; `.forkflow.toml`
 needs 3.11+). The layout and the rules it enforces: `${CLAUDE_PLUGIN_ROOT}/references/rules.md`.
@@ -22,8 +24,14 @@ needs 3.11+). The layout and the rules it enforces: `${CLAUDE_PLUGIN_ROOT}/refer
    ```
 
    Add `--fetch` when the user asks for *current* numbers ("are we behind right now?", "did
-   anything land upstream?") or is about to sync; without it the numbers are as of the last fetch,
-   which the header states. Add `-C DIR` when the repository is not the working directory.
+   anything land upstream?"), is about to sync, or when the `upstream` line says the server has
+   moved and the user wants to know by how much - without a fetch the script can say *that*
+   upstream moved but not by how many commits. Add `--offline` only when the user says the
+   server is unreachable. Add `-C DIR` when the repository is not the working directory.
+
+   **Never conclude "upstream has not moved" from a run that did not ask the server.** The
+   `upstream` line is the answer to that question; the `as of last fetch` age is not - it names
+   which remotes the last fetch reached, and after a `ship` that is often `origin only`.
 
 2. **Read the output.** Header first (mirror line, trunk line, divergence), then the branch line,
    the upstream-tracked WARNING list, backups, and the setup line.
@@ -44,10 +52,11 @@ Header:
 
 ```
 forkflow status  origin=<url>  upstream=<url>  platform=<gitlab|github|unknown>
-  as of last fetch: <relative age, or "never">
-  mirror  <mirror> <sha|->  origin/<mirror> <sha|-> (=|unpushed n|behind n|-)  upstream/<ub> <sha|unfetched> (=|mirror behind by n|DIVERGED|no mirror|unfetched|?)
+  as of last fetch: <relative age, or "never"> (<remotes it reached, e.g. "origin only - upstream not in it">)
+  mirror  <mirror> <sha|->  origin/<mirror> <sha|-> (=|unpushed n|behind n|-)  upstream/<ub> <sha|unfetched> (=|mirror behind by n|DIVERGED|no mirror|unfetched|?)[ as fetched, server moved]
   trunk   <trunk> <sha|->   origin/<trunk> <sha|missing> (=|+n/-m|missing|-)  upstream/<ub> (+n/-m vs origin/<trunk>|vs origin/<trunk>: unknown)
   divergence: <N> files, <M> upstream-tracked        (or: unknown (fetch upstream and create the trunk first))
+  upstream  $ git ls-remote --heads upstream refs/heads/<ub>  -> server at <sha> = fetched | server at <sha>, fetched <sha> - upstream moved since the last fetch: ... | server not reachable (...) | not asked (--offline)
 ```
 
 | what you see | what it means |
@@ -57,6 +66,9 @@ forkflow status  origin=<url>  upstream=<url>  platform=<gitlab|github|unknown>
 | `mirror behind by n` | upstream has moved; `sync` fast-forwards the mirror and takes it into the trunk |
 | `DIVERGED` | the mirror has commits of its own - it is not a mirror; a manual migration, never reset by the plugin |
 | `unfetched` | `upstream/<branch>` is not in this clone yet; rerun with `--fetch` |
+| `as fetched, server moved` on the mirror | the `(=)` or `behind by n` before it is true of the *last fetch*, and the server has moved since; the `upstream` line has the server's sha. `--fetch` for the count, `sync` to take it |
+| `upstream  ... server at <sha> = fetched` | the fetched ref is current; the numbers above can be trusted as of now |
+| `upstream  ... server not reachable` | the one network call failed; the numbers are as of the last fetch and nothing more is known |
 | `missing` on the trunk | the trunk is not on origin; `setup` bootstraps it on a fresh fork |
 | `behind n` on the mirror | `origin/<mirror>` is ahead of the local one (a teammate synced); fetch and fast-forward |
 | `no mirror` | neither a local nor an `origin/` copy of the mirror exists yet; run `setup` |
