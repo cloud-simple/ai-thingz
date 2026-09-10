@@ -420,12 +420,12 @@ commit is not in this clone the line degrades to `... - cannot verify here` and 
 **Files:**
 - Modify: `plugins/forkflow/scripts/forkflow.py`
 
-- [ ] extract `run_tool(ctx, cmd) -> Optional[CompletedProcess]` from `open_mr` (the `subprocess.run` call with `stdin=DEVNULL` and the `OSError` path); `open_mr` uses it; invariant edit 1: `test_git_and_the_platform_tools_are_the_only_subprocesses` replaces `open_mr` with `run_tool` in the pinned set, with the reason in its docstring
-- [ ] `open_mr` returns `(shown, url)`; `url` = first stdout line starting with `http`, else `""`; update the two production call sites (they discard it) and `TestOpenMr`'s seven `capture(open_mr, ...)` sites, two of which become `assertEqual(shown, ("", ""))`
-- [ ] `pending_entry(ctx) -> dict` (defensive read, `resumable` pattern); `finish_sync`/`finish_ship` write `pending = {kind, branch, commit, base, mr}` after the push succeeds and before `open_mr` (`base` captured as `origin/<trunk>` before the push), then rewrite it with the URL once `open_mr` returns
-- [ ] write tests: `pending` shape for ship (commit = squashed HEAD) and for sync (commit = merge commit), with and without `--mr`, URL taken from the fake's output in both platform shapes; `--dry-run` writes no state; `pending_entry` returns `{}` for a list, a dict missing `commit`, and non-string fields
-- [ ] write tests: `run_tool` returns `None` for a missing tool and the `CompletedProcess` otherwise; `TestSourceInvariants` green with the renamed owner
-- [ ] run tests - must pass before task 3
+- [x] extract `run_tool(ctx, cmd) -> Optional[CompletedProcess]` from `open_mr` (the `subprocess.run` call with `stdin=DEVNULL` and the `OSError` path); `open_mr` uses it; invariant edit 1: `test_git_and_the_platform_tools_are_the_only_subprocesses` replaces `open_mr` with `run_tool` in the pinned set, with the reason in its docstring
+- [x] `open_mr` returns `(shown, url)`; `url` = first stdout line starting with `http`, else `""`; update the two production call sites (they discard it) and `TestOpenMr`'s seven `capture(open_mr, ...)` sites, two of which become `assertEqual(shown, ("", ""))`
+- [x] `pending_entry(ctx) -> dict` (defensive read, `resumable` pattern); `finish_sync`/`finish_ship` write `pending = {kind, branch, commit, base, mr}` after the push succeeds and before `open_mr` (`base` captured as `origin/<trunk>` before the push), then rewrite it with the URL once `open_mr` returns
+- [x] write tests: `pending` shape for ship (commit = squashed HEAD) and for sync (commit = merge commit), with and without `--mr`, URL taken from the fake's output in both platform shapes; `--dry-run` writes no state; `pending_entry` returns `{}` for a list, a dict missing `commit`, and non-string fields
+- [x] write tests: `run_tool` returns `None` for a missing tool and the `CompletedProcess` otherwise; `TestSourceInvariants` green with the renamed owner
+- [x] run tests - must pass before task 3
 
 ### Task 3: `merge_command`, `merge_mr`, exit 6, and the merging fake
 

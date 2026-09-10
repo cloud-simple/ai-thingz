@@ -694,6 +694,35 @@ def resumable(ctx: Ctx, reason: str, branch: str) -> dict:
     return {}
 
 
+PENDING_FIELDS = ("kind", "branch", "commit", "base")   # what `land` needs; `mr` is display
+
+
+def record_pending(ctx: Ctx, kind: str, branch: str, base: str, url: str = "") -> None:
+    """What is waiting to land, for `land` and `status`: the tip this run pushed on `branch`
+    and the `origin/<trunk>` it was built on, with the merge request's URL once known.
+
+    Written right after the push succeeds and before the merge request step, so a merge
+    request that fails to open still leaves a landable record, then rewritten with the URL.
+    Only the most recent run is kept: a second ship before the first lands overwrites it,
+    and `land` handles one entry. A dry run writes nothing (`write_state`)."""
+    write_state(ctx, "pending", {"kind": kind, "branch": branch,
+                                 "commit": rev(ctx.root, f"refs/heads/{branch}"),
+                                 "base": base, "mr": url})
+
+
+def pending_entry(ctx: Ctx) -> dict:
+    """The recorded `pending` entry, {} unless it has the shape `record_pending` writes.
+
+    A state file edited by hand, or written by an older version, is no state rather than
+    a crash - the same defensive read as `resumable`."""
+    entry = read_state(ctx).get("pending")
+    if (isinstance(entry, dict)
+            and all(isinstance(entry.get(k), str) for k in PENDING_FIELDS)
+            and isinstance(entry.get("mr", ""), str)):
+        return entry
+    return {}
+
+
 # --------------------------------------------------------------------------- #
 # reporting
 # --------------------------------------------------------------------------- #
@@ -1358,9 +1387,30 @@ def mr_command(ctx: Ctx, branch: str, title: str, body_file: str) -> list:
     return []
 
 
-def open_mr(ctx: Ctx, branch: str, title: str, body: str, run_it: bool) -> str:
+def run_tool(ctx: Ctx, cmd: Sequence[str]) -> Optional[subprocess.CompletedProcess]:
+    """Run a platform tool (glab, gh) and answer with its process; None when it cannot run.
+
+    stdin is closed: a prompt the flags did not cover fails fast as a non-zero exit, which
+    the caller reports with the tool's stderr, instead of waiting on a terminal nobody is
+    at. A tool that is not installed, or not executable, is an OSError rather than an exit
+    code; the callers say "unavailable" for it and still print the command, which is worth
+    running by hand. The one place the platform tools are run from - `open_mr` and the
+    merge step share it, and `TestSourceInvariants` pins it."""
+    try:
+        return subprocess.run(list(cmd), cwd=ctx.root, capture_output=True,
+                              stdin=subprocess.DEVNULL)
+    except OSError:
+        return None
+
+
+def open_mr(ctx: Ctx, branch: str, title: str, body: str, run_it: bool) -> Tuple[str, str]:
     """Print the MR command and, with --mr, run it. Never a failure: the branch is pushed,
-    the merge request is the only thing left to do."""
+    the merge request is the only thing left to do.
+
+    Answers (the command as shown, the merge request's URL). The URL is the first stdout
+    line of the tool that starts with `http` - what both glab and gh print - and "" when
+    the tool was not run, could not run or failed. It is kept for the `pending` record and
+    for display only: nothing parses it, the merge step addresses the MR by its branch."""
     path = "<description file>" if ctx.dry_run else write_temp(body, "mr-body.md")
     cmd = mr_command(ctx, branch, title, path)
     if not cmd:
@@ -1371,30 +1421,27 @@ def open_mr(ctx: Ctx, branch: str, title: str, body: str, run_it: bool) -> str:
         print(f"    title: {title}")
         if not ctx.dry_run:
             print(f"    description: {path}")
-        return ""
+        return "", ""
     shown = " ".join(shlex.quote(c) for c in cmd)
     if ctx.dry_run:
         step("mr", shown, "not run (dry run)", dry=True)
-        return shown
+        return shown, ""
     if not run_it:
         step("mr", shown, "not run (add --mr to run it)")
         print(f"    description: {path}")
-        return shown
-    try:
-        # stdin closed: a prompt the flags did not cover fails fast as a non-zero exit,
-        # reported below with its stderr, instead of waiting on a terminal nobody is at
-        p = subprocess.run(cmd, cwd=ctx.root, capture_output=True, stdin=subprocess.DEVNULL)
-    except OSError as exc:
-        step("mr", shown, f"{cmd[0]} unavailable ({exc.strerror or exc})")
+        return shown, ""
+    p = run_tool(ctx, cmd)
+    if p is None:
+        step("mr", shown, f"{cmd[0]} unavailable (not installed, or not runnable)")
         print(f"    description: {path}")
-        return shown
+        return shown, ""
     out = p.stdout.decode("utf-8", "replace").strip()
     if p.returncode != 0:
         step("mr", shown, f"FAILED (exit {p.returncode}) - open it yourself")
         for line in tail_lines(p.stderr.decode("utf-8", "replace"), TAIL_LINES):
             print(f"      {line}")
         print(f"    description: {path}")
-        return shown
+        return shown, ""
     step("mr", shown, "created")
     for line in out.splitlines():
         print(f"    {line}")
@@ -1402,7 +1449,8 @@ def open_mr(ctx: Ctx, branch: str, title: str, body: str, run_it: bool) -> str:
         os.unlink(path)          # the description is on the platform now; nobody needs the file
     except OSError:
         pass
-    return shown
+    url = next((ln.strip() for ln in out.splitlines() if ln.strip().startswith("http")), "")
+    return shown, url
 
 
 # --------------------------------------------------------------------------- #
@@ -2005,17 +2053,21 @@ def finish_sync(ctx: Ctx, args: argparse.Namespace, name: str, commits: Sequence
         print(check_failure_hint(ctx, name))
         return 3
 
+    base = rev(ctx.root, f"{ctx.origin}/{ctx.trunk}")   # what the merge was built on
     try:
         push(ctx, name)
     except Fail as exc:
         if exc.code == 5:
             print("  fix that, then: forkflow sync --continue")
         raise
+    record_pending(ctx, "sync", name, base)            # landable even if the MR step fails
 
     title = (getattr(args, "title", None)
              or f"sync: {ctx.up()} {utc_stamp()} ({len(commits)} commits)")
-    open_mr(ctx, name, title, sync_body(ctx, commits, rows, mirror_move, backup_ref),
-            bool(getattr(args, "mr", False)))
+    _, url = open_mr(ctx, name, title, sync_body(ctx, commits, rows, mirror_move, backup_ref),
+                     bool(getattr(args, "mr", False)))
+    if url:
+        record_pending(ctx, "sync", name, base, url)
     write_state(ctx, "sync", None)                     # this sync is done: nothing to resume
     print(f"  after the MR is merged: git fetch {sh_arg(ctx.origin)} "
           f"&& git switch {sh_arg(ctx.trunk)} "
@@ -2389,17 +2441,21 @@ def finish_ship(ctx: Ctx, args: argparse.Namespace, branch: str,
         print(f"  fix that on `{branch}` and commit it, then: forkflow ship --continue")
         return 3
 
+    base = rev(ctx.root, trunk_ref)                    # what the squash was built on
     try:
         push(ctx, branch, lease=lease or None, backup_ref=backup_ref)
     except Fail as exc:
         if exc.code == 5 and rollback:
             print(rollback)
         raise
+    record_pending(ctx, "ship", branch, base)          # landable even if the MR step fails
 
     title = (getattr(args, "title", None)
              or (message.strip().splitlines() or [f"ship {branch}"])[0])
-    open_mr(ctx, branch, title, ship_body(ctx, message, touched),
-            bool(getattr(args, "mr", False)))
+    _, url = open_mr(ctx, branch, title, ship_body(ctx, message, touched),
+                     bool(getattr(args, "mr", False)))
+    if url:
+        record_pending(ctx, "ship", branch, base, url)
     write_state(ctx, "ship", None)                     # this ship is done: nothing to resume
     print(f"  after the MR is merged: git fetch {sh_arg(ctx.origin)} "
           f"&& git switch {sh_arg(ctx.trunk)} "
@@ -4535,6 +4591,56 @@ def run_tests() -> None:
             self.assertEqual(resumable(here, "ship", "feat/x")["backup"], "here")
             self.assertEqual(resumable(there, "ship", "feat/other")["backup"], "there")
             self.assertEqual(resumable(here, "ship", "feat/other"), {})
+
+    class TestPendingEntry(Base):
+        """`land` works from the `pending` record and nothing else, so what is read back
+        has to be exactly what `record_pending` wrote - or nothing at all."""
+
+        def test_round_trip_and_the_url_added_afterwards(self):
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            self.assertEqual(pending_entry(ctx), {})
+            sh("git", "branch", "feat/x", "develop", cwd=fork)
+            base = rev(fork, "origin/develop")
+            record_pending(ctx, "ship", "feat/x", base)
+            self.assertEqual(pending_entry(ctx),
+                             {"kind": "ship", "branch": "feat/x", "commit": rev(fork, "feat/x"),
+                              "base": base, "mr": ""})
+            record_pending(ctx, "ship", "feat/x", base, "https://example.invalid/pull/1")
+            self.assertEqual(pending_entry(ctx)["mr"], "https://example.invalid/pull/1")
+            self.assertEqual(pending_entry(ctx)["commit"], rev(fork, "feat/x"))
+            write_state(ctx, "pending", None)
+            self.assertEqual(pending_entry(ctx), {})
+
+        def test_the_most_recent_run_is_the_only_one_kept(self):
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            sh("git", "branch", "feat/x", "develop", cwd=fork)
+            sh("git", "branch", "feat/y", "develop", cwd=fork)
+            record_pending(ctx, "ship", "feat/x", rev(fork, "origin/develop"))
+            record_pending(ctx, "sync", "feat/y", rev(fork, "origin/develop"))
+            self.assertEqual((pending_entry(ctx)["kind"], pending_entry(ctx)["branch"]),
+                             ("sync", "feat/y"))
+
+        def test_anything_but_the_written_shape_is_no_entry(self):
+            ctx = ctx_for(make_fork(self.tmp))
+            good = {"kind": "ship", "branch": "feat/x", "commit": "abc", "base": "def"}
+            for bad in (["a", "list"],                                   # not a dict
+                        {k: v for k, v in good.items() if k != "commit"},  # missing a field
+                        dict(good, commit=1),                            # non-string field
+                        dict(good, base=None),
+                        dict(good, mr=7),                                # non-string URL
+                        "abc"):
+                save_state(ctx, {"pending": bad})
+                self.assertEqual(pending_entry(ctx), {}, repr(bad))
+            save_state(ctx, {"pending": good})                           # `mr` may be absent
+            self.assertEqual(pending_entry(ctx), good)
+
+        def test_a_dry_run_records_nothing(self):
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork, dry_run=True)
+            record_pending(ctx, "ship", "develop", rev(fork, "origin/develop"))
+            self.assertFalse(os.path.exists(state_path(ctx)))
 
     class TestCleanTree(Base):
         def test_untracked_is_clean(self):
@@ -8427,7 +8533,7 @@ def run_tests() -> None:
             fork = make_fork(self.tmp)
             ctx = ctx_for(fork)
             shown, out, _ = capture(open_mr, ctx, "feat/x", "a title", "body\n", True)
-            self.assertEqual(shown, "")
+            self.assertEqual(shown, ("", ""))
             self.assertIn("open the merge request manually: feat/x -> develop", out)
             self.assertIn("a title", out)
 
@@ -8440,13 +8546,43 @@ def run_tests() -> None:
             ctx.upstream_url = "git@gitlab.example.com:original/widget.git"
             done = subprocess.CompletedProcess([], 0, b"https://gitlab.example.com/mr/1\n", b"")
             with mock.patch.object(subprocess, "run", return_value=done) as ran:
-                shown, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+                (shown, url), out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
             argv = list(ran.call_args[0][0])
             self.assertEqual(argv[argv.index("--repo") + 1],
                              "ssh://gitlab.example.com/acme/team/widget")
             self.assertNotIn("original/widget", " ".join(argv))
             self.assertIn("--repo ssh://gitlab.example.com/acme/team/widget", shown)
             self.assertIn("created", out)
+            self.assertEqual(url, "https://gitlab.example.com/mr/1")
+
+        def test_the_url_is_the_first_http_line_the_tool_prints_and_only_on_success(self):
+            """glab and gh both print the merge request's URL on its own line, glab after a
+            "Creating merge request for ..." line. Anything else - no such line, or a tool
+            that failed after printing one - is no URL: the `pending` record must not name
+            a merge request that does not exist."""
+            ctx = ctx_for(make_fork(self.tmp))
+            ctx.platform = "gitlab"
+            ctx.origin_url = "git@gitlab.example.com:acme/team/widget.git"
+            chatty = subprocess.CompletedProcess(
+                [], 0, b"Creating merge request for feat/x into develop in acme/team/widget\n"
+                       b"https://gitlab.example.com/acme/team/widget/-/merge_requests/2\n"
+                       b"  more\n", b"")
+            with mock.patch.object(subprocess, "run", return_value=chatty):
+                (shown, url), _, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+            self.assertTrue(shown)
+            self.assertEqual(url, "https://gitlab.example.com/acme/team/widget/-/merge_requests/2")
+            silent = subprocess.CompletedProcess([], 0, b"done\n", b"")
+            with mock.patch.object(subprocess, "run", return_value=silent):
+                (shown, url), _, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+            self.assertTrue(shown)
+            self.assertEqual(url, "")
+            failed = subprocess.CompletedProcess([], 1, b"https://gitlab.example.com/x\n",
+                                                 b"glab: pipeline required\n")
+            with mock.patch.object(subprocess, "run", return_value=failed):
+                (shown, url), out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+            self.assertTrue(shown)
+            self.assertEqual(url, "")
+            self.assertIn("FAILED (exit 1)", out)
 
         def test_the_tool_runs_with_its_confirmation_skipped_and_stdin_closed(self):
             """--mr has no terminal behind it. glab's "create this merge request?" prompt is
@@ -8460,7 +8596,7 @@ def run_tests() -> None:
             ctx.upstream_url = "git@gitlab.example.com:original/widget.git"
             done = subprocess.CompletedProcess([], 0, b"https://gitlab.example.com/mr/1\n", b"")
             with mock.patch.object(subprocess, "run", return_value=done) as ran:
-                shown, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+                (shown, _url), out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
             argv = list(ran.call_args[0][0])
             self.assertIn("--yes", argv)
             self.assertIs(ran.call_args[1].get("stdin"), subprocess.DEVNULL)
@@ -8480,7 +8616,7 @@ def run_tests() -> None:
             with mock.patch.object(subprocess, "run") as ran:
                 shown, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
             ran.assert_not_called()
-            self.assertEqual(shown, "")
+            self.assertEqual(shown, ("", ""))
             self.assertIn("names no project there", out)
             self.assertIn("open the merge request manually: feat/x -> develop", out)
 
@@ -8491,11 +8627,11 @@ def run_tests() -> None:
             ctx.origin_url = "git@gitlab.example.com:acme/team/widget.git"
             missing = FileNotFoundError(2, "No such file or directory")
             with mock.patch.object(subprocess, "run", side_effect=missing):
-                shown, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+                (shown, url), out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
             self.assertIn("glab mr create --repo ssh://gitlab.example.com/acme/team/widget",
                           shown)
+            self.assertEqual(url, "")
             self.assertIn("glab unavailable", out)
-            self.assertIn("No such file or directory", out)
 
         def temp_files(self) -> list:
             return sorted(f for f in os.listdir(tempfile.gettempdir())
@@ -8507,11 +8643,33 @@ def run_tests() -> None:
             ctx.platform = "github"
             ctx.origin_url = "https://github.com/acme/widget.git"
             before = self.temp_files()
-            shown, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+            (shown, url), out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
             self.assertIn("gh pr create --repo https://github.com/acme/widget", shown)
             self.assertIn("<description file>", shown)
+            self.assertEqual(url, "")
             self.assertIn("not run (dry run)", out)
             self.assertEqual(self.temp_files(), before)      # nothing was written anywhere
+
+    class TestRunTool(Base):
+        """`run_tool` is the one place glab and gh are run from (`TestSourceInvariants` pins
+        it): output captured, stdin closed, and a tool that cannot run is None, not a
+        raise - the command is still worth printing for the user to run by hand."""
+
+        def test_a_missing_tool_is_none_and_never_raises(self):
+            ctx = ctx_for(make_fork(self.tmp))
+            self.assertIsNone(run_tool(ctx, ["forkflow-no-such-tool", "mr", "create"]))
+
+        def test_a_present_tool_answers_with_its_process(self):
+            ctx = ctx_for(make_fork(self.tmp))
+            p = run_tool(ctx, ["sh", "-c", "echo out; echo err >&2; exit 3"])
+            self.assertEqual((p.returncode, p.stdout, p.stderr), (3, b"out\n", b"err\n"))
+
+        def test_stdin_is_closed_so_a_prompt_cannot_wait(self):
+            """A tool that asks a question reads end-of-file at once, not the developer's
+            terminal - the failure guarded against is a suite (or a `--mr`) that hangs."""
+            ctx = ctx_for(make_fork(self.tmp))
+            p = run_tool(ctx, ["sh", "-c", 'read answer; echo "got:$answer"'])
+            self.assertEqual(p.stdout, b"got:\n")
 
     class TestMrEndToEnd(Base):
         def record(self, name: str) -> str:
@@ -8670,6 +8828,135 @@ def run_tests() -> None:
             self.assertEqual(code, 0, err + out)
             self.assertIn("forkflow-no-such-tool unavailable", out)
             self.assertEqual(origin_sha(fork, "feat/x"), rev(fork, "HEAD"))
+
+    class TestPendingRecord(ShipBase):
+        """Every `ship` and `sync` that pushed a branch leaves the `pending` record `land`
+        works from - with or without `--mr`, whether or not the merge request could be
+        opened, and with the URL the tool printed when it could."""
+
+        FORKS = {"gitlab": "ssh://gitlab.example.com/acme/team/widget",
+                 "github": "https://github.com/acme/widget"}
+
+        def on(self, platform: str):
+            return mock.patch.multiple(sys.modules[__name__],
+                                       detect_platform=lambda url: platform,
+                                       mr_target=lambda ctx: (self.FORKS[platform], ""))
+
+        def url_tool(self, name: str, url: str) -> None:
+            """A glab/gh that prints a chatty line first, then the URL - as both tools do."""
+            fake_tool(os.path.join(self.tmp, "bin"), name,
+                      'echo "Creating a merge request for $2"\necho %s\n' % shlex.quote(url))
+
+        @staticmethod
+        def pending_of(fork: str) -> dict:
+            return pending_entry(ctx_for(fork, need_trunk=False, strict_mirror=False))
+
+        @staticmethod
+        def parents_of(fork: str, sha: str) -> list:
+            return sh("git", "rev-list", "--parents", "-1", sha, cwd=fork).split()[1:]
+
+        def test_ship_records_the_squashed_tip_and_the_trunk_it_was_built_on(self):
+            fork = make_fork(self.tmp)
+            name = self.feature(fork, commits=2)
+            base = origin_sha(fork, "develop")
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            entry = self.pending_of(fork)
+            self.assertEqual(entry, {"kind": "ship", "branch": name, "commit": rev(fork, name),
+                                     "base": base, "mr": ""})
+            self.assertEqual(entry["commit"], origin_sha(fork, name))     # the pushed tip
+            self.assertEqual(self.parents_of(fork, entry["commit"]), [base])   # one squash
+            self.assertEqual(resumable(ctx_for(fork), "ship", name), {})   # still cleared
+
+        def test_ship_base_is_the_fetched_trunk_not_the_stale_local_one(self):
+            """`base` is `origin/<trunk>` after the fetch the run made - the commit the
+            squash sits on - not the local trunk, which may be behind."""
+            fork = make_fork(self.tmp)
+            name = self.feature(fork)
+            moved = second_clone_commit(self.tmp)
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            entry = self.pending_of(fork)
+            self.assertEqual(entry["base"], moved)
+            self.assertEqual(self.parents_of(fork, entry["commit"]), [moved])
+            self.assertNotEqual(rev(fork, "develop"), moved)              # local trunk untouched
+
+        def test_sync_records_the_merge_commit(self):
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            base = origin_sha(fork, "develop")
+            name = sync_branch_name()
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 0, err + out)
+            entry = self.pending_of(fork)
+            self.assertEqual(entry, {"kind": "sync", "branch": name, "commit": rev(fork, name),
+                                     "base": base, "mr": ""})
+            self.assertEqual(entry["commit"], origin_sha(fork, name))
+            parents = self.parents_of(fork, entry["commit"])
+            self.assertEqual(len(parents), 2)                             # the merge commit
+            self.assertEqual(parents[0], base)
+            self.assertEqual(resumable(ctx_for(fork, strict_mirror=False), "sync", name), {})
+
+        def test_the_url_gh_prints_is_recorded_for_a_ship(self):
+            fork = make_fork(self.tmp)
+            name = self.feature(fork)
+            self.url_tool("gh", "https://github.com/acme/widget/pull/7")
+            with self.on("github"):
+                code, out, err = run("-C", fork, "ship", "--mr")
+            self.assertEqual(code, 0, err + out)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"], entry["mr"]),
+                             ("ship", name, "https://github.com/acme/widget/pull/7"))
+            self.assertEqual(entry["commit"], origin_sha(fork, name))
+
+        def test_the_url_glab_prints_is_recorded_for_a_sync(self):
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            url = "https://gitlab.example.com/acme/team/widget/-/merge_requests/3"
+            self.url_tool("glab", url)
+            with self.on("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--mr")
+            self.assertEqual(code, 0, err + out)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"], entry["mr"]),
+                             ("sync", sync_branch_name(), url))
+
+        def test_a_failed_or_missing_tool_still_leaves_the_record(self):
+            """The branch is pushed either way; the merge request is what is missing, and
+            `land` after a by-hand merge needs the record just the same."""
+            fork = make_fork(self.tmp)
+            name = self.feature(fork)
+            fake_tool(os.path.join(self.tmp, "bin"), "glab",
+                      'echo "https://example.invalid/-/merge_requests/9"\n'
+                      'echo "glab: not authenticated" >&2\nexit 1\n')
+            with self.on("gitlab"):
+                code, out, err = run("-C", fork, "ship", "--mr")
+            self.assertEqual(code, 0, err + out)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"], entry["mr"]), ("ship", name, ""))
+            self.assertEqual(entry["commit"], origin_sha(fork, name))
+
+            sh("git", "checkout", "-b", "feat/y", "develop", cwd=fork)
+            commit_fork(fork, "ours/y.txt", "y\n", "ours: y")
+            absent = ["forkflow-no-such-tool", "mr", "create"]
+            with self.on("gitlab"), mock.patch.object(
+                    sys.modules[__name__], "mr_command", lambda *a: absent):
+                code, out, err = run("-C", fork, "ship", "--mr")
+            self.assertEqual(code, 0, err + out)
+            entry = self.pending_of(fork)                  # the most recent run, URL-less
+            self.assertEqual((entry["kind"], entry["branch"], entry["mr"]),
+                             ("ship", "feat/y", ""))
+
+        def test_a_dry_run_writes_no_record(self):
+            fork = make_fork(self.tmp)
+            self.feature(fork)
+            code, out, err = run("-C", fork, "ship", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertFalse(os.path.exists(git_path(fork, STATE_FILE)))
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            code, out, err = run("-C", fork, "sync", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertFalse(os.path.exists(git_path(fork, STATE_FILE)))
 
     # ------------------------------------------------------------------- #
     # argument parsing and main
@@ -8899,8 +9186,11 @@ def run_tests() -> None:
             self.assertEqual(self.owners('"rebase"'), {"rebase_onto"})
 
         def test_git_and_the_platform_tools_are_the_only_subprocesses(self):
+            """`run_tool` took over the platform-tool call from `open_mr` when the merge
+            step (`merge_mr`) came to share it: a rename of the one owner, not a widening
+            of the set."""
             self.assertEqual(self.owners("subprocess"),      # `<module>` is the import
-                             {"git", "git_ok", "git_rc", "shell", "open_mr", "api_get",
+                             {"git", "git_ok", "git_rc", "shell", "run_tool", "api_get",
                               "<module>"})
 
     loader = unittest.TestLoader()
