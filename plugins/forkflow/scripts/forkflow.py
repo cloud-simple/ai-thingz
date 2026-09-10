@@ -1332,9 +1332,14 @@ def mr_command(ctx: Ctx, branch: str, title: str, body_file: str) -> list:
     if not target:
         return []
     if ctx.platform == "gitlab":
+        # `--yes` skips glab's "create this merge request?" confirmation: with --mr there is
+        # no terminal to answer it, and on the first real fork the printed command was run
+        # by hand every time for exactly that reason. gh needs nothing: --title and
+        # --body-file already make it non-interactive, and it has no --yes to give.
         return ["glab", "mr", "create", "--repo", target,
                 "--source-branch", branch, "--target-branch", ctx.trunk,
-                "--title", title, "--description-file", body_file, "--remove-source-branch"]
+                "--title", title, "--description-file", body_file, "--remove-source-branch",
+                "--yes"]
     if ctx.platform == "github":
         return ["gh", "pr", "create", "--repo", target,
                 "--head", branch, "--base", ctx.trunk,
@@ -1365,7 +1370,9 @@ def open_mr(ctx: Ctx, branch: str, title: str, body: str, run_it: bool) -> str:
         print(f"    description: {path}")
         return shown
     try:
-        p = subprocess.run(cmd, cwd=ctx.root, capture_output=True)
+        # stdin closed: a prompt the flags did not cover fails fast as a non-zero exit,
+        # reported below with its stderr, instead of waiting on a terminal nobody is at
+        p = subprocess.run(cmd, cwd=ctx.root, capture_output=True, stdin=subprocess.DEVNULL)
     except OSError as exc:
         step("mr", shown, f"{cmd[0]} unavailable ({exc.strerror or exc})")
         print(f"    description: {path}")
@@ -8220,7 +8227,8 @@ def run_tests() -> None:
                  "--target-branch", "develop",
                  "--title", "sync: title",
                  "--description-file", "/tmp/body.md",
-                 "--remove-source-branch"])
+                 "--remove-source-branch",
+                 "--yes"])
 
         def test_github_command(self):
             ctx = self.ctx("https://github.com/owner/repo.git")
@@ -8364,6 +8372,30 @@ def run_tests() -> None:
             self.assertIn("--repo ssh://gitlab.example.com/acme/team/widget", shown)
             self.assertIn("created", out)
 
+        def test_the_tool_runs_with_its_confirmation_skipped_and_stdin_closed(self):
+            """--mr has no terminal behind it. glab's "create this merge request?" prompt is
+            skipped with --yes, and stdin is closed so any prompt the flags did not cover
+            fails fast as an exit code instead of waiting. The spy is on the call rather than
+            on a fake that reads stdin: a fake that blocks on a real terminal would hang a
+            developer's suite, which is the failure being guarded against."""
+            ctx = ctx_for(make_fork(self.tmp))
+            ctx.platform = "gitlab"
+            ctx.origin_url = "git@gitlab.example.com:acme/team/widget.git"
+            ctx.upstream_url = "git@gitlab.example.com:original/widget.git"
+            done = subprocess.CompletedProcess([], 0, b"https://gitlab.example.com/mr/1\n", b"")
+            with mock.patch.object(subprocess, "run", return_value=done) as ran:
+                shown, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+            argv = list(ran.call_args[0][0])
+            self.assertIn("--yes", argv)
+            self.assertIs(ran.call_args[1].get("stdin"), subprocess.DEVNULL)
+            self.assertIn("--yes", shown)         # the printed command is the runnable one
+            ctx.platform = "github"
+            ctx.origin_url = "git@github.com:acme/widget.git"
+            with mock.patch.object(subprocess, "run", return_value=done) as ran:
+                capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+            self.assertNotIn("--yes", list(ran.call_args[0][0]))   # gh has no such flag
+            self.assertIs(ran.call_args[1].get("stdin"), subprocess.DEVNULL)
+
         def test_a_known_platform_that_names_no_project_runs_nothing(self):
             """--mr with nothing to aim at: the manual note, and no tool run at all - a
             command without the flag would have gone to the original project."""
@@ -8465,6 +8497,9 @@ def run_tests() -> None:
             argv = self.argv(log)
             self.assertEqual(argv[:2], ["mr", "create"])
             self.assertIn("--remove-source-branch", argv)
+            # no terminal answers glab's confirmation under --mr; on the first real fork the
+            # printed command was rerun by hand with --yes for all eight merge requests
+            self.assertIn("--yes", argv)
             # the merge request is opened on the fork; without this glab would resolve the
             # project from the remotes and answer with `upstream` - the original project
             self.assertEqual(self.value(argv, "--repo"), self.GL_FORK)
@@ -8497,6 +8532,7 @@ def run_tests() -> None:
 
             argv = self.argv(log)
             self.assertEqual(argv[:2], ["pr", "create"])
+            self.assertNotIn("--yes", argv)      # gh has no such flag; --title/--body-file suffice
             self.assertEqual(self.value(argv, "--repo"), self.GH_FORK)   # fork, not upstream
             self.assertEqual(self.value(argv, "--head"), "feat/x")
             self.assertEqual(self.value(argv, "--base"), "develop")
