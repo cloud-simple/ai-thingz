@@ -24,8 +24,8 @@ Sequence rule: sync first, then ship; rebase locally, merge globally.
 Usage:
     forkflow.py status [--fetch | --offline] [-C DIR]
     forkflow.py check [-C DIR]
-    forkflow.py sync [--continue] [--mr] [--title T] [-C DIR] [--dry-run] [--force]
-    forkflow.py ship [--continue] [--mr] [--title T] [--message-file F] [-C DIR] [--dry-run] [--force]
+    forkflow.py sync [--continue] [--mr] [--merge] [--title T] [-C DIR] [--dry-run] [--force]
+    forkflow.py ship [--continue] [--mr] [--merge] [--title T] [--message-file F] [-C DIR] [--dry-run] [--force]
     forkflow.py setup [--upstream NAME] [--upstream-url URL] [--trunk NAME] [--mirror NAME]
                       [-C DIR] [--dry-run] [--force]
     forkflow.py --test                        # run the embedded test suite
@@ -196,7 +196,11 @@ def short(sha: str) -> str:
 # --------------------------------------------------------------------------- #
 
 CONFIG_STRINGS = ("upstream", "upstream_branch", "mirror", "trunk",
-                  "sync_prefix", "backup_prefix")
+                  "sync_prefix", "backup_prefix", "merge")
+# `merge`: who merges this fork's merge requests. "manual" (the default) means a person does,
+# through the platform; "self" means whoever opened them - the solo fork - and is what lets
+# `sync --merge` / `ship --merge` merge the request they have just opened.
+MERGE_MODES = ("manual", "self")
 
 
 def have_tomllib() -> bool:
@@ -240,6 +244,11 @@ def parse_config(text: str, where: str) -> dict:
     if gate is not None and (not isinstance(gate, list)
                              or any(not isinstance(c, str) for c in gate)):
         raise Fail(f"{where}: `gate` must be a list of shell commands")
+    merge = cfg.get("merge")
+    if merge is not None and merge not in MERGE_MODES:
+        raise Fail(f"{where}: `merge` must be "
+                   + " or ".join(f'"{mode}"' for mode in MERGE_MODES)
+                   + f', not "{merge}"')
     return cfg
 
 
@@ -296,6 +305,7 @@ class Ctx:
     dry_run: bool = False
     sync_prefix: str = DEFAULT_SYNC_PREFIX
     backup_prefix: str = DEFAULT_BACKUP_PREFIX
+    merge: str = MERGE_MODES[0]          # "manual": see CONFIG_STRINGS
 
     def up(self) -> str:
         return f"{self.upstream}/{self.upstream_branch}"
@@ -572,7 +582,8 @@ def resolve_ctx(cwd: str, args: Optional[argparse.Namespace] = None, need_upstre
               upstream=upstream, upstream_url=upstream_url, upstream_branch=ub,
               trunk=trunk, mirror=mirror,
               dry_run=bool(getattr(args, "dry_run", False)),
-              sync_prefix=sync_prefix, backup_prefix=backup_prefix)
+              sync_prefix=sync_prefix, backup_prefix=backup_prefix,
+              merge=cfg.get("merge") or MERGE_MODES[0])
     ctx.platform = detect_platform(ctx.origin_url)
 
     local_mirror = has_ref(root, f"refs/heads/{ctx.mirror}")
@@ -2075,9 +2086,29 @@ def cmd_sync_continue(ctx: Ctx, args: argparse.Namespace) -> int:
                        resumable(ctx, "sync", name).get("backup", ""), merge_sha)
 
 
+def merge_gate(ctx: Ctx, args: argparse.Namespace) -> None:
+    """`--merge` refused, or nothing - before the fetch, the backup and any push.
+
+    Config AND flag: the fork declares once, in `.forkflow.toml`, that its merge requests are
+    merged by whoever opened them (`merge = "self"`), and the flag asks for it per run. Either
+    alone does nothing, so a reviewed fork can never be merged by accident. The second check
+    is knowable now too: a merge command addresses the fork by URL (`mr_target`), and an
+    origin that names no project would otherwise be a push followed by a failure."""
+    if not getattr(args, "merge", False):
+        return
+    if ctx.merge != "self":
+        raise Fail(f"--merge needs `merge = \"self\"` in {CONFIG_FILE}: this fork's merge "
+                   f"requests are merged by hand")
+    target, reason = mr_target(ctx)
+    if not target:
+        raise Fail(f"--merge: `{ctx.origin_url or '-'}` names no project to merge on "
+                   f"({reason})")
+
+
 def cmd_sync(args: argparse.Namespace) -> int:
     ctx = resolve_ctx(args.dir, args, need_upstream=True, need_trunk=True, strict_mirror=True)
     header(ctx, "sync")
+    merge_gate(ctx, args)             # before `--continue`: a conflicted sync resumes with it
     if getattr(args, "cont", False):
         return cmd_sync_continue(ctx, args)
 
@@ -2466,6 +2497,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
     ctx = resolve_ctx(args.dir, args, need_upstream=True, need_trunk=True, strict_mirror=True)
     header(ctx, "ship")
     branch = ship_preflight(ctx)
+    merge_gate(ctx, args)             # before `--continue`, the fetch, the backup, the push
     trunk_ref = f"{ctx.origin}/{ctx.trunk}"
 
     if getattr(args, "cont", False):
@@ -2558,6 +2590,8 @@ def template_text(ctx: Ctx) -> str:
         (f'mirror = {toml_string(ctx.mirror)}', "our fast-forward-only copy of it"),
         (f'trunk = {toml_string(ctx.trunk)}', "protected, MR-only branch with our work"),
         ("gate = []", 'e.g. ["make test", "terraform fmt"]'),
+        (f'merge = {toml_string(ctx.merge)}',
+         '"self": this fork\'s MRs are merged by whoever opened them - enables --merge'),
         (f'sync_prefix = {toml_string(ctx.sync_prefix)}', ""),
         (f'backup_prefix = {toml_string(ctx.backup_prefix)}', ""),
     ]
@@ -3577,12 +3611,18 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     sy.add_argument("--continue", dest="cont", action="store_true",
                     help="resume after resolving merge conflicts")
     sy.add_argument("--mr", action="store_true", help="run the merge-request command")
+    sy.add_argument("--merge", action="store_true",
+                    help="open the merge request and merge it; needs merge = \"self\" "
+                         "in " + CONFIG_FILE)
     sy.add_argument("--title", help="merge-request title")
 
     sh = sub.add_parser("ship", parents=[common], help="squash a feature branch onto the trunk's tip")
     sh.add_argument("--continue", dest="cont", action="store_true",
                     help="resume after `git rebase --continue`")
     sh.add_argument("--mr", action="store_true", help="run the merge-request command")
+    sh.add_argument("--merge", action="store_true",
+                    help="open the merge request and merge it; needs merge = \"self\" "
+                         "in " + CONFIG_FILE)
     sh.add_argument("--title", help="merge-request title")
     sh.add_argument("--message-file", help="file with the squashed commit message")
 
@@ -3599,6 +3639,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     for name, default in (("dir", "."), ("dry_run", False), ("force", False)):
         if not hasattr(args, name):
             setattr(args, name, default)
+    if getattr(args, "merge", False):
+        args.mr = True                   # merging a merge request means opening it first
     return args
 
 
@@ -4006,6 +4048,27 @@ def run_tests() -> None:
             self.assertEqual(cm.exception.code, 2)
             self.assertIn("3.11", str(cm.exception))
 
+        @needs_tomllib
+        def test_merge_is_manual_or_self_and_nothing_else(self):
+            """`merge` decides whether `--merge` may merge at all: a spelling nobody defined
+            is refused outright rather than read as one of the two."""
+            for text, expected in (('merge = "self"\n', "self"), ('merge = "manual"\n', "manual")):
+                write(self.tmp, CONFIG_FILE, text)
+                self.assertEqual(load_config(self.tmp)["merge"], expected, text)
+            write(self.tmp, CONFIG_FILE, 'trunk = "develop"\n')
+            self.assertNotIn("merge", load_config(self.tmp))              # absent: the default
+            for text in ('merge = "auto"\n', 'merge = "Self"\n', 'merge = ""\n'):
+                write(self.tmp, CONFIG_FILE, text)
+                with self.assertRaises(Fail) as cm:
+                    load_config(self.tmp)
+                self.assertEqual(cm.exception.code, 2, text)
+                self.assertIn('`merge` must be "manual" or "self"', str(cm.exception))
+            write(self.tmp, CONFIG_FILE, "merge = true\n")
+            with self.assertRaises(Fail) as cm:
+                load_config(self.tmp)
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("`merge` must be a string", str(cm.exception))
+
     # ------------------------------------------------------------------- #
     # resolve_ctx
     # ------------------------------------------------------------------- #
@@ -4027,6 +4090,17 @@ def run_tests() -> None:
             ctx = ctx_for(fork)
             self.assertEqual((ctx.trunk, ctx.mirror), ("trunk", "upstream-main"))
             self.assertEqual(ctx.up(), "upstream/main")
+
+        def test_merge_defaults_to_manual(self):
+            """No config, no `merge` key: the fork's merge requests are merged by hand."""
+            self.assertEqual(ctx_for(make_fork(self.tmp)).merge, "manual")
+
+        @needs_tomllib
+        def test_merge_is_read_from_the_config(self):
+            fork = make_fork(self.tmp, config='merge = "self"\n')
+            self.assertEqual(ctx_for(fork).merge, "self")
+            write(fork, CONFIG_FILE, 'merge = "manual"\n')       # the working tree decides
+            self.assertEqual(ctx_for(fork).merge, "manual")
 
         def test_upstream_head_master_fallback(self):
             fork = make_fork(self.tmp)
@@ -7014,6 +7088,8 @@ def run_tests() -> None:
                 template = fh.read()
             self.assertIn('# trunk = "develop"', template)
             self.assertIn('# mirror = "main"', template)
+            self.assertIn('# merge = "manual"', template)
+            self.assertIn("enables --merge", template)
             self.assertIn("commit " + CONFIG_FILE, out)
             self.assertNotIn("would:", out)
 
@@ -8599,6 +8675,97 @@ def run_tests() -> None:
     # argument parsing and main
     # ------------------------------------------------------------------- #
 
+    class TestMergeGate(Base):
+        """`--merge` is config AND flag, refused before the fetch, the backup and any push.
+
+        A reviewed fork must never be merged by accident: the flag alone does nothing, and
+        the refusal comes before anything the run would have to undo - `origin/develop`, the
+        mirror, the backup branches, the sync branch, the feature branch on origin and the
+        state file are all exactly as they were. The fixture's origin is a local path, so
+        the second condition (the fork can be named) needs the platform supplied."""
+
+        REFUSED = "--merge needs"
+        UNNAMED = "names no project"
+        FORK = "ssh://gitlab.example.com/acme/team/widget"
+
+        def named(self):
+            return mock.patch.multiple(sys.modules[__name__],
+                                       detect_platform=lambda url: "gitlab",
+                                       mr_target=lambda ctx: (self.FORK, ""))
+
+        def feature(self, fork: str) -> str:
+            sh("git", "checkout", "-b", "feat/x", "develop", cwd=fork)
+            commit_fork(fork, "ours/f0.txt", "line 0\n", "ours: step 0")
+            return "feat/x"
+
+        def refused(self, fork: str, *argv: str, why: str = REFUSED) -> None:
+            before = (origin_sha(fork, "develop"), origin_sha(fork, "main"),
+                      rev(fork, "refs/heads/main"), local_branches(fork))
+            code, out, err = run("-C", fork, *argv)
+            self.assertEqual(code, 2, " ".join(argv) + ": " + err + out)
+            self.assertIn(why, err)
+            self.assertEqual((origin_sha(fork, "develop"), origin_sha(fork, "main"),
+                              rev(fork, "refs/heads/main"), local_branches(fork)), before)
+            self.assertEqual(sh("git", "ls-remote", "--heads", "origin",
+                                "refs/heads/" + DEFAULT_BACKUP_PREFIX + "*", cwd=fork), "")
+            self.assertEqual(origin_sha(fork, sync_branch_name()), "")
+            self.assertEqual(origin_sha(fork, "feat/x"), "")
+            self.assertFalse(os.path.exists(git_path(fork, STATE_FILE)))
+
+        def both_refused(self, fork: str, why: str = REFUSED) -> None:
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            self.refused(fork, "sync", "--merge", why=why)
+            self.feature(fork)
+            self.refused(fork, "ship", "--merge", why=why)
+
+        @needs_tomllib
+        def test_refused_on_a_manual_fork_with_the_config_committed(self):
+            self.both_refused(make_fork(self.tmp, config='merge = "manual"\n'))
+
+        @needs_tomllib
+        def test_refused_on_a_manual_fork_with_the_config_untracked(self):
+            """`setup` leaves `.forkflow.toml` untracked, and `load_config` reads the
+            working tree: the gate must read it there too."""
+            fork = make_fork(self.tmp)
+            write(fork, CONFIG_FILE, 'merge = "manual"\n')
+            self.assertIn("?? " + CONFIG_FILE, sh("git", "status", "--porcelain", cwd=fork))
+            self.both_refused(fork)
+
+        def test_refused_with_no_config_at_all(self):
+            """No file means "manual": the default is the safe side."""
+            self.both_refused(make_fork(self.tmp))
+
+        def test_refused_on_continue_too(self):
+            """`cmd_sync` dispatches `--continue` before any preflight, and a conflicted sync
+            is exactly when `--continue` is used: the gate has to sit in front of it."""
+            fork = make_fork(self.tmp)
+            self.refused(fork, "sync", "--continue", "--merge")
+            self.feature(fork)
+            self.refused(fork, "ship", "--continue", "--merge")
+
+        @needs_tomllib
+        def test_refused_when_the_origin_names_no_project(self):
+            """Knowable at gate time, so not a push followed by a failed merge: the fixture's
+            local-path origin is on no platform and cannot be given to `--repo`."""
+            self.both_refused(make_fork(self.tmp, config='merge = "self"\n'), why=self.UNNAMED)
+
+        @needs_tomllib
+        def test_passes_on_a_self_fork_whose_origin_is_named(self):
+            """Both conditions met: the run goes on (a dry run here, which pushes nothing
+            and reaches the merge-request step)."""
+            fork = make_fork(self.tmp, config='merge = "self"\n')
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            with self.named():
+                code, out, err = run("-C", fork, "sync", "--merge", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertNotIn(self.REFUSED, err)
+            self.feature(fork)
+            with self.named():
+                code, out, err = run("-C", fork, "ship", "--merge", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertNotIn(self.REFUSED, err)
+            self.assertIn("not run (dry run)", out)              # `--merge` implied `--mr`
+
     class TestParseArgs(unittest.TestCase):
         def test_common_flags_before_or_after_the_subcommand(self):
             for argv in (["--dry-run", "sync"], ["sync", "--dry-run"]):
@@ -8623,6 +8790,21 @@ def run_tests() -> None:
                 self.assertEqual(parse_args([cmd, "--title", "t"]).title, "t", cmd)
                 self.assertFalse(parse_args([cmd]).mr, cmd)
                 self.assertIsNone(parse_args([cmd]).title, cmd)
+
+        def test_merge_implies_mr_and_not_the_other_way_round(self):
+            """Merging a merge request means opening it first; opening one never means
+            merging it."""
+            for cmd in ("sync", "ship"):
+                args = parse_args([cmd, "--merge"])
+                self.assertTrue(args.merge, cmd)
+                self.assertTrue(args.mr, cmd)
+                args = parse_args([cmd, "--mr"])
+                self.assertTrue(args.mr, cmd)
+                self.assertFalse(args.merge, cmd)
+                self.assertFalse(parse_args([cmd]).merge, cmd)
+            for argv in (["--dry-run", "ship", "--merge"], ["ship", "--merge", "--dry-run"]):
+                args = parse_args(argv)
+                self.assertTrue(args.mr and args.dry_run, argv)
 
         def test_no_subcommand_is_exit_2(self):
             code, _, err = capture(main, [])

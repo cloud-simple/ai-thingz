@@ -407,13 +407,13 @@ commit is not in this clone the line degrades to `... - cannot verify here` and 
 **Files:**
 - Modify: `plugins/forkflow/scripts/forkflow.py`
 
-- [ ] add `merge` to `CONFIG_STRINGS`; in `parse_config` the `("manual", "self")` membership check with `Fail(2)` in the other keys' wording; `Ctx.merge` field set in `resolve_ctx`
-- [ ] `template_text`: the commented `merge` line with its one-line explanation (Technical Details / Config)
-- [ ] `parse_args`: `--merge` on `sync` and `ship` implying `--mr`; module docstring usage lines gain `[--merge]`
-- [ ] the gate, both conditions (config, and `mr_target` can name the origin): in `cmd_ship` inside/after `ship_preflight`; in `cmd_sync` immediately after `header(ctx, "sync")` and before the `--continue` dispatch
-- [ ] write tests: config parse - `"self"`, default, bad value -> 2 (`needs_tomllib`); template contains the key; `parse_args` sets `mr` from `merge`
-- [ ] write tests: `--merge` refused before any push on a `"manual"` fork with the config committed, with it untracked (written into the working tree, not through `make_fork(config=)`), and with no config at all; on `sync --continue --merge` and `ship --continue --merge`; and on an unnameable origin: exit 2, `origin_sha(develop)` unchanged, no `backup/*` local or on origin, no sync branch, no state entry
-- [ ] run `python3 plugins/forkflow/scripts/forkflow.py --test` - must pass before task 2
+- [x] add `merge` to `CONFIG_STRINGS`; in `parse_config` the `("manual", "self")` membership check with `Fail(2)` in the other keys' wording; `Ctx.merge` field set in `resolve_ctx`
+- [x] `template_text`: the commented `merge` line with its one-line explanation (Technical Details / Config)
+- [x] `parse_args`: `--merge` on `sync` and `ship` implying `--mr`; module docstring usage lines gain `[--merge]`
+- [x] the gate, both conditions (config, and `mr_target` can name the origin): in `cmd_ship` inside/after `ship_preflight`; in `cmd_sync` immediately after `header(ctx, "sync")` and before the `--continue` dispatch
+- [x] write tests: config parse - `"self"`, default, bad value -> 2 (`needs_tomllib`); template contains the key; `parse_args` sets `mr` from `merge`
+- [x] write tests: `--merge` refused before any push on a `"manual"` fork with the config committed, with it untracked (written into the working tree, not through `make_fork(config=)`), and with no config at all; on `sync --continue --merge` and `ship --continue --merge`; and on an unnameable origin: exit 2, `origin_sha(develop)` unchanged, no `backup/*` local or on origin, no sync branch, no state entry
+- [x] run `python3 plugins/forkflow/scripts/forkflow.py --test` - must pass before task 2
 
 ### Task 2: `run_tool`, `open_mr` returning the URL, and the `pending` record
 
