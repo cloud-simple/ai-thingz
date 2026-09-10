@@ -39,6 +39,8 @@ Exit codes:
     3   invariant checked by `check` (gate command failed, branch not on the trunk's tip)
     4   conflicts - resolve, then rerun with --continue
     5   rewrite safety (backup not confirmed, tree hash mismatch, push rejected)
+    6   merge request not created or not merged (--merge only) - the branch is pushed;
+        merge by hand, then forkflow land
     130 interrupted
 
 `.forkflow.toml` is optional; reading it needs Python 3.11+ (tomllib). A config file that is
@@ -75,6 +77,8 @@ BOTH_SIDES_SNIFF = 8192              # bytes of a blob looked at for a NUL befor
 BOTH_SIDES_WIDTH = 48                # column the both-sides table pads paths to
 MAX_SYNC_RERUNS = 100                # `--force` reruns: `<name>-2` .. `<name>-99` before it gives up
 EXIT_INTERRUPTED = 130               # Ctrl-C, as the module docstring publishes it
+EXIT_NOT_MERGED = 6                  # --merge: the branch is pushed, the merge request is
+                                     # not merged (or not created) - all before it stands
 PUBLISHED_KEEP = 100                 # remembered (branch, commit) pushes - see record_published
 
 # The port each scheme reaches without being told: `ssh://host:22/o/r` and `host:o/r` are one
@@ -1453,6 +1457,68 @@ def open_mr(ctx: Ctx, branch: str, title: str, body: str, run_it: bool) -> Tuple
     return shown, url
 
 
+def merge_command(ctx: Ctx, kind: str, branch: str, head: str) -> list:
+    """The platform's merge command for the merge request `branch` opened, [] when the fork
+    cannot be named (see `mr_target`).
+
+    The merge request is addressed by its source branch - both tools accept that in place
+    of a number, and the run already has it; the URL is never parsed. `--repo` names the
+    fork for the same reason `mr_command` gives it. The method is the one rule 5 requires:
+    on GitLab the project's own `merge_method` decides (`setup`'s report insists on `ff`), so
+    glab gets neither `--squash` nor `--rebase`; GitHub has no project-level method, so gh is
+    told per call - `--merge` for a sync (its tip is the merge commit, the "merge" button
+    keeps it) and `--rebase` for a ship (the "rebase and merge" button, a fast-forward of one
+    commit - a gh flag, not a git verb). The head-commit guard is always on: `--sha` /
+    `--match-head-commit` merge only the exact commit this run pushed, never whatever the
+    branch points at by then - rule 4's spirit. `--auto-merge=false` is what makes glab
+    merge *now*: by default it arms merge-when-pipeline-succeeds and `land` finds nothing."""
+    target, _ = mr_target(ctx)
+    if not target:
+        return []
+    if ctx.platform == "gitlab":
+        return ["glab", "mr", "merge", branch, "--repo", target, "--sha", head,
+                "--auto-merge=false", "--remove-source-branch", "--yes"]
+    if ctx.platform == "github":
+        return ["gh", "pr", "merge", branch, "--repo", target, "--match-head-commit", head,
+                "--merge" if kind == "sync" else "--rebase"]
+    return []
+
+
+def merge_mr(ctx: Ctx, kind: str, branch: str, url: str) -> None:
+    """Merge the merge request `open_mr` just opened on `branch`, or exit 6.
+
+    Runs after the push and after the `pending` record has the merge request's URL, so any
+    failure here leaves a landable state: the branch is on origin, the merge request is
+    open, and `forkflow land` finishes the job once it is merged by hand - which is what
+    the exit-6 message says. A merge request that was never created (the tool failed, was
+    missing, or printed no URL) is the same exit: there is nothing to merge. A dry run
+    shows the merge and the landing it would chain into and runs neither."""
+    head = "<pushed head>" if ctx.dry_run else rev(ctx.root, f"refs/heads/{branch}")
+    cmd = merge_command(ctx, kind, branch, head)
+    shown = " ".join(shlex.quote(c) for c in cmd)
+    if ctx.dry_run:
+        step("merge", shown or f"# {mr_target(ctx)[1]}", "not run (dry run)", dry=True)
+        step("land", "forkflow land", "not run (dry run)", dry=True)
+        return
+    if not url or not cmd:
+        raise Fail("the merge request was not created - the branch is pushed; open and "
+                   "merge it by hand, then: forkflow land", EXIT_NOT_MERGED)
+    p = run_tool(ctx, cmd)
+    if p is None:
+        step("merge", shown, f"NOT MERGED ({cmd[0]} unavailable: not installed, or not runnable)")
+    elif p.returncode != 0:
+        step("merge", shown, f"NOT MERGED (exit {p.returncode})")
+        for line in tail_lines(p.stderr.decode("utf-8", "replace"), TAIL_LINES):
+            print(f"      {line}")
+    else:
+        step("merge", shown, "merged")
+        for line in p.stdout.decode("utf-8", "replace").strip().splitlines():
+            print(f"    {line}")
+        return
+    raise Fail(f"the merge request was not merged - the branch is pushed; merge it by hand "
+               f"({url}), then: forkflow land", EXIT_NOT_MERGED)
+
+
 # --------------------------------------------------------------------------- #
 # subcommands
 # --------------------------------------------------------------------------- #
@@ -2069,6 +2135,10 @@ def finish_sync(ctx: Ctx, args: argparse.Namespace, name: str, commits: Sequence
     if url:
         record_pending(ctx, "sync", name, base, url)
     write_state(ctx, "sync", None)                     # this sync is done: nothing to resume
+    if getattr(args, "merge", False):
+        merge_mr(ctx, "sync", name, url)               # exit 6 leaves the record above
+        print("  next: forkflow land")
+        return 0
     print(f"  after the MR is merged: git fetch {sh_arg(ctx.origin)} "
           f"&& git switch {sh_arg(ctx.trunk)} "
           f"&& git merge --ff-only {sh_arg(f'{ctx.origin}/{ctx.trunk}')}")
@@ -2174,8 +2244,13 @@ def cmd_sync(args: argparse.Namespace) -> int:
     sync_branch_is_free(ctx, name, force)     # before the backup: no orphan backup on a rerun
     if force:
         name = free_sync_name(ctx, name)      # a published sync branch is never pushed over
-    print(f"  leaving `{branch}`, switching to `{name}` "
-          f"(you stay on it when this finishes; the trunk is never touched)")
+    if getattr(args, "merge", False):
+        print(f"  leaving `{branch}`, switching to `{name}` "
+              f"(you stay on it when this finishes unless --merge lands it - then you "
+              f"are on `{ctx.trunk}`)")
+    else:
+        print(f"  leaving `{branch}`, switching to `{name}` "
+              f"(you stay on it when this finishes; the trunk is never touched)")
 
     fetch_both(ctx)
     target = rev(ctx.root, ctx.up())
@@ -2457,6 +2532,10 @@ def finish_ship(ctx: Ctx, args: argparse.Namespace, branch: str,
     if url:
         record_pending(ctx, "ship", branch, base, url)
     write_state(ctx, "ship", None)                     # this ship is done: nothing to resume
+    if getattr(args, "merge", False):
+        merge_mr(ctx, "ship", branch, url)             # exit 6 leaves the record above
+        print("  next: forkflow land")
+        return 0
     print(f"  after the MR is merged: git fetch {sh_arg(ctx.origin)} "
           f"&& git switch {sh_arg(ctx.trunk)} "
           f"&& git merge --ff-only {sh_arg(f'{ctx.origin}/{ctx.trunk}')}")
@@ -3914,6 +3993,95 @@ def run_tests() -> None:
         with open(path, "w") as fh:
             fh.write(body)
         os.chmod(path, 0o755)
+
+    def commit_after_receive(tmp: str, pattern: str = "refs/heads/feat/*") -> None:
+        """A post-receive hook in the bare origin that puts one more commit on the branch it
+        has just accepted - a teammate pushing between the push and the merge. The push
+        reports success; only the head-commit guard at merge time can catch it."""
+        hooks = os.path.join(tmp, "origin.git", "hooks")
+        os.makedirs(hooks, exist_ok=True)
+        body = ("#!/bin/sh\n"
+                "while read old new ref; do\n"
+                "  case \"$ref\" in %s) git update-ref \"$ref\" "
+                "\"$(git commit-tree \"$new^{tree}\" -p \"$new\" -m teammate)\" \"$new\";; esac\n"
+                "done\nexit 0\n" % pattern)
+        path = os.path.join(hooks, "post-receive")
+        with open(path, "w") as fh:
+            fh.write(body)
+        os.chmod(path, 0o755)
+
+    MERGING_TOOL_URL = {"glab": "https://example.invalid/-/merge_requests/1",
+                        "gh": "https://example.invalid/pull/1"}
+
+    def merging_tool(tmp: str, name: str, trunk: str = "develop") -> None:
+        """A glab/gh on PATH that opens AND merges: the platform simulated, not faked away.
+
+        Its argv goes one argument per line into `<name>-<subcommand>-argv.txt` - `create`
+        and `merge` get separate logs, because the one binary is run twice under `--merge`
+        and a single truncating log would lose the create argv and the body copy
+        (`<name>-body-copy.md`). On `create` it prints a URL in the platform's shape. On
+        `merge` it reads the sha from its own `--sha` / `--match-head-commit`, compares it
+        with the tip of the source branch in the bare origin and exits 1 with "head
+        mismatch" when they differ - so the head-commit guard is tested as behaviour, not
+        as an argv string - then merges the way the platform would: a fast-forward of the
+        bare origin's trunk (`update-ref`) for glab and for gh `--merge` (a sync's tip is
+        the merge commit), and for gh `--rebase` a cherry-pick of the commit in a temp
+        clone of the origin, pushed back - a one-commit rebase, new SHA, same patch; a bare
+        repository cannot rebase. `FORKFLOW_FAKE_FAIL=1` in the environment makes the merge
+        exit 1 with a stderr line and move nothing."""
+        origin_git = os.path.join(tmp, "origin.git")
+        script = (
+            'sub="$2"\n'
+            'for a in "$@"; do echo "$a"; done > {logs}/{name}-"$sub"-argv.txt\n'
+            'case "$sub" in\n'
+            'create)\n'
+            '  for a in "$@"; do [ -f "$a" ] && cp "$a" {body}; done\n'
+            '  echo "Creating merge request"\n'
+            '  echo {url}\n'
+            '  exit 0;;\n'
+            'merge)\n'
+            '  if [ -n "$FORKFLOW_FAKE_FAIL" ]; then\n'
+            '    echo "{name}: merge refused (FORKFLOW_FAKE_FAIL)" >&2; exit 1\n'
+            '  fi\n'
+            '  branch="$3"; want=""; rebase=0; prev=""\n'
+            '  for a in "$@"; do\n'
+            '    case "$prev" in --sha|--match-head-commit) want="$a";; esac\n'
+            '    [ "$a" = --rebase ] && rebase=1\n'
+            '    prev="$a"\n'
+            '  done\n'
+            '  tip=$(git --git-dir={origin} rev-parse "refs/heads/$branch") || exit 1\n'
+            '  if [ "$want" != "$tip" ]; then\n'
+            '    echo "{name}: head mismatch: $branch is at $tip, not $want" >&2; exit 1\n'
+            '  fi\n'
+            '  if [ "$rebase" = 1 ]; then\n'
+            '    clone={clone}; rm -rf "$clone"\n'
+            '    git clone -q -b {trunk} {origin} "$clone" >/dev/null 2>&1 || exit 1\n'
+            '    git -C "$clone" config commit.gpgsign false\n'
+            '    GIT_COMMITTER_NAME="{name} platform" GIT_COMMITTER_EMAIL=noreply@example.invalid\n'
+            '    export GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL\n'
+            '    git -C "$clone" cherry-pick "$tip" >/dev/null 2>&1 || {{\n'
+            '      echo "{name}: rebase and merge failed" >&2; exit 1; }}\n'
+            '    git -C "$clone" push -q origin HEAD:{trunk} >/dev/null 2>&1 || exit 1\n'
+            '  else\n'
+            '    git --git-dir={origin} update-ref refs/heads/{trunk} "$tip" || exit 1\n'
+            '  fi\n'
+            '  echo "merged $branch into {trunk}"\n'
+            '  exit 0;;\n'
+            'esac\n'
+            'echo "{name}: unexpected subcommand $sub" >&2; exit 2\n'
+        ).format(name=name, logs=shlex.quote(tmp), url=shlex.quote(MERGING_TOOL_URL[name]),
+                 body=shlex.quote(os.path.join(tmp, name + "-body-copy.md")),
+                 origin=shlex.quote(origin_git), trunk=shlex.quote(trunk),
+                 clone=shlex.quote(os.path.join(tmp, "platform-clone")))
+        fake_tool(os.path.join(tmp, "bin"), name, script)
+
+    def tool_argv(tmp: str, name: str, sub: str) -> list:
+        """What `merging_tool` recorded for `<name> <mr|pr> <sub>`, [] when it never ran."""
+        path = os.path.join(tmp, "%s-%s-argv.txt" % (name, sub))
+        if not os.path.exists(path):
+            return []
+        with open(path) as fh:
+            return [ln.rstrip("\n") for ln in fh]
 
     def local_branches(fork: str) -> str:
         return sh("git", "for-each-ref", "--format=%(refname)", "refs/heads/", cwd=fork)
@@ -8440,6 +8608,61 @@ def run_tests() -> None:
             self.assertIn("fast-forward", merge_button(gitlab, "ship"))
             self.assertIn("Rebase and merge", merge_button(github, "ship"))
 
+    class TestMergeCommand(unittest.TestCase):
+        """The merge command carries the method rule 5 requires and the head-commit guard,
+        names the fork, and addresses the merge request by its source branch."""
+
+        HEAD = "0123456789abcdef0123456789abcdef01234567"
+
+        def ctx(self, url: str, trunk: str = DEFAULT_TRUNK) -> Ctx:
+            c = Ctx(root="/repo", origin_url=url, trunk=trunk)
+            c.platform = detect_platform(url)
+            return c
+
+        def test_gitlab_is_the_projects_method_with_the_guard_and_no_auto_merge(self):
+            """No --squash and no --rebase: on GitLab the project's `merge_method` decides.
+            `--auto-merge=false` is what makes glab merge now rather than arm
+            merge-when-pipeline-succeeds, and `--yes` skips a confirmation nobody is at."""
+            ctx = self.ctx("git@gitlab.com:group/proj.git")
+            for kind in ("ship", "sync"):
+                self.assertEqual(
+                    merge_command(ctx, kind, "feat/x", self.HEAD),
+                    ["glab", "mr", "merge", "feat/x",
+                     "--repo", "ssh://gitlab.com/group/proj",
+                     "--sha", self.HEAD,
+                     "--auto-merge=false", "--remove-source-branch", "--yes"], kind)
+
+        def test_github_is_told_the_method_per_call(self):
+            """GitHub has no project-level method: `--merge` keeps a sync's merge commit,
+            `--rebase` fast-forwards a ship's one commit (the "Rebase and merge" button)."""
+            ctx = self.ctx("https://github.com/owner/repo.git")
+            self.assertEqual(
+                merge_command(ctx, "sync", "sync/upstream-20260101", self.HEAD),
+                ["gh", "pr", "merge", "sync/upstream-20260101",
+                 "--repo", "https://github.com/owner/repo",
+                 "--match-head-commit", self.HEAD, "--merge"])
+            self.assertEqual(
+                merge_command(ctx, "ship", "feat/x", self.HEAD),
+                ["gh", "pr", "merge", "feat/x",
+                 "--repo", "https://github.com/owner/repo",
+                 "--match-head-commit", self.HEAD, "--rebase"])
+            for kind in ("ship", "sync"):
+                self.assertNotIn("--squash", merge_command(ctx, kind, "feat/x", self.HEAD))
+
+        def test_the_guard_is_the_head_it_was_given(self):
+            for url, flag in (("git@gitlab.com:g/p.git", "--sha"),
+                              ("git@github.com:g/p.git", "--match-head-commit")):
+                cmd = merge_command(self.ctx(url), "ship", "feat/x", "abc123")
+                self.assertEqual(cmd[cmd.index(flag) + 1], "abc123", cmd)
+                self.assertEqual(cmd[3], "feat/x", cmd)          # addressed by branch
+
+        def test_no_fork_to_name_means_no_command(self):
+            self.assertEqual(merge_command(self.ctx("/srv/git/repo.git"), "ship", "feat/x",
+                                           self.HEAD), [])
+            # more than owner/repo on GitHub: gh refuses it, so `mr_target` names nothing
+            self.assertEqual(merge_command(self.ctx("https://github.com/a/b/c.git"), "ship",
+                                           "feat/x", self.HEAD), [])
+
     class TestMrCommandsNameTheFork(unittest.TestCase):
         """Every merge request command names the fork itself.
 
@@ -8957,6 +9180,274 @@ def run_tests() -> None:
             code, out, err = run("-C", fork, "sync", "--dry-run")
             self.assertEqual(code, 0, err + out)
             self.assertFalse(os.path.exists(git_path(fork, STATE_FILE)))
+
+    @needs_tomllib
+    class TestMergeStep(ShipBase):
+        """`--merge`: the merge request the run just opened is merged by the platform tool
+        with the method rule 5 requires and a head-commit guard - or the run is exit 6 with
+        the branch pushed, the merge request open and the `pending` record intact.
+
+        The platform is `merging_tool`, which moves the bare origin's trunk the way the real
+        one would, so a success is asserted on the trunk moving and not on the argv alone.
+        Nothing here asserts on `pending` after a successful merge: `land` chains in after
+        it and clears the record. The fixture's origin is a local path, so the platform
+        and the fork it names are supplied (`TestMrCommandsNameTheFork` proves the URL)."""
+
+        FORKS = {"gitlab": "ssh://gitlab.example.com/acme/team/widget",
+                 "github": "https://github.com/acme/widget"}
+        TOOLS = {"gitlab": "glab", "github": "gh"}
+
+        def on(self, platform: str):
+            return mock.patch.multiple(sys.modules[__name__],
+                                       detect_platform=lambda url: platform,
+                                       mr_target=lambda ctx: (self.FORKS[platform], ""))
+
+        def self_fork(self) -> str:
+            return make_fork(self.tmp, config='merge = "self"\n')
+
+        def platform(self, name: str) -> str:
+            """A merging glab/gh on PATH; answers with the platform it stands for."""
+            merging_tool(self.tmp, self.TOOLS[name])
+            return name
+
+        def argv(self, platform: str, sub: str) -> list:
+            return tool_argv(self.tmp, self.TOOLS[platform], sub)
+
+        def value(self, argv: Sequence[str], flag: str) -> str:
+            self.assertIn(flag, argv)
+            return argv[list(argv).index(flag) + 1]
+
+        def upstream_change(self) -> None:
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+
+        def state_file(self, fork: str) -> str:
+            return git_path(fork, STATE_FILE)
+
+        @staticmethod
+        def pending_of(fork: str) -> dict:
+            return pending_entry(ctx_for(fork, need_trunk=False, strict_mirror=False))
+
+        @staticmethod
+        def tree_of(fork: str, sha: str) -> str:
+            return sh("git", "rev-parse", sha + "^{tree}", cwd=fork)
+
+        # -- success: the trunk moves, by the platform, to what this run pushed ----------
+
+        def test_gitlab_ship_merges_with_the_projects_method_and_the_head_guard(self):
+            fork = self.self_fork()
+            name = self.feature(fork, commits=2)
+            base = origin_sha(fork, "develop")
+            with self.on(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 0, err + out)
+            shipped = origin_sha(fork, name)
+            self.assertNotEqual(shipped, "")
+            self.assertEqual(self.argv("gitlab", "create")[:2], ["mr", "create"])
+            argv = self.argv("gitlab", "merge")
+            self.assertEqual(argv[:3], ["mr", "merge", name])          # by branch, not URL
+            self.assertEqual(self.value(argv, "--repo"), self.FORKS["gitlab"])
+            self.assertEqual(self.value(argv, "--sha"), shipped)       # the pushed head
+            self.assertIn("--auto-merge=false", argv)
+            self.assertIn("--remove-source-branch", argv)
+            self.assertIn("--yes", argv)
+            for flag in ("--squash", "--rebase", "--merge"):
+                self.assertNotIn(flag, argv)               # the project's method decides
+            self.assertNotEqual(origin_sha(fork, "develop"), base)
+            self.assertEqual(origin_sha(fork, "develop"), shipped)     # fast-forwarded
+            self.assertIn(MERGING_TOOL_URL["glab"], out)
+            self.assertIn("merged", out)
+
+        def test_gitlab_sync_merges_the_merge_commit_fast_forward(self):
+            fork = self.self_fork()
+            self.upstream_change()
+            name = sync_branch_name()
+            with self.on(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.assertEqual(code, 0, err + out)
+            synced = origin_sha(fork, name)
+            argv = self.argv("gitlab", "merge")
+            self.assertEqual(argv[:3], ["mr", "merge", name])
+            self.assertEqual(self.value(argv, "--sha"), synced)
+            self.assertEqual(origin_sha(fork, "develop"), synced)
+            self.assertEqual(len(sh("git", "rev-list", "--parents", "-1", synced,
+                                    cwd=fork).split()), 3)            # still the merge commit
+
+        def test_github_ship_merges_with_rebase_and_the_head_guard(self):
+            """"Rebase and merge" rewrites the commit: the trunk gets a new SHA with the
+            same patch on top of the base - which is what the fake does, and what `land`
+            has to recognise later."""
+            fork = self.self_fork()
+            name = self.feature(fork)
+            base = origin_sha(fork, "develop")
+            with self.on(self.platform("github")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 0, err + out)
+            shipped = origin_sha(fork, name)
+            argv = self.argv("github", "merge")
+            self.assertEqual(argv[:3], ["pr", "merge", name])
+            self.assertEqual(self.value(argv, "--repo"), self.FORKS["github"])
+            self.assertEqual(self.value(argv, "--match-head-commit"), shipped)
+            self.assertIn("--rebase", argv)
+            for flag in ("--squash", "--merge", "--auto-merge=false", "--yes"):
+                self.assertNotIn(flag, argv)
+            sh("git", "fetch", "origin", cwd=fork)
+            landed = origin_sha(fork, "develop")
+            self.assertNotIn(landed, (base, shipped))                  # rewritten
+            self.assertEqual(sh("git", "rev-list", "--parents", "-1", landed,
+                                cwd=fork).split()[1:], [base])
+            self.assertEqual(self.tree_of(fork, landed), self.tree_of(fork, shipped))
+
+        def test_github_sync_merges_with_merge(self):
+            fork = self.self_fork()
+            self.upstream_change()
+            name = sync_branch_name()
+            with self.on(self.platform("github")):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.assertEqual(code, 0, err + out)
+            argv = self.argv("github", "merge")
+            self.assertEqual(argv[:3], ["pr", "merge", name])
+            self.assertEqual(self.value(argv, "--match-head-commit"), origin_sha(fork, name))
+            self.assertIn("--merge", argv)
+            self.assertNotIn("--rebase", argv)
+            self.assertNotIn("--squash", argv)
+            self.assertEqual(origin_sha(fork, "develop"), origin_sha(fork, name))
+
+        # -- exit 6: the branch is pushed, the record is landable ------------------------
+
+        def refused_merge(self, fork: str, name: str, kind: str, base: str,
+                          platform: str, *argv: str) -> dict:
+            """Run with --merge, expect exit 6, and answer with the intact record."""
+            with self.on(platform):
+                code, out, err = run("-C", fork, kind, "--merge", *argv)
+            self.assertEqual(code, 6, err + out)
+            self.assertIn("forkflow land", err)                        # the way out
+            self.assertEqual(origin_sha(fork, "develop"), base)        # trunk unchanged
+            entry = self.pending_of(fork)
+            self.assertEqual((entry.get("kind"), entry.get("branch")), (kind, name))
+            self.assertEqual(entry.get("commit"), rev(fork, "refs/heads/" + name))
+            self.assertEqual(entry.get("base"), base)
+            self.assertEqual(resumable(ctx_for(fork, strict_mirror=False), kind, name), {})
+            return entry
+
+        def head_moved(self, platform: str, flag: str) -> None:
+            """A teammate's commit reaches the branch between the push and the merge: the
+            guard names the commit this run pushed, and the platform refuses - the merge
+            must never take whatever the branch points at by then. The proof is the fake's
+            refusal, not the argv; and the argv carries exactly the recorded commit."""
+            fork = self.self_fork()
+            name = self.feature(fork)
+            base = origin_sha(fork, "develop")
+            commit_after_receive(self.tmp)
+            with self.on(self.platform(platform)):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 6, err + out)
+            self.assertIn("head mismatch", out)                        # the fake's refusal
+            self.assertIn("NOT MERGED (exit 1)", out)
+            self.assertIn("forkflow land", err)                        # the way out
+            self.assertEqual(origin_sha(fork, "develop"), base)        # trunk unchanged
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"], entry["base"]),
+                             ("ship", name, base))
+            self.assertEqual(entry["commit"], rev(fork, "refs/heads/" + name))
+            self.assertEqual(entry["mr"], MERGING_TOOL_URL[self.TOOLS[platform]])
+            self.assertEqual(self.value(self.argv(platform, "merge"), flag), entry["commit"])
+            self.assertNotEqual(origin_sha(fork, name), entry["commit"])    # it did move
+            self.assertEqual(sh("git", "symbolic-ref", "--short", "HEAD", cwd=fork), name)
+
+        def test_gitlab_refuses_a_head_that_moved_after_the_push(self):
+            self.head_moved("gitlab", "--sha")
+
+        def test_github_refuses_a_head_that_moved_after_the_push(self):
+            self.head_moved("github", "--match-head-commit")
+
+        def test_a_failing_merge_is_exit_6_with_the_request_open(self):
+            fork = self.self_fork()
+            self.upstream_change()
+            name = sync_branch_name()
+            base = origin_sha(fork, "develop")
+            os.environ["FORKFLOW_FAKE_FAIL"] = "1"
+            with self.on(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.assertEqual(code, 6, err + out)
+            self.assertIn("created", out)                              # the MR is open ...
+            self.assertIn(MERGING_TOOL_URL["glab"], out)
+            self.assertIn("NOT MERGED (exit 1)", out)                  # ... and not merged
+            self.assertIn("FORKFLOW_FAKE_FAIL", out)                   # the tool's stderr
+            self.assertIn("not merged", err)
+            self.assertEqual(origin_sha(fork, "develop"), base)
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+            entry = self.pending_of(fork)
+            self.assertEqual(entry, {"kind": "sync", "branch": name,
+                                     "commit": rev(fork, "refs/heads/" + name),
+                                     "base": base, "mr": MERGING_TOOL_URL["glab"]})
+            self.assertEqual(resumable(ctx_for(fork, strict_mirror=False), "sync", name), {})
+
+        def test_a_merge_request_that_was_not_created_is_exit_6(self):
+            """The tool failed at `create`, so there is no merge request to merge: no merge
+            is attempted, and the record is there for a by-hand merge and `land`."""
+            fork = self.self_fork()
+            name = self.feature(fork)
+            base = origin_sha(fork, "develop")
+            fake_tool(os.path.join(self.tmp, "bin"), "glab",
+                      'echo "glab: not authenticated" >&2\nexit 1\n')
+            entry = self.refused_merge(fork, name, "ship", base, "gitlab")
+            self.assertEqual(entry["mr"], "")
+            self.assertEqual(self.argv("gitlab", "merge"), [])          # never ran
+            self.assertEqual(origin_sha(fork, name), entry["commit"])   # pushed all the same
+
+        def test_a_missing_merge_tool_is_exit_6(self):
+            fork = self.self_fork()
+            name = self.feature(fork)
+            base = origin_sha(fork, "develop")
+            self.platform("github")
+            absent = ["forkflow-no-such-tool", "pr", "merge", name]
+            with mock.patch.object(sys.modules[__name__], "merge_command", lambda *a: absent):
+                with self.on("github"):
+                    code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 6, err + out)
+            self.assertIn("NOT MERGED (forkflow-no-such-tool unavailable", out)
+            self.assertEqual(origin_sha(fork, "develop"), base)
+            self.assertEqual(self.pending_of(fork)["mr"], MERGING_TOOL_URL["gh"])
+
+        # -- what does not merge ----------------------------------------------------------
+
+        def test_mr_without_merge_runs_no_merge(self):
+            fork = self.self_fork()
+            name = self.feature(fork)
+            base = origin_sha(fork, "develop")
+            with self.on(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--mr")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(self.argv("gitlab", "create")[:2], ["mr", "create"])
+            self.assertEqual(self.argv("gitlab", "merge"), [])
+            self.assertEqual(origin_sha(fork, "develop"), base)
+            self.assertEqual(self.pending_of(fork)["mr"], MERGING_TOOL_URL["glab"])
+            self.assertEqual(sh("git", "symbolic-ref", "--short", "HEAD", cwd=fork), name)
+
+        def test_a_dry_run_runs_nothing_and_writes_nothing(self):
+            fork = self.self_fork()
+            self.upstream_change()
+            before = (origin_sha(fork, "develop"), origin_sha(fork, "main"))
+            self.platform("gitlab")
+            with self.on("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--merge", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("would: merge", out)
+            self.assertIn("would: land", out)
+            self.assertIn("unless --merge lands it", out)         # where you end up
+            name = self.feature(fork)
+            with self.on("gitlab"):
+                code, out, err = run("-C", fork, "ship", "--merge", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("would: merge", out)
+            self.assertIn("glab mr merge " + name, out)
+            self.assertIn("would: land", out)
+            self.assertEqual(self.argv("gitlab", "create"), [])       # neither tool ran
+            self.assertEqual(self.argv("gitlab", "merge"), [])
+            self.assertFalse(os.path.exists(self.state_file(fork)))    # no state at all
+            self.assertEqual((origin_sha(fork, "develop"), origin_sha(fork, "main")), before)
+            self.assertEqual(self.backup_branch(fork), "")
+            self.assertEqual(origin_sha(fork, name), "")                # nothing pushed
 
     # ------------------------------------------------------------------- #
     # argument parsing and main
