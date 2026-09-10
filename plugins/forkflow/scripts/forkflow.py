@@ -26,6 +26,7 @@ Usage:
     forkflow.py check [-C DIR]
     forkflow.py sync [--continue] [--mr] [--merge] [--title T] [-C DIR] [--dry-run] [--force]
     forkflow.py ship [--continue] [--mr] [--merge] [--title T] [--message-file F] [-C DIR] [--dry-run] [--force]
+    forkflow.py land [--force] [-C DIR] [--dry-run]
     forkflow.py setup [--upstream NAME] [--upstream-url URL] [--trunk NAME] [--mirror NAME]
                       [-C DIR] [--dry-run] [--force]
     forkflow.py --test                        # run the embedded test suite
@@ -1153,14 +1154,19 @@ def push_mirror(ctx: Ctx, target: str = "") -> str:
     return cmd
 
 
-def mirror_worktree(ctx: Ctx) -> str:
-    """Path of the worktree that has the mirror checked out, "" when none."""
+def branch_worktree(ctx: Ctx, branch: str) -> str:
+    """Path of the worktree that has `branch` checked out, "" when none."""
     rc, out, _ = git_rc("for-each-ref", "--format=%(worktreepath)",
-                        f"refs/heads/{ctx.mirror}", cwd=ctx.root)
+                        f"refs/heads/{branch}", cwd=ctx.root)
     if rc != 0:                     # git without %(worktreepath): only this worktree is visible
         cur = git("symbolic-ref", "-q", "--short", "HEAD", cwd=ctx.root, check=False)
-        return ctx.root if cur == ctx.mirror else ""
+        return ctx.root if cur == branch else ""
     return out.strip()
+
+
+def mirror_worktree(ctx: Ctx) -> str:
+    """Path of the worktree that has the mirror checked out, "" when none."""
+    return branch_worktree(ctx, ctx.mirror)
 
 
 def advance_mirror(ctx: Ctx, target: str) -> Tuple[str, str]:
@@ -2137,12 +2143,27 @@ def finish_sync(ctx: Ctx, args: argparse.Namespace, name: str, commits: Sequence
     write_state(ctx, "sync", None)                     # this sync is done: nothing to resume
     if getattr(args, "merge", False):
         merge_mr(ctx, "sync", name, url)               # exit 6 leaves the record above
-        print("  next: forkflow land")
+        land_after_merge(ctx)
         return 0
-    print(f"  after the MR is merged: git fetch {sh_arg(ctx.origin)} "
-          f"&& git switch {sh_arg(ctx.trunk)} "
-          f"&& git merge --ff-only {sh_arg(f'{ctx.origin}/{ctx.trunk}')}")
+    print("  after the MR is merged, next: forkflow land")
     return 0
+
+
+def land_after_merge(ctx: Ctx) -> None:
+    """`--merge`'s closing step: the request is merged, so `land` runs in this process.
+
+    A catch-up that cannot run is its own exit 2, but the message has to open with what
+    did happen - the merge request *is* merged - so nobody reads a non-zero exit as
+    "nothing happened": the branch is on the trunk, and `forkflow land` finishes the rest
+    once the reason is dealt with. A dry run wrote no record and `merge_mr` has already
+    shown `would: land`, so there is nothing to run here."""
+    if ctx.dry_run:
+        return
+    try:
+        land_pending(ctx)
+    except Fail as exc:
+        raise Fail(f"the merge request was merged; the local catch-up did not run: {exc}",
+                   exc.code)
 
 
 def cmd_sync_continue(ctx: Ctx, args: argparse.Namespace) -> int:
@@ -2534,14 +2555,9 @@ def finish_ship(ctx: Ctx, args: argparse.Namespace, branch: str,
     write_state(ctx, "ship", None)                     # this ship is done: nothing to resume
     if getattr(args, "merge", False):
         merge_mr(ctx, "ship", branch, url)             # exit 6 leaves the record above
-        print("  next: forkflow land")
+        land_after_merge(ctx)
         return 0
-    print(f"  after the MR is merged: git fetch {sh_arg(ctx.origin)} "
-          f"&& git switch {sh_arg(ctx.trunk)} "
-          f"&& git merge --ff-only {sh_arg(f'{ctx.origin}/{ctx.trunk}')}")
-    if ctx.platform == "github":
-        print(f"    then delete the local `{branch}`: "
-              f'"Rebase and merge" rewrites the commit, so the local branch is a stale copy')
+    print("  after the MR is merged, next: forkflow land")
     return 0
 
 
@@ -2696,6 +2712,215 @@ def cmd_ship(args: argparse.Namespace) -> int:
     write_state(ctx, "ship", {"branch": branch, "backup": backup_ref, "lease": lease})
     rebase_onto(ctx, branch, trunk_ref)
     return finish_ship(ctx, args, branch, backup_ref, lease)
+
+
+# --------------------------------------------------------------------------- #
+# land - the closing step: the merge request is merged, catch the local trunk up
+#
+# The only place this script moves the local trunk, and only by fast-forward (a merge, not a
+# ref move: `git branch -f` stays blocked by `TestSourceInvariants`). It neither pushes,
+# rebases nor commits: what `origin/<trunk>` holds after the platform merged the request
+# is taken as it is, and the branch that was merged is deleted locally.
+# --------------------------------------------------------------------------- #
+
+def landed(ctx: Ctx, entry: dict) -> Tuple[Optional[str], str]:
+    """Is the pending commit on `origin/<trunk>`? (the trunk commit it landed as, how).
+
+    Git only - no API call. Ancestry first: a fast-forward or a merge commit keeps the
+    SHA, so the recorded commit is simply reachable from the trunk ("ancestor"). A ship
+    the platform or a human rebased or squashed lands under a new SHA with the same patch,
+    so for a ship `git cherry` is asked, in the direction that names the trunk commit: which
+    commits in `<base>..origin/<trunk>` carry the shipped commit's patch-id ("rewritten"). That
+    survives other commits landing in between, which tree equality would not. A sync's tip
+    is the merge commit itself and only ever lands as an ancestor - rewritten, it would
+    have broken rule 5, which the caller says. (None, "") when nothing landed."""
+    trunk_ref = f"refs/remotes/{ctx.origin}/{ctx.trunk}"
+    commit, base = entry["commit"], entry["base"]
+    rc, _, _ = git_rc("merge-base", "--is-ancestor", commit, trunk_ref, cwd=ctx.root)
+    if rc == 0:
+        return (commit, "ancestor")
+    if rc != 1:
+        raise Fail(f"cannot verify the landing: {short(commit)} (the pushed `{entry['branch']}`) "
+                   f"is not in this clone - `land` needs the clone that ran the ship or the "
+                   f"sync, or `land --force` to fast-forward unverified")
+    if entry["kind"] != "ship":
+        return (None, "")
+    # `git cherry <upstream> <head> <limit>`: the commits in `<limit>..<head>` (here, what
+    # landed on the trunk since the base), each marked `-` when a commit reachable from
+    # `<upstream>` but not from `<head>` (here, exactly the shipped commit) has its patch
+    rc, out, _ = git_rc("cherry", commit, trunk_ref, base, cwd=ctx.root)
+    if rc != 0:
+        return (None, "")
+    for line in out.splitlines():
+        mark, _, sha = line.partition(" ")
+        if mark == "-" and sha.strip():
+            return (sha.strip(), "rewritten")
+    return (None, "")
+
+
+def trunk_elsewhere(ctx: Ctx) -> None:
+    """Fail(2) when the trunk is checked out in another worktree: it has to be checked out
+    and fast-forwarded there, as `advance_mirror` insists for the mirror."""
+    wt = branch_worktree(ctx, ctx.trunk)
+    if wt and os.path.realpath(wt) != os.path.realpath(ctx.root):
+        raise Fail(f"trunk `{ctx.trunk}` is checked out in {wt}: run `forkflow land` there, "
+                   f"or remove that worktree")
+
+
+def land_trunk(ctx: Ctx) -> Tuple[str, str]:
+    """Check the local trunk out and fast-forward it to `origin/<trunk>`. (old sha, new sha).
+
+    The checkout is unconditional: HEAD is usually on the branch about to be deleted, and
+    `land` leaves you on the trunk either way (`git checkout`, not `switch` - the git floor
+    is 2.20). The fast-forward is `merge --ff-only` - the second owner of that call after
+    `advance_mirror`, pinned by `TestSourceInvariants` - and never a ref move: the branch is
+    checked out, so its files have to follow. A local trunk with commits origin lacks is
+    refused before anything moves: this plugin never creates such commits (rule 2), so they
+    are someone's by-hand work and not this script's to lose."""
+    t = ctx.trunk
+    trunk_ref = f"refs/remotes/{ctx.origin}/{t}"
+    shown_ref = f"{ctx.origin}/{t}"
+    new = rev(ctx.root, trunk_ref)
+    if not new:
+        raise Fail(f"`{shown_ref}` does not resolve after the fetch: is the trunk still on "
+                   f"{ctx.origin}?")
+    old = rev(ctx.root, f"refs/heads/{t}")
+    if old and old != new:
+        rc, _, _ = git_rc("merge-base", "--is-ancestor", old, trunk_ref, cwd=ctx.root)
+        if rc != 0:
+            raise Fail(f"`{t}` has commits {ctx.origin} lacks - the plugin never creates "
+                       f"these; resolve by hand (`git log {sh_arg(f'{shown_ref}..{t}')}`), "
+                       f"then run `forkflow land` again")
+    trunk_elsewhere(ctx)
+    if not old:
+        cmd = f"git branch --no-track {sh_arg(t)} {sh_arg(shown_ref)}"
+        if ctx.dry_run:
+            step("trunk", cmd, f"would create {t} at {short(new)}", dry=True)
+        else:
+            git("branch", "--no-track", t, trunk_ref, cwd=ctx.root)
+            step("trunk", cmd, f"created at {short(new)} (no local `{t}` before)")
+    cmd = f"git checkout {sh_arg(t)}"
+    if ctx.dry_run:
+        step("checkout", cmd, f"would leave you on {t}", dry=True)
+    else:
+        rc, out, err = git_rc("checkout", t, cwd=ctx.root)
+        if rc != 0:
+            step("checkout", cmd, "FAILED")
+            raise Fail(f"cannot check out `{t}`:\n{(err or out).strip()}")
+        step("checkout", cmd, f"on {t}")
+    if not old or old == new:
+        step("trunk", f"git rev-parse {sh_arg(t)}", f"up to date at {short(new)}")
+        return (old or new, new)
+    cmd = f"git merge --ff-only {sh_arg(shown_ref)}"
+    if ctx.dry_run:
+        step("trunk", cmd, f"{short(old)} -> {short(new)}", dry=True)
+        return (old, new)
+    rc, out, err = git_rc("merge", "--ff-only", trunk_ref, cwd=ctx.root)
+    if rc != 0:                     # unreachable after the ancestor check, but git has the say
+        step("trunk", cmd, "REFUSED")
+        raise Fail(f"cannot fast-forward `{t}`:\n{(err or out).strip()}")
+    step("trunk", cmd, f"{short(old)} -> {short(new)}")
+    return (old, new)
+
+
+def land_pending(ctx: Ctx, force: bool = False) -> None:
+    """The closing step of a ship or a sync, from the `pending` record: fetch, recognise
+    the landing, fast-forward the local trunk, delete the landed branch, forget the record.
+
+    Works after a human merged the merge request, in any later session, and after a
+    "squash and merge" or a "rebase and merge" of a ship (see `landed`). A merge request
+    that is not on the trunk yet is exit 2 and not an error - "not merged yet" - unless
+    `force`, which fast-forwards to whatever origin has, deletes no branch (nothing was
+    verified) and clears the record: the escape hatch for a landing the tool cannot see,
+    and for a request that was closed instead of merged. Rule 5 is reported, not enforced:
+    a ship that landed as a merge commit is said out loud. A dry run fetches, decides, and
+    prints every mutating step as `would:`; the record stays (`write_state`)."""
+    entry = pending_entry(ctx)
+    if not entry:
+        raise Fail("nothing pending: `forkflow ship` or `forkflow sync` first - `land` "
+                   "finishes the run that pushed a branch")
+    kind, branch = entry["kind"], entry["branch"]
+    if rebase_in_progress(ctx):            # before the tree: a stopped rebase leaves it dirty
+        raise Fail("a rebase is in progress: finish it (`git rebase --continue`) or abort "
+                   "it (`git rebase --abort`) first")
+    if not clean_tree(ctx):
+        raise Fail("the working tree has uncommitted changes: commit or stash them first")
+    trunk_elsewhere(ctx)
+
+    shown_ref = f"{ctx.origin}/{ctx.trunk}"
+    trunk_ref = f"refs/remotes/{shown_ref}"
+    rc, cmd, result, err = fetch(ctx, (ctx.origin,), [shown_ref])
+    if rc != 0:
+        step("fetch", cmd, "FAILED")
+        raise Fail(f"fetch failed: {err.strip()}")
+    step("fetch", cmd, result)
+
+    request = entry.get("mr") or f"`{branch}`"
+    sha, how = landed(ctx, entry)
+    if sha is None:
+        cmd = f"git merge-base --is-ancestor {sh_arg(short(entry['commit']))} {sh_arg(shown_ref)}"
+        if not force:
+            step("landed?", cmd, f"no - {short(entry['commit'])} is not on {shown_ref}")
+            note = ""
+            if kind == "sync":
+                note = (f"; if it was squashed or rebased in the UI, rule 5 was broken (see "
+                        f"rules.md) - `forkflow land --force` fast-forwards anyway")
+            raise Fail(f"MR {request} is not on {shown_ref} yet - merge it, then run "
+                       f"`forkflow land` again{note}")
+        step("landed?", cmd, "landing not verified (--force): fast-forwarding to whatever "
+                             f"{shown_ref} holds")
+    else:
+        if how == "ancestor":
+            cmd = (f"git merge-base --is-ancestor {sh_arg(short(entry['commit']))} "
+                   f"{sh_arg(shown_ref)}")
+        else:
+            cmd = (f"git cherry {sh_arg(short(entry['commit']))} {sh_arg(shown_ref)} "
+                   f"{sh_arg(short(entry['base']))}")
+        step("landed?", cmd, f"yes - as {short(sha)} ({how})")
+        if kind == "ship" and how == "ancestor":
+            # a fast-forward puts the shipped commit on the trunk's first-parent line; a
+            # merge commit keeps its SHA too, but hangs it off a second parent
+            first = git("rev-list", "--first-parent", f"{entry['base']}..{trunk_ref}",
+                        cwd=ctx.root, check=False).split()
+            if sha not in first:
+                print(f"  WARNING: the ship MR was merged as a merge commit - rule 5 asks for "
+                      f"a fast-forward; check the project's merge method (`forkflow setup` "
+                      f"reports it)")
+
+    old, new = land_trunk(ctx)
+
+    if sha is not None and branch not in (ctx.trunk, ctx.mirror):
+        # `-d` refuses a branch whose tip is unreachable from the trunk, which a rewritten
+        # landing is by definition; the patch is verifiably on the trunk, so `-D` is safe
+        flag = "-d" if how == "ancestor" else "-D"
+        cmd = f"git branch {flag} {sh_arg(branch)}"
+        if ctx.dry_run:
+            step("branch", cmd, f"would delete `{branch}` (landed as {short(sha)})", dry=True)
+        elif not has_ref(ctx.root, f"refs/heads/{branch}"):
+            step("branch", cmd, f"`{branch}` is already gone")
+        else:
+            rc, out, err = git_rc("branch", flag, branch, cwd=ctx.root)
+            if rc != 0:             # the landing is done; a branch that will not go is said
+                step("branch", cmd, f"NOT deleted: {(err or out).strip().splitlines()[-1]}")
+            else:
+                step("branch", cmd, f"deleted (landed as {short(sha)})")
+    elif sha is None:
+        print(f"  `{branch}` is kept: its landing was not verified")
+
+    write_state(ctx, "pending", None)
+    moved = f"{short(old)}..{short(new)}" if old != new else f"at {short(new)}"
+    print(f"  {'would: ' if ctx.dry_run else ''}landed: {ctx.trunk} {moved} - you are on "
+          f"{ctx.trunk}")
+    if ctx.platform == "github" and kind == "ship":
+        print(f"  {ctx.origin}/{branch} may still exist: git push {sh_arg(ctx.origin)} "
+              f"--delete {sh_arg(branch)}")
+
+
+def cmd_land(args: argparse.Namespace) -> int:
+    ctx = resolve_ctx(args.dir, args, need_upstream=True, need_trunk=True, strict_mirror=False)
+    header(ctx, "land")
+    land_pending(ctx, force=bool(getattr(args, "force", False)))
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -3713,6 +3938,7 @@ COMMANDS = {
     "check": cmd_check,
     "sync": cmd_sync,
     "ship": cmd_ship,
+    "land": cmd_land,
     "setup": cmd_setup,
 }
 
@@ -3727,13 +3953,14 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
                              "write no config (it does fetch, and simulates the merge)")
     common.add_argument("--force", action="store_true", default=argparse.SUPPRESS,
                         help="`sync`: recreate an existing sync branch; `setup`: replace a "
-                             "foreign pre-push hook. No effect on status, check or ship")
+                             "foreign pre-push hook. No effect on status, check or ship; "
+                             "`land --force` fast-forwards a landing the tool cannot verify")
 
     p = argparse.ArgumentParser(prog="forkflow", parents=[common],
                                 description=__doc__.split("\n\n")[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter,
                                 epilog="`forkflow.py --test` runs the embedded test suite.")
-    sub = p.add_subparsers(dest="cmd", metavar="{status,check,sync,ship,setup}")
+    sub = p.add_subparsers(dest="cmd", metavar="{status,check,sync,ship,land,setup}")
 
     s = sub.add_parser("status", parents=[common], help="where mirror, trunk and upstream stand")
     s.add_argument("--fetch", action="store_true", help="refresh remote-tracking refs first")
@@ -3760,6 +3987,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
                          "in " + CONFIG_FILE)
     sh.add_argument("--title", help="merge-request title")
     sh.add_argument("--message-file", help="file with the squashed commit message")
+
+    sub.add_parser("land", parents=[common],
+                   help="the MR is merged: fast-forward the local trunk and delete the branch")
 
     st = sub.add_parser("setup", parents=[common], help="make the rules mechanical in this clone")
     st.add_argument("--upstream", metavar="NAME", help="remote name of the original project")
@@ -4662,7 +4892,7 @@ def run_tests() -> None:
             for line in out.splitlines():
                 if "  $ " in line:
                     found.append(line.split("  $ ", 1)[1].split("  -> ")[0])
-                for marker in ("rollback: ", "fix: ", "after the MR is merged: "):
+                for marker in ("rollback: ", "fix: ", "may still exist: "):
                     if marker in line:
                         found.append(line.split(marker, 1)[1])
             return found
@@ -4690,10 +4920,16 @@ def run_tests() -> None:
             commit_upstream(self.tmp, "src/app.py", "def main():\n    return 3\n")
             sh("git", "checkout", "-b", "feat/x", self.TRUNK, cwd=fork)
             commit_fork(fork, "ours/f.txt", "ours\n", "ours: step")
+            # a `pending` entry nothing landed, so `land --force --dry-run` prints the
+            # checkout and the fast-forward it would run, with the trunk's name in both
+            write_state(ctx_for(fork, strict_mirror=False), "pending",
+                        {"kind": "ship", "branch": "feat/x", "commit": rev(fork, "feat/x"),
+                         "base": origin_sha(fork, self.TRUNK), "mr": ""})
 
             names, seen = (self.TRUNK, self.PREFIX), set()
             for argv in (("status", "--fetch"), ("check",), ("sync", "--dry-run"),
-                         ("ship", "--dry-run"), ("setup", "--dry-run")):
+                         ("ship", "--dry-run"), ("land", "--force", "--dry-run"),
+                         ("setup", "--dry-run")):
                 code, out, err = run("-C", fork, *argv)
                 self.assertEqual(code, 0, " ".join(argv) + ": " + err + out)
                 self.assertTrue(self.commands(out), "no commands printed by " + argv[0])
@@ -9182,16 +9418,11 @@ def run_tests() -> None:
             self.assertFalse(os.path.exists(git_path(fork, STATE_FILE)))
 
     @needs_tomllib
-    class TestMergeStep(ShipBase):
-        """`--merge`: the merge request the run just opened is merged by the platform tool
-        with the method rule 5 requires and a head-commit guard - or the run is exit 6 with
-        the branch pushed, the merge request open and the `pending` record intact.
-
-        The platform is `merging_tool`, which moves the bare origin's trunk the way the real
-        one would, so a success is asserted on the trunk moving and not on the argv alone.
-        Nothing here asserts on `pending` after a successful merge: `land` chains in after
-        it and clears the record. The fixture's origin is a local path, so the platform
-        and the fork it names are supplied (`TestMrCommandsNameTheFork` proves the URL)."""
+    class MergeBase(ShipBase):
+        """A `merge = "self"` fork on a named platform, with `merging_tool` as the platform:
+        what the `--merge` tests and the `land`-after-`--merge` tests share. The fixture's
+        origin is a local path, so the platform and the fork it names are supplied
+        (`TestMrCommandsNameTheFork` proves the URL)."""
 
         FORKS = {"gitlab": "ssh://gitlab.example.com/acme/team/widget",
                  "github": "https://github.com/acme/widget"}
@@ -9230,6 +9461,16 @@ def run_tests() -> None:
         @staticmethod
         def tree_of(fork: str, sha: str) -> str:
             return sh("git", "rev-parse", sha + "^{tree}", cwd=fork)
+
+    class TestMergeStep(MergeBase):
+        """`--merge`: the merge request the run just opened is merged by the platform tool
+        with the method rule 5 requires and a head-commit guard - or the run is exit 6 with
+        the branch pushed, the merge request open and the `pending` record intact.
+
+        The platform is `merging_tool`, which moves the bare origin's trunk the way the real
+        one would, so a success is asserted on the trunk moving and not on the argv alone.
+        Nothing here asserts on `pending` after a successful merge: `land` chains in after
+        it and clears the record (`TestMergeLands` asserts that chain)."""
 
         # -- success: the trunk moves, by the platform, to what this run pushed ----------
 
@@ -9450,6 +9691,421 @@ def run_tests() -> None:
             self.assertEqual(origin_sha(fork, name), "")                # nothing pushed
 
     # ------------------------------------------------------------------- #
+    # land
+    # ------------------------------------------------------------------- #
+
+    class TestLand(ShipBase):
+        """`land`: the closing step, from the `pending` record a ship or a sync left.
+
+        The merge is a human's here - the bare origin's trunk is moved by the test, the way
+        the platform's merge button moves it: a fast-forward, a cherry-pick (rebase and
+        merge), a squash, a merge commit. Assertions are on state: where the local trunk,
+        HEAD and the landed branch are afterwards, and whether the record is gone."""
+
+        MR = "https://example.invalid/-/merge_requests/1"
+
+        def origin_git(self) -> str:
+            return os.path.join(self.tmp, "origin.git")
+
+        def move_trunk(self, sha: str) -> None:
+            """A human merged the MR by fast-forward: the bare origin's trunk moves to `sha`."""
+            sh("git", "--git-dir=" + self.origin_git(), "update-ref", "refs/heads/develop", sha)
+
+        def human(self, *cmds: Sequence[str]) -> str:
+            """A clone somebody else merges from: origin/develop checked out, each of `cmds`
+            run there, the result pushed; answers with the trunk's new tip.
+
+            Under their own committer identity: a cherry-pick onto the same parent by the
+            same committer in the same second is byte-for-byte the shipped commit again,
+            and a "rewrite" that keeps the SHA would prove nothing."""
+            clone = os.path.join(self.tmp, "human")
+            if not os.path.exists(clone):
+                sh("git", "clone", "-q", self.origin_git(), clone)
+                identity(clone)
+            with mock.patch.dict(os.environ, {"GIT_COMMITTER_NAME": "a human",
+                                              "GIT_COMMITTER_EMAIL": "human@example.invalid"}):
+                sh("git", "fetch", "-q", "origin", cwd=clone)
+                sh("git", "checkout", "-q", "-B", "develop", "origin/develop", cwd=clone)
+                for cmd in cmds:
+                    sh("git", *cmd, cwd=clone)
+                sh("git", "push", "-q", "origin", "develop", cwd=clone)
+            return sh("git", "rev-parse", "HEAD", cwd=clone)
+
+        def parent_of(self, sha: str) -> str:
+            return sh("git", "rev-parse", sha + "^", cwd=os.path.join(self.tmp, "human"))
+
+        @staticmethod
+        def pending_of(fork: str) -> dict:
+            return pending_entry(ctx_for(fork, need_trunk=False, strict_mirror=False))
+
+        def with_mr(self, fork: str, entry: dict) -> dict:
+            """The record as a run with `--mr` leaves it: the merge request's URL known."""
+            entry = dict(entry, mr=self.MR)
+            write_state(ctx_for(fork, strict_mirror=False), "pending", entry)
+            return entry
+
+        def shipped(self, commits: int = 1) -> Tuple[str, str, dict]:
+            """A fork whose feature branch is shipped and pushed, the MR not merged yet."""
+            fork = make_fork(self.tmp)
+            name = self.feature(fork, commits=commits)
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("next: forkflow land", out)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"]), ("ship", name))
+            return fork, name, entry
+
+        def synced(self) -> Tuple[str, str, dict]:
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("next: forkflow land", out)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"]), ("sync", sync_branch_name()))
+            return fork, entry["branch"], entry
+
+        def land(self, fork: str, *flags: str):
+            return run("-C", fork, "land", *flags)
+
+        def assert_landed(self, fork: str, name: str, tip: str) -> None:
+            """The local trunk is at `tip` and checked out, the branch is gone, the record
+            is cleared, and the tree is clean."""
+            self.assertEqual(rev(fork, "refs/heads/develop"), tip)
+            self.assertEqual(rev(fork, "refs/remotes/origin/develop"), tip)
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(rev(fork, "refs/heads/" + name), "")
+            self.assertEqual(self.pending_of(fork), {})
+            self.assertEqual(sh("git", "status", "--porcelain", cwd=fork), "")
+
+        def assert_untouched(self, fork: str, name: str, entry: dict, on: str) -> None:
+            """Nothing moved: local trunk, HEAD, the branch and the record as they were."""
+            self.assertEqual(rev(fork, "refs/heads/develop"), entry["base"])
+            self.assertEqual(checked_out(fork), on)
+            self.assertEqual(rev(fork, "refs/heads/" + name), entry["commit"])
+            self.assertEqual(self.pending_of(fork), entry)
+
+        # -- preflight: exit 2, nothing moves ----------------------------------------------
+
+        def test_nothing_pending_is_exit_2(self):
+            fork = make_fork(self.tmp)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("nothing pending", err)
+            self.assertEqual(checked_out(fork), "develop")
+
+        def test_a_dirty_tree_is_exit_2(self):
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            write(fork, "README.md", "# edited\n")
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("uncommitted changes", err)
+            self.assert_untouched(fork, name, entry, on=name)
+
+        def test_a_rebase_in_progress_is_exit_2(self):
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            sh("git", "checkout", "-q", "-b", "other", "develop", cwd=fork)
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "other: shared")
+            second_clone_commit(self.tmp, path="shared.tf",
+                                content=self.BASE_TF.replace("count = 1", "count = 9"))
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            sh("git", "rebase", "origin/develop", cwd=fork, check=False)   # stops on shared.tf
+            self.assertTrue(rebase_in_progress(ctx_for(fork, strict_mirror=False)))
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("rebase is in progress", err)
+            self.assertEqual(rev(fork, "refs/heads/develop"), entry["base"])
+            self.assertEqual(self.pending_of(fork), entry)
+
+        def test_the_trunk_checked_out_in_another_worktree_is_exit_2(self):
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            wt = os.path.join(self.tmp, "wt")
+            sh("git", "worktree", "add", "-q", wt, "develop", cwd=fork)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("checked out in", err)
+            self.assertIn(os.path.basename(wt), err)                 # the path is named
+            self.assert_untouched(fork, name, entry, on=name)
+
+        # -- not landed --------------------------------------------------------------------
+
+        def test_a_ship_not_merged_yet_is_exit_2_naming_the_request(self):
+            fork, name, entry = self.shipped()
+            entry = self.with_mr(fork, entry)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn(self.MR, err)
+            self.assertIn("not on origin/develop yet", err)
+            self.assertNotIn("rule 5", err)                          # a ship may be rewritten
+            self.assert_untouched(fork, name, entry, on=name)
+            self.assertEqual(origin_sha(fork, "develop"), entry["base"])
+
+        def test_a_sync_not_merged_yet_carries_the_rule_5_note(self):
+            fork, name, entry = self.synced()
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("`%s`" % name, err)                        # no URL: the branch
+            self.assertIn("rule 5", err)
+            self.assertIn("land --force", err)
+            self.assert_untouched(fork, name, entry, on=name)
+
+        def test_the_ship_of_another_clone_cannot_be_verified_here(self):
+            """A record whose commit this clone does not have - the state file copied from
+            elsewhere, say - is refused rather than guessed at."""
+            fork, name, entry = self.shipped()
+            elsewhere = commit_upstream(self.tmp, "docs/x.md", "x\n")   # never fetched here
+            entry = dict(entry, commit=elsewhere, branch="feat/other")
+            write_state(ctx_for(fork, strict_mirror=False), "pending", entry)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("cannot verify", err)
+            self.assertEqual(rev(fork, "refs/heads/develop"), entry["base"])
+
+        # -- landed ------------------------------------------------------------------------
+
+        def test_a_ship_merged_by_fast_forward_lands_by_ancestry(self):
+            fork, name, entry = self.shipped(commits=2)
+            self.move_trunk(entry["commit"])
+            old = rev(fork, "refs/heads/develop")
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("(ancestor)", out)
+            self.assertIn("git branch -d " + name, out)
+            self.assertIn("landed: develop %s..%s" % (short(old), short(entry["commit"])), out)
+            self.assertIn("you are on develop", out)
+            self.assertNotIn("WARNING", out)
+            self.assert_landed(fork, name, entry["commit"])
+            self.assertTrue(os.path.exists(os.path.join(fork, "ours", "f1.txt")))  # files follow
+
+        def test_a_sync_merged_as_its_merge_commit_lands(self):
+            fork, name, entry = self.synced()
+            self.move_trunk(entry["commit"])
+            mirror = rev(fork, "refs/heads/main")
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assert_landed(fork, name, entry["commit"])
+            self.assertEqual(rev(fork, "refs/heads/main"), mirror)     # the mirror is not touched
+            self.assertTrue(os.path.exists(os.path.join(fork, "docs", "theirs.md")))
+
+        def test_a_ship_rebased_by_the_platform_lands_by_its_patch(self):
+            """"Rebase and merge": a new SHA with the same patch. `-d` would refuse the
+            branch (its tip is unreachable from the trunk), so the verified landing uses `-D`."""
+            fork, name, entry = self.shipped()
+            tip = self.human(("cherry-pick", "origin/" + name))
+            self.assertNotEqual(tip, entry["commit"])
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("%s (rewritten)" % short(tip), out)
+            self.assertIn("git branch -D " + name, out)
+            self.assert_landed(fork, name, tip)
+
+        def test_a_rewritten_ship_is_found_behind_a_commit_that_landed_first(self):
+            """Another commit reached the trunk between the push and the merge: tree
+            equality would say "not landed"; the patch is still there."""
+            fork, name, entry = self.shipped()
+            other = second_clone_commit(self.tmp)
+            tip = self.human(("cherry-pick", "origin/" + name))
+            self.assertEqual(self.parent_of(tip), other)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("(rewritten)", out)
+            self.assert_landed(fork, name, tip)
+            self.assertTrue(os.path.exists(os.path.join(fork, "ours", "other.txt")))
+
+        def test_a_ship_squashed_by_a_human_lands_by_its_patch(self):
+            fork, name, entry = self.shipped()
+            tip = self.human(("merge", "--squash", "origin/" + name),
+                             ("commit", "-q", "-m", "squashed by hand"))
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("(rewritten)", out)
+            self.assert_landed(fork, name, tip)
+
+        def test_a_ship_merged_as_a_merge_commit_lands_with_the_rule_5_warning(self):
+            fork, name, entry = self.shipped()
+            tip = self.human(("merge", "--no-ff", "-q", "-m", "Merge " + name, "origin/" + name))
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("(ancestor)", out)
+            self.assertIn("WARNING", out)
+            self.assertIn("merged as a merge commit", out)
+            self.assert_landed(fork, name, tip)
+
+        def test_a_local_trunk_with_its_own_commit_is_exit_2_and_untouched(self):
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            sh("git", "checkout", "-q", "develop", cwd=fork)
+            own = commit_fork(fork, "ours/local.txt", "local\n", "local: by hand")
+            sh("git", "checkout", "-q", name, cwd=fork)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("commits origin lacks", err)
+            self.assertEqual(rev(fork, "refs/heads/develop"), own)
+            self.assertEqual(checked_out(fork), name)
+            self.assertEqual(rev(fork, "refs/heads/" + name), entry["commit"])
+            self.assertEqual(self.pending_of(fork), entry)
+
+        def test_a_missing_local_trunk_is_created_from_origin(self):
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            sh("git", "branch", "-D", "develop", cwd=fork)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("git branch --no-track develop origin/develop", out)
+            self.assert_landed(fork, name, entry["commit"])
+
+        def test_land_from_an_unrelated_branch_ends_on_the_trunk(self):
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            sh("git", "checkout", "-q", "-b", "other", "develop", cwd=fork)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assert_landed(fork, name, entry["commit"])
+            self.assertEqual(rev(fork, "refs/heads/other"), entry["base"])   # left alone
+
+        def test_land_twice_is_nothing_pending(self):
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("nothing pending", err)
+
+        # -- --force and --dry-run ---------------------------------------------------------
+
+        def test_force_fast_forwards_an_unverified_landing_and_keeps_the_branch(self):
+            """The MR was closed instead of merged and somebody else's commit landed: the
+            trunk follows origin, the branch stays (nothing proved it landed), the record
+            is cleared - the escape hatch, said out loud."""
+            fork, name, entry = self.shipped()
+            entry = self.with_mr(fork, entry)
+            other = second_clone_commit(self.tmp)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)                      # without --force: no
+            self.assert_untouched(fork, name, entry, on=name)
+            code, out, err = self.land(fork, "--force")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("not verified (--force)", out)
+            self.assertIn("`%s` is kept" % name, out)
+            self.assertEqual(rev(fork, "refs/heads/develop"), other)
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(rev(fork, "refs/heads/" + name), entry["commit"])   # kept
+            self.assertEqual(self.pending_of(fork), {})
+
+        def test_force_deletes_the_branch_when_the_landing_is_verified(self):
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            code, out, err = self.land(fork, "--force")
+            self.assertEqual(code, 0, err + out)
+            self.assertNotIn("not verified", out)
+            self.assert_landed(fork, name, entry["commit"])
+
+        def test_a_dry_run_moves_nothing_and_keeps_the_record(self):
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            code, out, err = self.land(fork, "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("would: checkout  $ git checkout develop", out)
+            self.assertIn("would: trunk  $ git merge --ff-only origin/develop", out)
+            self.assertIn("would: branch  $ git branch -d " + name, out)
+            self.assertIn("would: landed", out)
+            self.assertEqual(rev(fork, "refs/remotes/origin/develop"), entry["commit"])  # fetched
+            self.assert_untouched(fork, name, entry, on=name)
+
+    class TestMergeLands(MergeBase):
+        """`--merge` ends by running `land` in the same process: the trunk is
+        fast-forwarded locally, you are left on it, the branch is gone, the record cleared -
+        on both platforms and for both kinds. A merge that succeeded and a catch-up that
+        then could not run is exit 2 opening with "the merge request was merged"."""
+
+        def assert_landed(self, fork: str, name: str, tip: str) -> None:
+            self.assertEqual(rev(fork, "refs/heads/develop"), tip)
+            self.assertEqual(origin_sha(fork, "develop"), tip)
+            self.assertEqual(sh("git", "symbolic-ref", "--short", "HEAD", cwd=fork), "develop")
+            self.assertEqual(rev(fork, "refs/heads/" + name), "")
+            self.assertEqual(self.pending_of(fork), {})
+            self.assertEqual(sh("git", "status", "--porcelain", cwd=fork), "")
+
+        def test_gitlab_ship_lands_by_fast_forward(self):
+            fork = self.self_fork()
+            name = self.feature(fork, commits=2)
+            old = rev(fork, "refs/heads/develop")
+            with self.on(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 0, err + out)
+            shipped = origin_sha(fork, name)
+            self.assertIn("merged", out)
+            self.assertIn("(ancestor)", out)
+            self.assertIn("landed: develop %s..%s" % (short(old), short(shipped)), out)
+            self.assertNotIn("may still exist", out)                 # glab removed it
+            self.assert_landed(fork, name, shipped)
+
+        def test_gitlab_sync_lands_its_merge_commit(self):
+            fork = self.self_fork()
+            self.upstream_change()
+            name = sync_branch_name()
+            with self.on(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("unless --merge lands it", out)
+            self.assert_landed(fork, name, origin_sha(fork, name))
+            self.assertEqual(rev(fork, "refs/heads/main"), rev(fork, "upstream/main"))
+
+        def test_github_ship_lands_its_rebased_copy(self):
+            fork = self.self_fork()
+            name = self.feature(fork)
+            base = origin_sha(fork, "develop")
+            with self.on(self.platform("github")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 0, err + out)
+            tip = origin_sha(fork, "develop")
+            self.assertNotIn(tip, (base, origin_sha(fork, name)))     # rewritten by the platform
+            self.assertIn("(rewritten)", out)
+            self.assertIn("git branch -D " + name, out)
+            self.assertIn("git push origin --delete " + name, out)    # gh leaves the remote branch
+            self.assert_landed(fork, name, tip)
+
+        def test_github_sync_lands_its_merge_commit(self):
+            fork = self.self_fork()
+            self.upstream_change()
+            name = sync_branch_name()
+            with self.on(self.platform("github")):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("(ancestor)", out)
+            self.assertNotIn("may still exist", out)                 # a sync: no hint
+            self.assert_landed(fork, name, origin_sha(fork, name))
+
+        def test_a_merged_request_whose_catch_up_cannot_run_says_so_first(self):
+            """The local trunk carries a commit of its own: the platform merged the request,
+            `land` refuses to move the trunk, and the exit says both - merged, not landed."""
+            fork = self.self_fork()
+            name = self.feature(fork)
+            sh("git", "checkout", "-q", "develop", cwd=fork)
+            own = commit_fork(fork, "ours/local.txt", "local\n", "local: by hand")
+            sh("git", "checkout", "-q", name, cwd=fork)
+            with self.on(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 2, err + out)
+            self.assertTrue(err.startswith("forkflow: the merge request was merged; "
+                                           "the local catch-up did not run: "), err)
+            self.assertIn("commits origin lacks", err)
+            shipped = origin_sha(fork, name)
+            self.assertEqual(origin_sha(fork, "develop"), shipped)   # merged ...
+            self.assertEqual(rev(fork, "refs/heads/develop"), own)   # ... not landed
+            self.assertEqual(sh("git", "symbolic-ref", "--short", "HEAD", cwd=fork), name)
+            self.assertEqual(rev(fork, "refs/heads/" + name), shipped)
+            entry = self.pending_of(fork)                            # `land` can run later
+            self.assertEqual((entry["kind"], entry["branch"], entry["commit"]),
+                             ("ship", name, shipped))
+            self.assertEqual(entry["mr"], MERGING_TOOL_URL["glab"])
+
+    # ------------------------------------------------------------------- #
     # argument parsing and main
     # ------------------------------------------------------------------- #
 
@@ -9584,6 +10240,16 @@ def run_tests() -> None:
                 args = parse_args(argv)
                 self.assertTrue(args.mr and args.dry_run, argv)
 
+        def test_land_takes_the_common_flags_and_nothing_else(self):
+            self.assertIs(COMMANDS["land"], cmd_land)
+            for argv in (["land", "--force"], ["--force", "land"]):
+                args = parse_args(argv)
+                self.assertEqual((args.cmd, args.force, args.dry_run), ("land", True, False), argv)
+            args = parse_args(["land", "--dry-run", "-C", "/x"])
+            self.assertEqual((args.force, args.dry_run, args.dir), (False, True, "/x"))
+            with self.assertRaises(SystemExit):        # `--merge` belongs to sync and ship
+                capture(parse_args, ["land", "--merge"])
+
         def test_no_subcommand_is_exit_2(self):
             code, _, err = capture(main, [])
             self.assertEqual(code, 2)
@@ -9671,7 +10337,12 @@ def run_tests() -> None:
 
         def test_only_advance_mirror_moves_the_mirror(self):
             self.assertEqual(self.owners('"update-ref"'), {"advance_mirror"})
-            self.assertEqual(self.owners('"merge", "--ff-only"'), {"advance_mirror"})
+
+        def test_the_two_fast_forwards_are_the_mirror_and_the_trunk_landing(self):
+            """`land_trunk` joined `advance_mirror` as an owner of `merge --ff-only` when
+            `land` came: the local trunk moves only by fast-forward, only there, and never
+            by a ref move (`git branch -f` stays blocked, `update-ref` stays the mirror's)."""
+            self.assertEqual(self.owners('"merge", "--ff-only"'), {"advance_mirror", "land_trunk"})
 
         def test_the_only_rebase_is_of_a_feature_branch(self):
             self.assertEqual(self.owners('"rebase"'), {"rebase_onto"})
