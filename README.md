@@ -347,3 +347,14 @@ source-invariant test parses the script with `ast`, maps every line to the funct
 asserts that the git argument `push` appears only in the three push helpers, `update-ref` and
 `merge --ff-only` only in `advance_mirror`, `rebase` only in `rebase_onto`, `--force-with-lease` only
 in `push()`, and that no git call anywhere passes `--force` or `--no-verify`.
+
+### Versions
+
+The version in `plugins/forkflow/.claude-plugin/plugin.json` moves whenever a change alters what a
+subcommand does, so an installed copy can be told apart from `main` (`/plugin` shows it, and the
+marketplace cache directory is named after it). What each one carries:
+
+| version | what changed |
+|---|---|
+| `0.1.1` | `status` asks the upstream server whether its branch moved instead of trusting the last fetch (`--offline` opts out); `--mr` passes `--yes` to `glab` and runs the tool with stdin closed, so it no longer stops at a confirmation prompt. Earlier fixes that shipped under `0.1.0` and are worth knowing about: every `gh`/`glab` command names the fork with `--repo` rather than resolving to the original project; the sync gate guard compares committed config to committed config; `file://localhost/` spellings of the upstream URL are refused by the hook |
+| `0.1.0` | first release |
