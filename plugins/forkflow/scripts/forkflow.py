@@ -1599,6 +1599,11 @@ def cmd_status(args: argparse.Namespace) -> int:
           f"ff-only: {ctx.trunk} {'yes' if ff_trunk else 'no'}, "
           f"{ctx.mirror} {'yes' if ff_mirror else 'no'}")
 
+    entry = pending_entry(ctx)
+    if entry:
+        print(f"  pending  {entry['kind']} {entry['branch']} -> MR {entry.get('mr') or '-'} - "
+              f"{pending_verdict(ctx, entry)}")
+
     todo = []
     if not has_ref(ctx.root, f"refs/remotes/{ctx.origin}/{ctx.trunk}"):
         todo.append(f"trunk `{ctx.trunk}` is not on origin")
@@ -2756,6 +2761,22 @@ def landed(ctx: Ctx, entry: dict) -> Tuple[Optional[str], str]:
         if mark == "-" and sha.strip():
             return (sha.strip(), "rewritten")
     return (None, "")
+
+
+def pending_verdict(ctx: Ctx, entry: dict) -> str:
+    """`status`'s word on the pending entry, from the refs as they are: never raises.
+
+    Three states. `landed()` needs `origin/<trunk>` and the pending commit in this clone,
+    and `status` resolves with `need_trunk=False` - a fresh fork or a clone that did not
+    run the ship has neither; that is "cannot verify here", not an error. Git only, so the
+    answer is the same under `--offline`; `--fetch` moves the refs it is read from."""
+    if not has_ref(ctx.root, f"refs/remotes/{ctx.origin}/{ctx.trunk}"):
+        return "cannot verify here"
+    try:
+        sha, _ = landed(ctx, entry)
+    except Fail:
+        return "cannot verify here"
+    return "landed: run forkflow land" if sha else f"not on {ctx.origin}/{ctx.trunk} yet"
 
 
 def trunk_elsewhere(ctx: Ctx) -> None:
@@ -10016,6 +10037,124 @@ def run_tests() -> None:
             self.assertIn("would: landed", out)
             self.assertEqual(rev(fork, "refs/remotes/origin/develop"), entry["commit"])  # fetched
             self.assert_untouched(fork, name, entry, on=name)
+
+    class TestStatusPending(ShipBase):
+        """`status`'s `pending` line: the record a ship or a sync left and whether it has
+        landed, judged with git only from the refs as they are. Assertions are on the
+        decision the line carries (landed / not landed / cannot verify), read back through
+        `verdict()`, never on the sentence around it."""
+
+        def move_trunk(self, sha: str) -> None:
+            """A human merged the MR by fast-forward: the bare origin's trunk moves to `sha`."""
+            sh("git", "--git-dir=" + os.path.join(self.tmp, "origin.git"),
+               "update-ref", "refs/heads/develop", sha)
+
+        @staticmethod
+        def pending_of(fork: str) -> dict:
+            return pending_entry(ctx_for(fork, need_trunk=False, strict_mirror=False))
+
+        @staticmethod
+        def pending_line(out: str) -> Optional[str]:
+            lines = [ln for ln in out.splitlines() if ln.startswith("  pending")]
+            return lines[0] if lines else None
+
+        def verdict(self, out: str) -> Optional[str]:
+            """The decision on the pending line: "landed", "not landed", "cannot verify",
+            or None when there is no such line."""
+            line = self.pending_line(out)
+            if line is None:
+                return None
+            if "landed: run forkflow land" in line:
+                return "landed"
+            if "cannot verify" in line:
+                return "cannot verify"
+            self.assertIn("not on origin/develop yet", line)
+            return "not landed"
+
+        def status(self, fork: str, *flags: str) -> str:
+            code, out, err = run("-C", fork, "status", *flags)
+            self.assertEqual(code, 0, err + out)
+            return out
+
+        def shipped(self) -> Tuple[str, str, dict]:
+            fork = make_fork(self.tmp)
+            name = self.feature(fork)
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"]), ("ship", name))
+            return fork, name, entry
+
+        def test_no_line_when_nothing_is_pending(self):
+            fork = make_fork(self.tmp)
+            self.assertIsNone(self.verdict(self.status(fork)))
+
+        def test_not_landed_until_the_trunk_moves_and_fetch_flips_the_verdict(self):
+            fork, name, entry = self.shipped()
+            out = self.status(fork)
+            self.assertEqual(self.verdict(out), "not landed")
+            self.assertIn(f"pending  ship {name} -> MR -", self.pending_line(out))
+            self.move_trunk(entry["commit"])
+            # without --fetch the verdict is from the refs on disk, which have not moved
+            self.assertEqual(self.verdict(self.status(fork)), "not landed")
+            self.assertEqual(self.verdict(self.status(fork, "--fetch")), "landed")
+            # the fetch moved the refs, so a plain status now agrees
+            self.assertEqual(self.verdict(self.status(fork)), "landed")
+            self.assertEqual(self.pending_of(fork), entry)        # status writes nothing
+
+        def test_a_sync_is_judged_by_ancestry_of_its_merge_commit(self):
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 0, err + out)
+            entry = self.pending_of(fork)
+            self.assertEqual(entry["kind"], "sync")
+            self.assertEqual(self.verdict(self.status(fork)), "not landed")
+            self.move_trunk(entry["commit"])
+            sh("git", "fetch", "origin", cwd=fork)
+            self.assertEqual(self.verdict(self.status(fork)), "landed")
+
+        def test_the_url_is_shown_when_the_record_has_one(self):
+            fork, name, entry = self.shipped()
+            url = "https://example.invalid/-/merge_requests/7"
+            write_state(ctx_for(fork, strict_mirror=False), "pending", dict(entry, mr=url))
+            self.assertIn(f"-> MR {url} -", self.pending_line(self.status(fork)))
+
+        def test_offline_gives_the_same_verdict(self):
+            """The check is git-only: `--offline` skips the server round-trip and nothing else."""
+            fork, name, entry = self.shipped()
+            self.assertEqual(self.pending_line(self.status(fork, "--offline")),
+                             self.pending_line(self.status(fork)))
+            self.assertEqual(self.verdict(self.status(fork, "--offline")), "not landed")
+            self.move_trunk(entry["commit"])
+            sh("git", "fetch", "origin", cwd=fork)
+            self.assertEqual(self.verdict(self.status(fork, "--offline")), "landed")
+            self.assertEqual(self.pending_line(self.status(fork, "--offline")),
+                             self.pending_line(self.status(fork)))
+
+        def test_cannot_verify_without_the_trunk_on_origin(self):
+            """A fresh fork has no `origin/develop`; `status` resolves without one and must
+            not raise for this line."""
+            fork = make_fresh_fork(self.tmp)
+            head = rev(fork, "HEAD")
+            write_state(ctx_for(fork, need_trunk=False, strict_mirror=False), "pending",
+                        {"kind": "ship", "branch": "feat/x", "commit": head,
+                         "base": head, "mr": ""})
+            self.assertEqual(self.verdict(self.status(fork)), "cannot verify")
+
+        def test_cannot_verify_when_the_commit_is_not_in_this_clone(self):
+            """The record is the other clone's: `landed()` would raise, `status` does not."""
+            fork = make_fork(self.tmp)
+            write_state(ctx_for(fork, strict_mirror=False), "pending",
+                        {"kind": "ship", "branch": "feat/x", "commit": "1" * 40,
+                         "base": rev(fork, "refs/remotes/origin/develop"), "mr": ""})
+            self.assertEqual(self.verdict(self.status(fork)), "cannot verify")
+
+        def test_a_malformed_entry_is_ignored(self):
+            fork = make_fork(self.tmp)
+            write_state(ctx_for(fork, strict_mirror=False), "pending",
+                        {"kind": "ship", "branch": "feat/x"})
+            self.assertIsNone(self.verdict(self.status(fork)))
 
     class TestMergeLands(MergeBase):
         """`--merge` ends by running `land` in the same process: the trunk is

@@ -458,9 +458,9 @@ commit is not in this clone the line degrades to `... - cannot verify here` and 
 **Files:**
 - Modify: `plugins/forkflow/scripts/forkflow.py`
 
-- [ ] `cmd_status`: after the setup line, when `pending_entry(ctx)` is non-empty print the line in its three states (`not on origin/<trunk> yet` / `landed: run forkflow land` / `cannot verify here`), using `landed()` guarded so `status` never raises for it; unchanged under `--offline`
-- [ ] write tests: assert the landed/not-landed *decision* in both states (the bare origin's trunk moved or not), the line absent with nothing pending, `cannot verify` with `origin/<trunk>` absent (`make_fresh_fork` plus a hand-written entry), identical output under `--offline`, and a malformed entry ignored; `--fetch` flips the decision once the trunk moves
-- [ ] run tests - must pass before task 6
+- [x] `cmd_status`: after the setup line, when `pending_entry(ctx)` is non-empty print the line in its three states (`not on origin/<trunk> yet` / `landed: run forkflow land` / `cannot verify here`), using `landed()` guarded so `status` never raises for it; unchanged under `--offline`
+- [x] write tests: assert the landed/not-landed *decision* in both states (the bare origin's trunk moved or not), the line absent with nothing pending, `cannot verify` with `origin/<trunk>` absent (`make_fresh_fork` plus a hand-written entry), identical output under `--offline`, and a malformed entry ignored; `--fetch` flips the decision once the trunk moves
+- [x] run tests - must pass before task 6
 
 ### Task 6: skills and rules
 
