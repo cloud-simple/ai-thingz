@@ -42,7 +42,10 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    origin; "nothing to ship" and exit 0 if the branch has no commits beyond `origin/<trunk>`; back
    up HEAD as `backup/<ts>-pre-ship` and confirm it on origin; `git rebase origin/<trunk>`; squash
    to one commit and verify the tree hash is unchanged; `check`; push (with
-   `--force-with-lease` when the branch is already on origin); print the MR command.
+   `--force-with-lease` when the branch is already on origin); print the MR command. A
+   remote-tracking `origin/<branch>` whose branch origin no longer has (GitLab removed it after
+   a merge) is dropped first (`origin  $ git branch -d -r origin/<branch>  -> removed`), and the
+   branch is pushed as a new one, without a lease.
 
 4. **The commit message.** By default: the *oldest* commit's subject as the subject, then
    "Squashed from n commits (oldest first)" with each subject and its body. A single-commit branch
@@ -91,6 +94,16 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    merge request (when created) is open, so merge it by hand and run `forkflow land`. With
    `--merge` the run ends on the trunk, not on the feature branch. `--dry-run` shows `would:
    merge` and `would: land` and runs neither.
+
+   Worktrees: when the trunk is checked out in another worktree (the usual layout - the main
+   worktree on the trunk, the feature in a linked one), `--merge` from the linked worktree
+   always ends with exit 2 "the merge request was merged; the local catch-up did not run: trunk
+   ... is checked out in <path>: run `forkflow land <branch>` there". That is the expected end,
+   not a failure: the merge is done, the record is kept, and `land <branch>` in that worktree
+   catches the trunk up there. It cannot delete the branch while the linked worktree has it
+   checked out (`NOT deleted`), and the linked worktree stays on the feature branch - switch it
+   off (or remove the worktree), then delete the branch by hand (`git branch -D <branch>` once
+   `status` no longer lists it as pending: it has landed).
 
 8. **Report.** The one commit (SHA and subject) replacing the n originals, the tree hash check,
    the backup name and its rollback line, the rebase result, any WARNING files, the MR URL or

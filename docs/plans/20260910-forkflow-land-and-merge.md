@@ -305,7 +305,15 @@ tool exits 0 but the recorded commit is not on `origin/<trunk>` (a merge train, 
 required pipeline), `land_pending(after_merge=True)` raises exit 6 "the platform tool reported the
 merge request merged, but ..." and `land_after_merge` passes it on unwrapped - that request is not
 merged, so the "was merged" opening would be false. ➕ `--continue` hints printed by a run that had
-`--merge` (or `--mr`) carry the flag (`continue_cmd`).
+`--merge` (or `--mr`) carry the flag (`continue_cmd`). ⚠️ iteration 2: `ship_preflight`'s "a rebase
+is in progress" hint too (it takes `args`; the plain-`ship` form for a rebase that is not ours
+carries the flag as well).
+
+➕ as documented (iteration 2): in the usual worktree layout - trunk checked out in the main
+worktree, work in a linked one - every `--merge` from the linked worktree ends in that exit 2: the
+trunk is fast-forwarded only where it is checked out (`trunk_elsewhere`), so the message names
+`forkflow land <branch>` for the main worktree, and the branch stays while the linked worktree
+has it. Behaviour unchanged; ship/sync SKILL.md and the README say it plainly.
 
 ### Exit code 6
 
@@ -413,6 +421,12 @@ delete     git branch -d <branch>  when it is neither the trunk nor the mirror a
            ➕ review fix: after a verified landing, an `origin/<branch>` that origin no longer has
            (GitLab's --remove-source-branch) is dropped (`git branch -d -r`), or the next ship of
            that name offers it as a lease and is refused "(stale info)".
+           ⚠️ iteration 2: dropped under an unverified `--force` too (the kept branch is the
+           one shipped again; the decision is origin's `ls-remote` answer, not the landing),
+           and `cmd_ship` itself drops a stale `origin/<branch>` when `ls-remote` says origin
+           has no such branch, then pushes it as a new branch without a lease (nothing on origin
+           to force away, so no ownership to prove; the pre-ship backup is made as always; a
+           plain push only fast-forwards whatever appears there meanwhile).
 clear      write_state(ctx, "pending", None)
 print      "landed: <trunk> <old>..<new> - you are on <trunk>" ; github ship: "origin/<branch> may
            still exist: git push <origin> --delete <branch>"

@@ -355,9 +355,12 @@ the branch (its `create` fails) is not merged for you. A merge that does not hap
 the branch pushed and the MR open: merge by hand, then `forkflow land` - and so is a tool that
 answers "merged" while nothing reaches the trunk (a merge train, auto-merge, a required pipeline).
 A merge that happened but whose catch-up could not run is exit 2 with a message that opens with
-"the merge request was merged". A conflicted `sync --merge` or `ship --merge` prints the resume
-with `--merge` on it (`forkflow sync --continue --merge`), so following it to the letter still
-merges.
+"the merge request was merged". In the usual worktree layout - the trunk checked out in the main
+worktree, the work in a linked one - that is how every `--merge` from the linked worktree ends: the
+trunk can only be fast-forwarded where it is checked out, so the message names `forkflow land
+<branch>` to run in the main worktree, and the branch stays until the linked worktree lets go of it.
+A conflicted `sync --merge` or `ship --merge` prints the resume with `--merge` on it (`forkflow sync
+--continue --merge`), so following it to the letter still merges.
 
 `land --force` is the escape for a landing the tool cannot see - an MR closed without merging, a
 sync squashed or rebased in the UI (a broken rule 5, which `land` says out loud), a recorded commit
@@ -371,8 +374,10 @@ After a GitHub "Rebase and merge" of a ship MR the local feature branch is delet
 SHA was rewritten; the patch is recognised, and the branch's tip is still the commit that was
 pushed), but the remote branch survives on GitHub, for a ship and a sync alike - `land` prints the
 `git push origin --delete <branch>` line and leaves that call to you. On GitLab, where
-`--remove-source-branch` removed it, `land` drops the stale `origin/<branch>` ref this clone kept,
-so the name can be shipped again.
+`--remove-source-branch` removed it, `land` drops the stale `origin/<branch>` ref this clone kept
+(under `--force` too), so the name can be shipped again - and `ship` itself drops one it finds
+before it pushes, when origin answers that the branch is gone (a ship made after a merge in the UI
+but before `land`), then pushes the branch as a new one without a lease.
 
 ### Adopting forkflow in an existing fork
 

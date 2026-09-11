@@ -2551,16 +2551,18 @@ def rebasing_branch(ctx: Ctx) -> str:
     return ""
 
 
-def ship_preflight(ctx: Ctx) -> str:
+def ship_preflight(ctx: Ctx, args: Optional[argparse.Namespace] = None) -> str:
     """The branch `ship` may rewrite, or Fail(2). Everything else is refused by name:
     ship rebases and squashes what it is on, and only a feature branch may be rewritten."""
     if rebase_in_progress(ctx):
         # `--continue` only resumes a ship *this clone* started: naming it after a rebase
         # that is not one (a `git pull --rebase` this run's own advice asked for, say) sends
-        # the user to a command that refuses them
+        # the user to a command that refuses them. Either way it carries `--merge`/`--mr`:
+        # followed to the letter, a resume without it opens or merges nothing
         being = rebasing_branch(ctx)
-        resume = ("forkflow ship --continue" if being and resumable(ctx, "ship", being)
-                  else "forkflow ship")
+        resume = continue_cmd("ship", args)
+        if not (being and resumable(ctx, "ship", being)):
+            resume = resume.replace(" --continue", "", 1)
         raise Fail(f"a rebase is in progress: finish it with `git rebase --continue` and then "
                    f"`{resume}`, or start over with `git rebase --abort`")
     branch = current_branch(ctx)
@@ -2846,7 +2848,7 @@ def published_is_ours(ctx: Ctx, branch: str, published: str) -> bool:
 def cmd_ship(args: argparse.Namespace) -> int:
     ctx = resolve_ctx(args.dir, args, need_upstream=True, need_trunk=True, strict_mirror=True)
     header(ctx, "ship")
-    branch = ship_preflight(ctx)
+    branch = ship_preflight(ctx, args)
     merge_gate(ctx, args, branch=branch)   # before `--continue`, the fetch, the backup, the push
     trunk_ref = f"{ctx.origin}/{ctx.trunk}"
 
@@ -2882,6 +2884,16 @@ def cmd_ship(args: argparse.Namespace) -> int:
     # already, or shipping would rewrite someone else's commits out of the branch.
     branch_ref = f"refs/remotes/{ctx.origin}/{branch}"
     lease = rev(ctx.root, branch_ref)
+    if lease and origin_has_branch(ctx, branch) is False:
+        # the fetch does not prune, so `origin/<branch>` can outlive the branch on origin -
+        # GitLab's `--remove-source-branch` after a merge, `land --force` keeping the branch.
+        # Offered as the lease it is refused ("stale info") on every later ship. Origin has
+        # nothing under that name, so there is nothing to force-push away and nothing whose
+        # ownership to prove: the push creates the branch, without a lease - and a plain
+        # push cannot replace what somebody publishes there in the meantime (it only ever
+        # fast-forwards). The backup is made as always
+        drop_stale_tracking(ctx, branch)
+        lease = ""
     if lease:
         cmd = f"git merge-base --is-ancestor {sh_arg(f'{ctx.origin}/{branch}')} HEAD"
         rc, _, _ = git_rc("merge-base", "--is-ancestor", branch_ref, "HEAD", cwd=ctx.root)
@@ -3201,8 +3213,11 @@ def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False,
             land_branch(ctx, e, sha, how)
         elif sha is None:
             print(f"  `{name}` is kept: its landing was not verified")
-        if (sha is not None and name not in (ctx.trunk, ctx.mirror)
-                and remote_branch_left(ctx, name)):
+        # a stale `origin/<branch>` goes under `--force` too: the kept branch is the one most
+        # likely to be shipped again, and that is decided by origin's answer, not by the
+        # landing. The remote-delete hint is for a verified landing only
+        if (name not in (ctx.trunk, ctx.mirror) and remote_branch_left(ctx, name)
+                and sha is not None):
             leftovers.append(name)
         if not forget_pending(ctx, e) and not ctx.dry_run:
             step("pending", "-", f"kept: the record for `{name}` changed while this ran (a new "
@@ -3255,27 +3270,41 @@ def land_branch(ctx: Ctx, entry: dict, sha: str, how: str) -> None:
             step("branch", cmd, f"deleted (landed as {short(sha)})")
 
 
-def remote_branch_left(ctx: Ctx, branch: str) -> bool:
-    """After a verified landing: is `branch` still on origin? When origin no longer has it
-    (GitLab's `--remove-source-branch`), the remote-tracking ref this clone kept is stale and
-    goes too - left behind, it is the lease the next `ship` of that name offers, and the
-    push refuses a lease on a ref that no longer exists ("stale info").
-    Answers False when there is nothing on origin, or nothing is known here to begin with."""
-    tracking = f"{ctx.origin}/{branch}"
-    if not has_ref(ctx.root, f"refs/remotes/{tracking}"):
-        return False
+def origin_has_branch(ctx: Ctx, branch: str) -> Optional[bool]:
+    """Origin's own answer (`ls-remote`), not a remote-tracking ref: None when it cannot be
+    asked."""
     rc, out, _ = git_rc("ls-remote", "--heads", ctx.origin, f"refs/heads/{branch}",
                         cwd=ctx.root)
-    if rc != 0 or out.strip():
-        return rc == 0                  # unreachable: say nothing, remove nothing
+    return None if rc != 0 else bool(out.strip())
+
+
+def drop_stale_tracking(ctx: Ctx, branch: str) -> None:
+    """Remove `origin/<branch>` once origin has said it has no such branch. Left behind -
+    GitLab's `--remove-source-branch`, or anyone's delete, is not seen by a fetch that does
+    not prune - it is the lease the next `ship` of that name offers, and the push refuses a
+    lease on a ref that no longer exists ("stale info")."""
+    tracking = f"{ctx.origin}/{branch}"
     cmd = f"git branch -d -r {sh_arg(tracking)}"
     if ctx.dry_run:
         step("origin", cmd, f"would remove `{tracking}` (gone from {ctx.origin})", dry=True)
-        return False
+        return
     rc, out, err = git_rc("branch", "-d", "-r", tracking, cwd=ctx.root)
     step("origin", cmd, f"removed - `{branch}` is gone from {ctx.origin}" if rc == 0
          else f"NOT removed: {((err or out).strip().splitlines() or [''])[-1]}")
-    return False
+
+
+def remote_branch_left(ctx: Ctx, branch: str) -> bool:
+    """After a landing: is `branch` still on origin? When origin no longer has it, the
+    remote-tracking ref this clone kept is stale and goes too (`drop_stale_tracking`).
+    Answers False when there is nothing on origin, or nothing is known here to begin with."""
+    if not has_ref(ctx.root, f"refs/remotes/{ctx.origin}/{branch}"):
+        return False
+    there = origin_has_branch(ctx, branch)
+    if there is None:
+        return False                    # unreachable: say nothing, remove nothing
+    if not there:
+        drop_stale_tracking(ctx, branch)
+    return there
 
 
 def cmd_land(args: argparse.Namespace) -> int:
@@ -11435,6 +11464,100 @@ def run_tests() -> None:
             self.assertEqual(checked_out(fork), "develop")
             self.assertEqual(rev(fork, "refs/heads/" + name), "")
             self.assertTrue(os.path.isdir(blocker))
+
+    class TestShipAfterTheBranchLeftOrigin(MergeBase):
+        """A fetch does not prune, so `origin/<branch>` outlives the branch on origin when
+        the platform removes it after a merge (GitLab's `--remove-source-branch`). Offered as
+        the lease, it made every later ship of that name exit 5 "(stale info)", each attempt
+        leaving one more backup behind."""
+
+        def gone_from_origin(self, name: str) -> None:
+            sh("git", "--git-dir=" + os.path.join(self.tmp, "origin.git"),
+               "update-ref", "-d", "refs/heads/" + name)
+
+        def test_a_ship_after_a_merge_and_before_land_creates_the_branch_again(self):
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])                           # merged in the UI ...
+            self.gone_from_origin(name)                                # ... source removed
+            commit_fork(fork, "ours/more.txt", "more\n", "ours: more")
+            tracking = "refs/remotes/origin/" + name
+            self.assertEqual(rev(fork, tracking), entry["commit"])    # stale, still here
+            next_utc_second()
+            code, out, err = run("-C", fork, "ship", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(fork, tracking), entry["commit"])    # a dry run drops nothing
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+            self.assertEqual(rev(fork, tracking), rev(fork, "refs/heads/" + name))
+            self.assertEqual(sh("git", "rev-list", "--count", entry["commit"] + ".." + name,
+                                cwd=fork), "1")                       # the new work, squashed
+            backup = self.backup_branch(fork)                        # rule 4 still honoured
+            self.assertEqual(origin_sha(fork, backup), rev(fork, "refs/heads/" + backup))
+            self.assertEqual(self.pending_of(fork, name)["commit"], origin_sha(fork, name))
+
+        def test_land_force_drops_the_stale_ref_and_the_kept_branch_ships_again(self):
+            """The request was merged in a way `land` cannot see, and the platform removed the
+            branch: `land --force` keeps the local branch - and must not keep the stale
+            `origin/<branch>` that would block its next ship."""
+            fork, name, entry = self.shipped()
+            self.gone_from_origin(name)
+            code, out, err = run("-C", fork, "land", "--force")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(fork, "refs/heads/" + name), entry["commit"])   # kept
+            self.assertEqual(rev(fork, "refs/remotes/origin/" + name), "")      # not stale
+            self.assertEqual(self.pending_of(fork), {})
+            sh("git", "checkout", "-q", name, cwd=fork)
+            commit_fork(fork, "ours/more.txt", "more\n", "ours: more")
+            next_utc_second()
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+
+        def test_a_branch_origin_still_has_keeps_its_lease(self):
+            """Only origin's own "no such branch" drops the lease: a branch still there is
+            replaced behind `--force-with-lease` as before."""
+            fork, name, entry = self.shipped()
+            commit_fork(fork, "ours/more.txt", "more\n", "ours: more")
+            next_utc_second()
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("--force-with-lease=%s:%s" % (name, entry["commit"]), out)
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+
+        def test_the_stopped_rebase_hint_carries_merge(self):
+            """`ship --merge` stops on a conflict; the second commit stops the rebase again,
+            and `ship --continue --merge` run too early names the resume. Followed to the
+            letter once the rebase is done, it merges and lands."""
+            fork = self.self_fork()
+            name = self.feature(fork, commits=0)
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "ours: two")
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 3"),
+                        "ours: three")
+            second_clone_commit(self.tmp, path="shared.tf",
+                                content=self.BASE_TF.replace("count = 1", "count = 9"))
+            with on_platform(self.platform("gitlab")):
+                self.assertEqual(run("-C", fork, "ship", "--merge")[0], 4)
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
+            sh("git", "add", "shared.tf", cwd=fork)
+            sh("git", "rebase", "--continue", cwd=fork, check=False)   # stops on the second
+            self.assertTrue(rebase_in_progress(ctx_for(fork, strict_mirror=False)))
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "ship", "--continue", "--merge")
+            self.assertEqual(code, 2, err + out)
+            hinted = re.search(r"and then `(forkflow ship[^`]*)`", err)
+            self.assertTrue(hinted, err)
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 5"))
+            sh("git", "add", "shared.tf", cwd=fork)
+            sh("git", "rebase", "--continue", cwd=fork)
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, *hinted.group(1).split()[1:])
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(self.argv("gitlab", "merge")[:3], ["mr", "merge", name])
+            self.assertEqual(origin_sha(fork, "develop"), rev(fork, "refs/heads/develop"))
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(self.pending_of(fork), {})
 
     class TestMergeGate(ShipBase):
         """`--merge` is config AND flag, refused before the fetch, the backup and any push.

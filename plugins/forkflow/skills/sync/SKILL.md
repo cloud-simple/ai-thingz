@@ -112,7 +112,10 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    merge request created - is exit 6: the sync branch is pushed and the request (when created) is
    open, so merge it by hand **as a merge** and run `forkflow land`. With `--merge` the run ends
    on the trunk, not on the sync branch. `--dry-run` shows `would: merge` and `would: land` and
-   runs neither.
+   runs neither. Run from a linked worktree while the trunk is checked out in another one,
+   `--merge` merges and then ends with exit 2 "the merge request was merged; the local catch-up
+   did not run": expected - `forkflow land <sync branch>` in the worktree the message names
+   catches the trunk up (it cannot delete a branch the linked worktree still has checked out).
 
 6. **Report.** Mirror advance (old -> new, pushed), the sync branch name, the merge commit, the
    number of upstream commits taken, the backup name and its rollback line, any `CHECK` rows and

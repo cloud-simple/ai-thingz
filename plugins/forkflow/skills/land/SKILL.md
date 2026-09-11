@@ -110,7 +110,7 @@ Under `--dry-run` the mutating steps and the last line carry `would:` (`would: l
 | `` `<branch>` is kept: its landing was not verified `` | `--force` without a recognised landing - delete the branch yourself only when the user is sure |
 | `` branch ... kept: `<branch>` is at <sha>, not the <sha> that was pushed `` | the landing is done, but the branch has commits made after the ship: they are on no trunk, so the branch stays - tell the user, they ship them or drop them |
 | `branch ... NOT deleted: <line>` | the landing is done; git refused to delete the branch and said why (it is checked out in another worktree, say) |
-| `origin ... removed - <branch> is gone from origin` | GitLab's `--remove-source-branch` removed the branch; the stale `origin/<branch>` this clone kept is dropped, so the name can be shipped again |
+| `origin ... removed - <branch> is gone from origin` | GitLab's `--remove-source-branch` removed the branch; the stale `origin/<branch>` this clone kept is dropped (under `--force` too, where the local branch is kept), so the name can be shipped again |
 | `origin/<branch> may still exist: git push origin --delete <branch>` | GitHub (a ship or a sync): the remote branch is not removed by the merge; the user's call |
 | `landed: <trunk> <old>..<new> - you are on <trunk>` | done; HEAD is on the trunk (`at <sha>` when the local trunk was already there) |
 | `caught up, landing NOT verified: <trunk> ...` | `--force` ran without a recognised landing: the trunk follows origin, the branch is kept |
