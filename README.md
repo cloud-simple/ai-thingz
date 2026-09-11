@@ -294,8 +294,15 @@ from a file upstream also tracks says that out loud. Read the diff before mergin
 A `gate` the merge left alone still runs: the guard is keyed on the commands, not on the file.
 
 `setup` leaves `.forkflow.toml` untracked, so a sync that brings upstream's copy of it in would
-have to write over it - which git refuses. `sync` says so and names the file before it pushes
-anything, so there is nothing to clean up: remove it, or get it into `origin/<trunk>` first.
+have to write over it - which git refuses. `sync` says so and names the file before the backup
+and the sync branch, so there is nothing to clean up. Do not delete it - it is this fork's
+config: commit it on a branch and `ship` it, and the next sync meets upstream's copy as a
+tracked file, in the open. On a case-insensitive filesystem (the macOS and Windows default)
+upstream's `.ForkFlow.toml` is the same file as `.forkflow.toml`, and `sync` treats it so.
+forkflow reads its config only from a file named exactly `.forkflow.toml` and refuses a case
+variant; the way out it prints never deletes or renames the variant in the working tree while
+the fork has a `.forkflow.toml` of its own - on such a filesystem that would take the fork's
+config with it - but puts the fork's copy back from `HEAD` through the index.
 
 The script itself needs only Python 3.9+ and git 2.20+ (the merge simulation wants 2.38+ and is
 skipped with a note on older git). **Reading `.forkflow.toml` needs Python 3.11+** (`tomllib`): a
