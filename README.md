@@ -368,8 +368,9 @@ A merge that happened but whose catch-up could not run is exit 2 with a message 
 worktree, the work in a linked one - that is how a `--merge` from the linked worktree ends: the
 trunk can only be fast-forwarded where it is checked out, so the message names `forkflow land
 <branch>` to run in the main worktree, and the branch stays until the linked worktree lets go of it.
-A conflicted `sync --merge` or `ship --merge` prints the resume with `--merge` on it (`forkflow sync
---continue --merge`), so following it to the letter still merges.
+Every `forkflow sync` / `forkflow ship` a `--merge` (or `--mr`) run prints - the resume after a
+conflict (`forkflow sync --continue --merge`), a `--force` redo, a plain rerun - carries the flag,
+so following it to the letter still merges.
 
 `land --force` is the escape for a landing the tool cannot see - an MR closed without merging, a
 sync squashed or rebased in the UI (a broken rule 5, which `land` says out loud), a recorded commit
@@ -427,8 +428,9 @@ appears only in the three push helpers, `update-ref` only in `advance_mirror`, `
 only in `advance_mirror` and `land_trunk` (the plugin's two fast-forwards: the mirror advance and
 the trunk landing), `rebase` only in `rebase_onto`, `--force-with-lease` only in `push()`, that the
 only functions starting a subprocess are the git wrappers, `shell` (the gate), `run_tool` (the
-platform CLI for `--mr` and `--merge`) and `api_get`, and that no git call anywhere passes `--force`
-or `--no-verify`.
+platform CLI for `--mr` and `--merge`) and `api_get`, that no git call anywhere passes `--force`
+or `--no-verify`, and that no string in the code spells a `forkflow sync` / `forkflow ship`
+command: each printed one is built by `rerun_cmd`, which carries the run's `--merge` / `--mr`.
 
 ### Versions
 

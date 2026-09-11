@@ -1705,7 +1705,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             server = sha
             server_step = (cmd, f"server at {short(sha)}, fetched {short(fetched)} - upstream moved "
                                 f"since the last fetch: `status --fetch` for the numbers, "
-                                f"`forkflow sync` to take it")
+                                f"`{rerun_cmd('sync', None)}` to take it")
         else:
             server = sha
             server_step = (cmd, f"server at {short(sha)}, not fetched here yet: `status --fetch`")
@@ -2070,7 +2070,8 @@ def both_sides_survived(ctx: Ctx, ours: str, theirs: str) -> list:
     return rows
 
 
-def sync_branch_is_free(ctx: Ctx, name: str, force: bool) -> None:
+def sync_branch_is_free(ctx: Ctx, name: str, force: bool,
+                        args: Optional[argparse.Namespace] = None) -> None:
     """Refuse a sync branch that already exists, locally or on origin. Checked before the
     backup as well as inside `make_sync_branch`, so a rerun on the same day leaves no orphan
     backup on origin.
@@ -2078,18 +2079,20 @@ def sync_branch_is_free(ctx: Ctx, name: str, force: bool) -> None:
     origin is asked with `ls-remote`, as `free_sync_name` does and for the same reason: this
     runs before the fetch, and another clone's sync counts too. A branch that is only on
     origin gets the `--force` answer, not the `--continue` one - there is no local branch to
-    resume, so `--continue` cannot get past the push that would be rejected at the end."""
+    resume, so `--continue` cannot get past the push that would be rejected at the end. The
+    commands named carry this run's `--merge`/`--mr` (`rerun_cmd`)."""
     if force:
         return
     if has_ref(ctx.root, f"refs/heads/{name}"):
-        raise Fail(f"branch `{name}` already exists: resume it with `forkflow sync --continue`, "
-                   f"or recreate it from {ctx.origin}/{ctx.trunk} with `forkflow sync --force`")
+        raise Fail(f"branch `{name}` already exists: resume it with "
+                   f"`{continue_cmd('sync', args)}`, or recreate it from "
+                   f"{ctx.origin}/{ctx.trunk} with `{rerun_cmd('sync', args, ' --force')}`")
     rc, out, _ = git_rc("ls-remote", "--heads", ctx.origin, f"refs/heads/{name}", cwd=ctx.root)
     if rc == 0 and f"refs/heads/{name}" in out:
         raise Fail(f"`{name}` is already on {ctx.origin} and this clone has no local copy: a "
                    f"published sync branch is never rebased or force-pushed (rule 5). Close "
-                   f"its merge request and rerun with `forkflow sync --force`, which publishes "
-                   f"the next free `{name}-N`")
+                   f"its merge request and rerun with `{rerun_cmd('sync', args, ' --force')}`, "
+                   f"which publishes the next free `{name}-N`")
 
 
 def free_sync_name(ctx: Ctx, name: str) -> str:
@@ -2122,12 +2125,13 @@ def free_sync_name(ctx: Ctx, name: str) -> str:
                f"{ctx.origin}: delete the stale sync branches there first")
 
 
-def make_sync_branch(ctx: Ctx, name: str, force: bool) -> None:
+def make_sync_branch(ctx: Ctx, name: str, force: bool,
+                     args: Optional[argparse.Namespace] = None) -> None:
     """Create the sync branch off `origin/<trunk>` and switch to it. Never off the local trunk:
     the MR has to apply to what is published."""
     base = f"{ctx.origin}/{ctx.trunk}"
     cmd = f"git checkout --no-track -b {sh_arg(name)} {sh_arg(base)}"
-    sync_branch_is_free(ctx, name, force)
+    sync_branch_is_free(ctx, name, force, args)
     exists = has_ref(ctx.root, f"refs/heads/{name}")
     if ctx.dry_run:
         step("branch", cmd, f"would {'recreate' if exists else 'create'} it off {base}", dry=True)
@@ -2309,17 +2313,16 @@ def unmerged_paths(ctx: Ctx) -> list:
     return diff_names(ctx, "--diff-filter=U")
 
 
-def check_failure_hint(ctx: Ctx, name: str,
-                       resume: str = "forkflow sync --continue") -> str:
+def check_failure_hint(ctx: Ctx, name: str, args: Optional[argparse.Namespace]) -> str:
     """What to do about a failed `check` on a sync branch - which is not the same answer
     for the two invariants it checks."""
     rc, _, _ = git_rc("merge-base", "--is-ancestor", f"{ctx.origin}/{ctx.trunk}", "HEAD",
                       cwd=ctx.root)
     if rc != 0:
         return (f"  `{ctx.origin}/{ctx.trunk}` moved on: this sync has to be redone against "
-                f"the new tip - `forkflow sync --force` recreates `{name}` (a sync MR is "
-                f"never rebased)")
-    return f"  fix that on this branch and commit it, then: {resume}"
+                f"the new tip - `{rerun_cmd('sync', args, ' --force')}` recreates `{name}` "
+                f"(a sync MR is never rebased)")
+    return f"  fix that on this branch and commit it, then: {continue_cmd('sync', args)}"
 
 
 def finish_sync(ctx: Ctx, args: argparse.Namespace, name: str, commits: Sequence[str],
@@ -2358,7 +2361,7 @@ def finish_sync(ctx: Ctx, args: argparse.Namespace, name: str, commits: Sequence
     if ctx.dry_run:
         step("check", "forkflow check", "not run (dry run)", dry=True)
     elif run_check(ctx, config_merged=gate_merged) == 3:
-        print(check_failure_hint(ctx, name, resume))
+        print(check_failure_hint(ctx, name, args))
         return 3
 
     base = rev(ctx.root, f"{ctx.origin}/{ctx.trunk}")   # what the merge was built on
@@ -2480,8 +2483,10 @@ def cmd_sync_continue(ctx: Ctx, args: argparse.Namespace) -> int:
     merging = merge_in_progress(ctx)
     merge_sha = sync_merge_commit(ctx)
     if not merging and not merge_sha:
-        raise Fail(f"nothing to continue: `{name}` carries no sync merge - "
-                   f"run `forkflow sync`")
+        # a branch under today's sync name is one plain `sync` refuses ("already exists -
+        # resume it with --continue"), which is this very message: only `--force` recreates it
+        again = rerun_cmd("sync", args, " --force" if name == sync_branch(ctx) else "")
+        raise Fail(f"nothing to continue: `{name}` carries no sync merge - run `{again}`")
     if merging:
         cmd = "git commit --no-edit"
         if ctx.dry_run:
@@ -2531,10 +2536,13 @@ def merge_gate(ctx: Ctx, args: argparse.Namespace, resume_sync: bool = False,
         raise Fail(f"--merge needs `merge = \"self\"` in {CONFIG_FILE}: this fork's merge "
                    f"requests are merged by hand")
     if resume_sync and merge_mode_arrived_in_merge(ctx):
+        # the resume named keeps `--mr` (which `--merge` implies): it still opens the request
+        # the reviewer has to merge, only the merge itself is left out
+        by_hand = continue_cmd("sync", argparse.Namespace(mr=True))
         raise Fail(f"--merge: `merge = \"self\"` in {CONFIG_FILE} came in with this sync's "
-                   f"merge - it is not what this fork's own config says. Run `forkflow sync "
-                   f"--continue` without --merge and have the merge request merged by hand; "
-                   f"the reviewer sees the config change in it")
+                   f"merge - it is not what this fork's own config says. Run `{by_hand}` - "
+                   f"without --merge - and have the merge request merged by hand; the reviewer "
+                   f"sees the config change in it")
     target, reason = mr_target(ctx)
     if not target:
         raise Fail(f"--merge: `{ctx.origin_url or '-'}` names no project to merge on "
@@ -2562,7 +2570,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         raise Fail("the working tree has uncommitted changes: commit or stash them first")
     name = sync_branch(ctx)
     force = bool(getattr(args, "force", False))
-    sync_branch_is_free(ctx, name, force)     # before the backup: no orphan backup on a rerun
+    sync_branch_is_free(ctx, name, force, args)   # before the backup: none orphaned on a rerun
     if force:
         name = free_sync_name(ctx, name)      # a published sync branch is never pushed over
     tail = (f" unless --merge lands it - then you are on `{ctx.trunk}`"
@@ -2611,7 +2619,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print(f"    {line}")
 
     backup_ref = backup(ctx, "pre-sync", f"{ctx.origin}/{ctx.trunk}")
-    make_sync_branch(ctx, name, force=force)
+    make_sync_branch(ctx, name, force, args)
     write_state(ctx, "sync", {"branch": name, "backup": backup_ref})
     merge_upstream(ctx, name, target, commits, args)
 
@@ -2658,9 +2666,8 @@ def ship_preflight(ctx: Ctx, args: Optional[argparse.Namespace] = None) -> str:
         # the user to a command that refuses them. Either way it carries `--merge`/`--mr`:
         # followed to the letter, a resume without it opens or merges nothing
         being = rebasing_branch(ctx)
-        resume = continue_cmd("ship", args)
-        if not (being and resumable(ctx, "ship", being)):
-            resume = resume.replace(" --continue", "", 1)
+        resume = (continue_cmd("ship", args) if being and resumable(ctx, "ship", being)
+                  else rerun_cmd("ship", args))
         raise Fail(f"a rebase is in progress: finish it with `git rebase --continue` and then "
                    f"`{resume}`, or start over with `git rebase --abort`")
     branch = current_branch(ctx)
@@ -2673,8 +2680,8 @@ def ship_preflight(ctx: Ctx, args: Optional[argparse.Namespace] = None) -> str:
         raise Fail(f"`{branch}` is the mirror: it only ever copies `{ctx.up()}` - "
                    f"switch to the feature branch you want to ship")
     if branch.startswith(ctx.sync_prefix):
-        raise Fail(f"`{branch}` is a sync branch: finish it with `forkflow sync --continue`; "
-                   f"a sync is merged, never squashed")
+        raise Fail(f"`{branch}` is a sync branch: finish it with "
+                   f"`{continue_cmd('sync', args)}`; a sync is merged, never squashed")
     if branch.startswith(ctx.backup_prefix):
         raise Fail(f"`{branch}` is a backup branch: it is a restore point, not a feature branch")
     if not valid_branch_name(branch):
@@ -2688,7 +2695,7 @@ def ship_preflight(ctx: Ctx, args: Optional[argparse.Namespace] = None) -> str:
 
 
 def rebase_onto(ctx: Ctx, branch: str, trunk_ref: str,
-                resume: str = "forkflow ship --continue") -> None:
+                args: Optional[argparse.Namespace] = None) -> None:
     """Rebase locally so the trunk can fast-forward: `rebase locally, merge globally`."""
     cmd = f"git rebase {sh_arg(trunk_ref)}"
     tip = rev(ctx.root, trunk_ref)
@@ -2704,7 +2711,7 @@ def rebase_onto(ctx: Ctx, branch: str, trunk_ref: str,
     unmerged = unmerged_paths(ctx)
     report_paths("rebase", cmd, unmerged, "conflicting file(s)")
     raise Fail(f"resolve the conflicts, `git add` them, run `git rebase --continue`, "
-               f"then `{resume}`", 4)
+               f"then `{continue_cmd('ship', args)}`", 4)
 
 
 def commit_records(ctx: Ctx, base: str) -> list:
@@ -2957,12 +2964,12 @@ def cmd_ship(args: argparse.Namespace) -> int:
         state = resumable(ctx, "ship", branch)
         if not state.get("backup"):
             raise Fail(f"no ship to continue on `{branch}`: `--continue` resumes the run that "
-                       f"made the pre-ship backup - run `forkflow ship`")
+                       f"made the pre-ship backup - run `{rerun_cmd('ship', args)}`")
         cmd = f"git merge-base --is-ancestor {sh_arg(trunk_ref)} HEAD"
         rc, _, _ = git_rc("merge-base", "--is-ancestor", trunk_ref, "HEAD", cwd=ctx.root)
         if rc != 0:
             step("continue", cmd, f"`{branch}` is not on {trunk_ref}'s tip")
-            raise Fail("the rebase did not complete; run `forkflow ship` again")
+            raise Fail(f"the rebase did not complete; run `{rerun_cmd('ship', args)}` again")
         step("continue", cmd, "the rebase completed - resuming at the squash")
         return finish_ship(ctx, args, branch, state["backup"], state.get("lease", ""))
 
@@ -3019,7 +3026,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
 
     backup_ref = backup(ctx, "pre-ship", "HEAD")
     write_state(ctx, "ship", {"branch": branch, "backup": backup_ref, "lease": lease})
-    rebase_onto(ctx, branch, trunk_ref, continue_cmd("ship", args))
+    rebase_onto(ctx, branch, trunk_ref, args)
     return finish_ship(ctx, args, branch, backup_ref, lease)
 
 
@@ -3227,8 +3234,9 @@ def pending_to_land(ctx: Ctx, entry: Optional[dict], branch: str, force: bool) -
         return [entry]
     entries = pending_entries(ctx)
     if not entries:
-        raise Fail("nothing pending: `forkflow ship` or `forkflow sync` first - `land` "
-                   "finishes the run that pushed a branch")
+        raise Fail(f"nothing pending: `{rerun_cmd('ship', None)}` or "
+                   f"`{rerun_cmd('sync', None)}` first - `land` finishes the run that pushed "
+                   f"a branch")
     names = ", ".join(f"`{b}`" for b in sorted(entries))
     if branch:
         if branch not in entries:
@@ -3687,7 +3695,8 @@ def setup_mirror(ctx: Ctx, target: str) -> None:
             raise Fail(f"cannot compare `{ref}` with `{ctx.up()}`: "
                        f"run `git fetch {sh_arg(ctx.upstream)}`")
     step("mirror", f"git merge-base --is-ancestor {sh_arg(m)} {sh_arg(ctx.up())}",
-         f"`{m}` is a pure copy of `{ctx.up()}` (behind is fine - `forkflow sync` advances it)")
+         f"`{m}` is a pure copy of `{ctx.up()}` (behind is fine - "
+         f"`{rerun_cmd('sync', None)}` advances it)")
 
 
 def setup_trunk(ctx: Ctx, target: str) -> None:
@@ -11930,6 +11939,147 @@ def run_tests() -> None:
             self.assertEqual(checked_out(fork), "develop")
             self.assertEqual(self.pending_of(fork), {})
 
+    class TestPrintedRerunsCarryMerge(MergeBase):
+        """Every `forkflow sync` / `forkflow ship` a `--merge` run prints carries `--merge`.
+
+        Followed to the letter, one without it pushes and opens the request, merges nothing,
+        and exits 0 with a line that reads like success - found three rounds running at one
+        site after another, so every such command is built by `rerun_cmd` / `continue_cmd`
+        (`TestSourceInvariants` holds that). Each site here is reached for real, and its
+        command run exactly as printed has to end merged and landed."""
+
+        def run_it(self, text: str, start: str, fork: str) -> Tuple[int, str, str]:
+            with on_platform("gitlab"):
+                return run_printed(text, start, fork)
+
+        def merged_and_landed(self, fork: str, branch: str) -> None:
+            self.assertEqual(self.argv("gitlab", "merge")[:3], ["mr", "merge", branch])
+            self.assertEqual(origin_sha(fork, "develop"), rev(fork, "refs/heads/develop"))
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(self.pending_of(fork, branch), {})
+
+        def conflicted_sync(self) -> str:
+            """A `merge = "self"` fork whose `sync --merge` stopped on a conflict."""
+            fork = self.self_fork()
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "ours: shared", push=True)
+            commit_upstream(self.tmp, "shared.tf", self.BASE_TF.replace("count = 1", "count = 3"),
+                            "theirs: shared")
+            with on_platform(self.platform("gitlab")):
+                self.assertEqual(run("-C", fork, "sync", "--merge")[0], 4)
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
+            sh("git", "add", "shared.tf", cwd=fork)
+            return fork
+
+        def test_a_sync_committed_by_hand_is_resumed_with_merge(self):
+            """The conflict resolved and the merge committed by hand, the user reruns
+            `sync --merge`: the branch exists, and the resume it names must merge."""
+            fork = self.conflicted_sync()
+            sh("git", "commit", "-q", "--no-edit", cwd=fork)
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.assertEqual(code, 2, err + out)
+            code, out, err2 = self.run_it(err, "forkflow sync --continue", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.merged_and_landed(fork, sync_branch_name())
+
+        def test_ship_on_a_sync_branch_names_the_sync_resume_with_merge(self):
+            fork = self.conflicted_sync()
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 2, err + out)
+            code, out, err2 = self.run_it(err, "forkflow sync --continue", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.merged_and_landed(fork, sync_branch_name())
+
+        def test_a_published_sync_branch_is_redone_with_force_and_merge(self):
+            """Today's sync branch is on origin and gone here: `--force` publishes `<name>-2`,
+            and with `--merge` merges and lands it."""
+            fork = self.self_fork()
+            self.upstream_change()
+            name = sync_branch_name()
+            with on_platform(self.platform("gitlab")):
+                self.assertEqual(run("-C", fork, "sync", "--mr")[0], 0)
+            sh("git", "checkout", "-q", "develop", cwd=fork)
+            sh("git", "branch", "-D", name, cwd=fork)
+            next_utc_second()
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.assertEqual(code, 2, err + out)
+            code, out, err2 = self.run_it(err, "forkflow sync --force", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.merged_and_landed(fork, name + "-2")
+
+        def test_a_sync_the_trunk_moved_under_is_redone_with_force_and_merge(self):
+            """`check` fails on the tip because origin's trunk moved after the merge was made:
+            the redo it names (`--force`) must merge. The gate asks for an untracked marker so
+            the first stop is the gate's and the second the tip's."""
+            fork = make_fork(self.tmp, config='merge = "self"\ngate = ["test -e .gate-ok"]\n')
+            self.upstream_change()
+            with on_platform(self.platform("gitlab")):
+                self.assertEqual(run("-C", fork, "sync", "--merge")[0], 3)
+            second_clone_commit(self.tmp)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            write(fork, ".gate-ok", "")
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--continue", "--merge")
+            self.assertEqual(code, 3, err + out)
+            next_utc_second()
+            code, out, err2 = self.run_it(out, "forkflow sync --force", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.merged_and_landed(fork, sync_branch_name())
+
+        def test_a_sync_branch_without_its_merge_is_redone_with_merge(self):
+            """A branch under today's sync name carrying no merge: "nothing to continue".
+            Plain `sync` would refuse the existing branch and send the user back to
+            `--continue` - the rerun named is `--force`, and it merges."""
+            fork = self.self_fork()
+            self.upstream_change()
+            sh("git", "checkout", "-q", "-b", sync_branch_name(), "develop", cwd=fork)
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "sync", "--continue", "--merge")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("nothing to continue", err)
+            code, out, err2 = self.run_it(err, "forkflow sync", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.merged_and_landed(fork, sync_branch_name())
+
+        def test_no_ship_to_continue_names_ship_with_merge(self):
+            fork = self.self_fork()
+            name = self.feature(fork)
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--continue", "--merge")
+            self.assertEqual(code, 2, err + out)
+            code, out, err2 = self.run_it(err, "forkflow ship", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.merged_and_landed(fork, name)
+
+        def test_an_aborted_rebase_names_ship_with_merge(self):
+            """`git rebase --abort` after `ship --merge` stopped, then `ship --continue
+            --merge`: "run `forkflow ship` again" lost the flag. Run as printed it stops on
+            the same conflict, whose resume then merges and lands."""
+            fork = self.self_fork()
+            name = self.feature(fork, commits=0)
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "ours: two")
+            second_clone_commit(self.tmp, path="shared.tf",
+                                content=self.BASE_TF.replace("count = 1", "count = 9"))
+            with on_platform(self.platform("gitlab")):
+                self.assertEqual(run("-C", fork, "ship", "--merge")[0], 4)
+            sh("git", "rebase", "--abort", cwd=fork)
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "ship", "--continue", "--merge")
+            self.assertEqual(code, 2, err + out)
+            next_utc_second()
+            code, out, err = self.run_it(err, "forkflow ship", fork)
+            self.assertEqual(code, 4, err + out)
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
+            sh("git", "add", "shared.tf", cwd=fork)
+            sh("git", "rebase", "--continue", cwd=fork)
+            code, out, err2 = self.run_it(err, "forkflow ship --continue", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.merged_and_landed(fork, name)
+
     class TestMergeGate(ShipBase):
         """`--merge` is config AND flag, refused before the fetch, the backup and any push.
 
@@ -11969,7 +12119,9 @@ def run_tests() -> None:
                     sh("git", "for-each-ref", "--format=%(refname) %(objectname)", cwd=fork),
                     state)
 
-        def refused(self, fork: str, *argv: str, why: str = REFUSED, named: bool = True) -> None:
+        def refused(self, fork: str, *argv: str, why: str = REFUSED, named: bool = True) -> str:
+            """Exit 2 naming `why`, nothing changed and no platform tool run; answers with
+            the message, for the route it names."""
             merging_tool(self.tmp, "glab")
             before = self.snapshot(fork)
             if named:
@@ -11982,6 +12134,7 @@ def run_tests() -> None:
             self.assertEqual(self.snapshot(fork), before)
             self.assertEqual(tool_argv(self.tmp, "glab", "create"), [])
             self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
+            return err
 
         def both_refused(self, fork: str, why: str = REFUSED, named: bool = True) -> None:
             commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
@@ -12046,8 +12199,8 @@ def run_tests() -> None:
             """The fork has no config ("manual"); upstream's `.forkflow.toml` says `merge =
             "self"` and comes in with a conflicted sync. On `--continue` the working tree is
             the merge, upstream's file included - that must not switch the gate off, before
-            the merge is committed or after. Plain `--continue`, the route the refusal
-            names, still finishes the sync and merges nothing."""
+            the merge is committed or after. `--continue --mr`, the route the refusal names,
+            still finishes the sync, opens the request and merges nothing."""
             fork = make_fork(self.tmp)
             commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
                         "ours: shared", push=True)
@@ -12062,14 +12215,16 @@ def run_tests() -> None:
             sh("git", "add", "shared.tf", cwd=fork)
             self.refused(fork, "sync", "--continue", "--merge", why=self.ARRIVED)
             sh("git", "commit", "-q", "--no-edit", cwd=fork)             # committed by hand
-            self.refused(fork, "sync", "--continue", "--merge", why=self.ARRIVED)
+            err = self.refused(fork, "sync", "--continue", "--merge", why=self.ARRIVED)
             name = sync_branch_name()
             self.assertEqual(origin_sha(fork, name), "")
             with on_platform("gitlab"):
-                code, out, err = run("-C", fork, "sync", "--continue")
+                code, out, err = run_printed(err, "forkflow sync --continue", fork)
             self.assertEqual(code, 0, err + out)
             self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
             self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
+            # still `--mr`: the request the reviewer merges by hand is opened
+            self.assertEqual(tool_argv(self.tmp, "glab", "create")[:2], ["mr", "create"])
 
         @needs_tomllib
         def test_refused_when_the_origin_names_no_project(self):
@@ -12257,7 +12412,7 @@ def run_tests() -> None:
             self.assertEqual(code, 2, err + out)
             self.assertIn("came in with this sync's merge", err)
             with on_platform("gitlab"):
-                code, out, err = run("-C", fork, "sync", "--continue")
+                code, out, err = run_printed(err, "forkflow sync --continue", fork)
             self.assertEqual(code, 0, err + out)
             self.assertIn("NOT RUN", out)
             self.assertFalse(os.path.exists(flag))
@@ -12573,6 +12728,7 @@ def run_tests() -> None:
             with open(os.path.abspath(__file__), encoding="utf-8") as fh:
                 src = fh.read()
             tree = ast.parse(src)
+            cls.tree = tree
             cls.limit = next(n.lineno for n in tree.body
                              if isinstance(n, ast.FunctionDef) and n.name == "run_tests")
             funcs = [n for n in ast.walk(tree)
@@ -12632,6 +12788,39 @@ def run_tests() -> None:
             # `run_tool` runs whatever it is handed, so who hands it something is pinned too:
             # the merge request's two steps and nothing else
             self.assertEqual(self.owners("run_tool("), {"run_tool", "open_mr", "merge_mr"})
+
+        def test_every_printed_sync_and_ship_command_comes_from_rerun_cmd(self):
+            """A printed `forkflow sync ...` / `forkflow ship ...` spelled out by hand drops the
+            `--merge` (or `--mr`) the run was given, and followed to the letter it merges
+            nothing - found at one site after another. So no string in the code spells one:
+            `rerun_cmd` (behind `continue_cmd`) is the one place that writes `forkflow
+            <subcommand>`, and `header`'s title line the one other `forkflow {...}`. Every
+            string literal and f-string is read, adjacent pieces joined as Python joins them;
+            docstrings are prose and are skipped (comments never reach the tree)."""
+            import ast
+            prose = {id(n.value) for n in ast.walk(self.tree)
+                     if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)}
+            parts = {id(v) for n in ast.walk(self.tree) if isinstance(n, ast.JoinedStr)
+                     for v in n.values}
+            spelled, built = set(), set()
+            for n in ast.walk(self.tree):
+                if getattr(n, "lineno", self.limit) >= self.limit:
+                    continue
+                if isinstance(n, ast.JoinedStr):
+                    text = "".join(v.value if isinstance(v, ast.Constant) else "{}"
+                                   for v in n.values)
+                elif (isinstance(n, ast.Constant) and isinstance(n.value, str)
+                      and id(n) not in prose and id(n) not in parts):
+                    text = n.value
+                else:
+                    continue
+                owner = self.owner.get(n.lineno, "<module>")
+                if re.search(r"forkflow\s+(sync|ship)\b", text):
+                    spelled.add(owner)
+                if re.search(r"forkflow\s+(\{|%)", text):
+                    built.add(owner)
+            self.assertEqual(spelled, set())
+            self.assertEqual(built, {"rerun_cmd", "header"})
 
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
