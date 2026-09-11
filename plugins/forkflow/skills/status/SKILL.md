@@ -35,7 +35,8 @@ needs 3.11+). The layout and the rules it enforces: `${CLAUDE_PLUGIN_ROOT}/refer
 
 2. **Read the output.** Header first (mirror line, trunk line, divergence), then the branch line,
    the upstream-tracked WARNING list, backups, the setup line, and - when a ship or a sync is
-   waiting to land - the `pending` line.
+   waiting to land - the `pending` line. The record behind it is shared by every worktree of the
+   clone, so a ship made in a linked worktree shows here too.
 
 3. **Explain, don't just paste.** Say in plain words where the fork stands: how far the trunk is
    ahead of upstream and behind it, whether the mirror is behind upstream or unpushed, whether the

@@ -26,8 +26,11 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    ```
 
    It finishes the most recent `ship` or `sync` this clone ran - the one whose branch it pushed
-   and recorded as *pending*. Preflight: a pending record ("nothing pending" otherwise), no rebase
-   in progress, a clean tree, and the trunk not checked out in another worktree - all exit 2.
+   and recorded as *pending*. The record is shared by every worktree of the clone, so a ship made
+   in a linked worktree is landed from whichever worktree has the trunk checked out. Preflight: a
+   pending record ("nothing pending" otherwise), no rebase in progress, a clean tree, and the trunk
+   not checked out in another worktree (the message names it: run `forkflow land` there) - all
+   exit 2, before the fetch.
    Then: fetch origin; decide whether the recorded commit is on `origin/<trunk>` - by ancestry
    (a fast-forward or a merge commit keeps the SHA), and for a ship also by patch, so a "squash
    and merge" or a "rebase and merge" that gave the commit a new SHA is recognised too; create
@@ -102,7 +105,7 @@ After the usual header (mirror line, trunk line, divergence), one line per step:
 | exit | what happened | what to do |
 |---|---|---|
 | 0 | landed, or dry run | nothing; the record is cleared (a second `land` is "nothing pending") |
-| 2 | precondition: nothing pending, rebase in progress, dirty tree, trunk checked out in another worktree, the fetch failed, the recorded commit is not in this clone (`cannot verify the landing`), not on `origin/<trunk>` yet, the local trunk carries commits origin lacks, `origin/<trunk>` does not resolve, or the usual setup failures (no `upstream` remote, the trunk not on origin, an origin whose push URL is the original project, an unreadable `.forkflow.toml`) | fix what the message names and rerun. "Not yet" means wait for the merge; "commits origin lacks" means somebody committed on the local trunk by hand - show them `git log origin/<trunk>..<trunk>` and let them decide, the plugin never moves that trunk over its own commits |
+| 2 | precondition: nothing pending, rebase in progress, dirty tree, trunk checked out in another worktree, the fetch failed, the recorded commit is not in this clone (`cannot verify the landing`), not on `origin/<trunk>` yet, the local trunk carries commits origin lacks, `origin/<trunk>` does not resolve, or the usual setup failures (no `upstream` remote, the trunk not on origin, an origin whose push URL is the original project, an unreadable `.forkflow.toml`) | fix what the message names and rerun. A trunk checked out in another worktree means `forkflow land` in that worktree - it sees the same pending record. "Not yet" means wait for the merge; "commits origin lacks" means somebody committed on the local trunk by hand - show them `git log origin/<trunk>..<trunk>` and let them decide, the plugin never moves that trunk over its own commits |
 
 ## Notes
 

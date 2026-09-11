@@ -136,6 +136,13 @@ decisions are recorded at the end.
   5. a test that wants the merge to fail sets `FORKFLOW_FAKE_FAIL=1` in the environment; the fake
      then exits 1 with a stderr line and moves nothing.
   With that fake, `--merge` -> `land` is testable end to end with no network.
+  ➕ review fix (phase 1): the fake was made to match the platforms where it did not - gh
+  `--merge` makes a real `--no-ff` merge commit in the temp clone (GitHub's "Create a merge
+  commit" always does), glab's fast-forward refuses when the trunk is not an ancestor of the tip
+  ("rebase needed") instead of rewinding it, glab without `--auto-merge=false` arms auto-merge,
+  exits 0 and moves nothing, `--remove-source-branch` deletes the source branch on origin, and
+  `FORKFLOW_FAKE_CREATE=fail|nourl` fails `create` or gives no URL. Tests that read the shipped
+  commit from `origin/<branch>` after a glab merge read it from the recorded `--sha` instead.
 - **what the suite cannot prove**: that real `glab mr merge` / `gh pr merge` accept these flags and
   merge - the fake proves the argv shape and the chain. Real validation happens on the GET fork's next
   ship after the plugin is updated to 0.2.0 (Post-Completion)
@@ -228,6 +235,13 @@ Two conditions, both checked before the fetch, the backup and any push:
 2. `args.merge and not mr_target(ctx)[0]` -> `Fail(f"--merge: `{ctx.origin_url}` names no project
    ... ({reason})", 2)` - knowable now, so not a push followed by an exit 6.
 
+⚠️ review fix (phase 1): on `sync --continue` the working tree is the sync's merge, upstream's
+`.forkflow.toml` included, so a `merge = "self"` the original project carries switched condition 1
+off. `merge_gate(..., resume_sync=True)` now also refuses (exit 2, before anything is pushed) when
+the working-tree `merge` differs from the fork's side of the merge - `HEAD` while it is
+uncommitted, `<merge>^1` once committed - the comparison `gate_arrived_in_merge` makes for `gate`;
+an untracked file is the fork's own and is trusted (`merge_mode_arrived_in_merge`).
+
 Placement: in `cmd_ship`, inside/after `ship_preflight` (which already runs before its `--continue`
 branch). In `cmd_sync`, **immediately after `header(ctx, "sync")` and before the `--continue`
 dispatch** - `cmd_sync` dispatches `--continue` on its fourth line, before any preflight, and a
@@ -298,6 +312,15 @@ For a sync `commit` is the merge commit (`HEAD` of the sync branch after the mer
 `branch`, `commit` and `base` as strings - the `resumable` pattern. `write_state` already skips
 `--dry-run`. The existing `write_state(ctx, kind, None)` (the resume entry) stays.
 
+⚠️ review fix (phase 1): the state file is per worktree (`git rev-parse --git-path`), so a ship
+from a linked worktree while the trunk was checked out in the main one dead-ended - `land` there
+said "nothing pending", `land` in the linked one named the main worktree and offered "remove
+that worktree", which the main one cannot be. `pending` now lives in the state file under
+`git rev-parse --git-common-dir` (`SHARED_STATE`; the same file as the main worktree's own), so
+every worktree sees one record; the resume entries and `published` stay per worktree. The
+worktree refusal names only `forkflow land` in that worktree - a route that works. `save_state`
+writes a temp file and renames it over the old one.
+
 ### `land`
 
 `cmd_land(args)` -> `resolve_ctx(need_upstream=True, need_trunk=True, strict_mirror=False)`, header,
@@ -308,6 +331,8 @@ preflight  pending_entry(ctx) non-empty (else 2: "nothing pending: ship or sync 
            clean tree (else 2) ; no rebase in progress (else 2)
            trunk not checked out in another worktree (for-each-ref %(worktreepath), as mirror_worktree
            does) - else 2 naming the path
+           ⚠️ review fix: this preflight is the only worktree check (land_trunk's copy dropped) and
+           the message names `forkflow land` there only (the pending record is shared)
 fetch      git fetch <origin>                                   (git_rc; failure -> 2)
 landed?    landed(ctx, entry) -> (sha | None, how):
              1. git merge-base --is-ancestor <commit> origin/<trunk>      rc 0 -> (<commit>, "ancestor")

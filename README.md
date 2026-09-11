@@ -276,8 +276,12 @@ backup_prefix = "backup/"
 default) means somebody reviews and presses the button, and `--merge` is refused with exit 2 before
 anything is pushed; `"self"` means whoever opened the MR merges it, which lets `ship --merge` and
 `sync --merge` do so. Config *and* flag are needed - either alone does nothing - so a reviewed fork
-can never be merged by accident. The key is read from the working tree, tracked or not, which is
-where `setup` leaves the file.
+can never be merged by accident. `--merge` also needs an origin URL that names a GitLab or GitHub
+project the merge command can address with `--repo`; one that does not is the same exit 2, before
+anything is pushed. The key is read from the working tree, tracked or not, which is
+where `setup` leaves the file - except on `sync --continue`, where that tree is the sync's merge:
+there a `merge = "self"` that came in with upstream's `.forkflow.toml` is refused, and only the
+fork's own side of the merge counts.
 
 `gate` is the one key that is *run* rather than read - `sh -c` in the repo root, on every `check`,
 `sync` and `ship` - and `.forkflow.toml` is a tracked file a sync is designed to bring in from the
@@ -304,7 +308,7 @@ so) and a file of nothing but comments is read as no config at all.
 |---|---|
 | `0` | done, dry run, or nothing to do (already in sync; nothing to ship). Also `--mr` when the tool is missing or fails, without `--merge` - the branch is pushed and the command is printed |
 | `1` | `--test` had failures |
-| `2` | precondition: dirty tree, detached HEAD, missing remote, unfetched upstream, unreadable `.forkflow.toml`, mirror diverged from upstream, trunk missing on origin, foreign pre-push hook, `--merge` on a fork whose config does not say `merge = "self"`, `land` with nothing pending or with an MR that is not merged yet, ... |
+| `2` | precondition: dirty tree, detached HEAD, missing remote, unfetched upstream, unreadable `.forkflow.toml`, mirror diverged from upstream, trunk missing on origin, foreign pre-push hook, `--merge` on a fork whose config does not say `merge = "self"` (or whose origin names no project to merge on), `land` with nothing pending or with an MR that is not merged yet, ... |
 | `3` | invariant checked by `check`: a gate command failed, or the branch is not on the trunk's tip |
 | `4` | conflicts - resolve them, then rerun with `--continue` |
 | `5` | rewrite safety: backup not confirmed on origin, tree hash differs after the squash, push rejected |
@@ -322,7 +326,9 @@ python3 $S land
 
 `land` finishes the most recent `ship` or `sync` this clone ran - the run that pushed a branch
 recorded what is waiting to land, so it works in any later session, and `status` shows the record
-on its `pending` line with the same verdict. It fetches; verifies that the recorded commit is on
+on its `pending` line with the same verdict. The record is shared by every worktree of the clone:
+a ship made in a linked worktree lands from the worktree that has the trunk checked out, and
+`land` elsewhere says which one that is before it fetches anything. It fetches; verifies that the recorded commit is on
 `origin/<trunk>` - by ancestry, or for a ship by patch, so a "squash and merge" or GitHub's "Rebase
 and merge" that gave the commit a new SHA is recognised too; checks the local trunk out (creating it
 from `origin/<trunk>` in a single-branch clone) and fast-forwards it with `git merge --ff-only`;
