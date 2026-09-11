@@ -9885,6 +9885,8 @@ def run_tests() -> None:
             self.assertEqual(code, 2, err + out)
             self.assertIn("cannot verify", err)
             self.assertEqual(rev(fork, "refs/heads/develop"), entry["base"])
+            self.assertEqual(checked_out(fork), name)                # nothing moved ...
+            self.assertEqual(self.pending_of(fork), entry)           # ... and nothing forgotten
 
         # -- landed ------------------------------------------------------------------------
 
@@ -9978,6 +9980,12 @@ def run_tests() -> None:
             self.assertEqual(code, 0, err + out)
             self.assertIn("git branch --no-track develop origin/develop", out)
             self.assert_landed(fork, name, entry["commit"])
+            # `--no-track` as state, not as the printed command: the recreated trunk has no
+            # upstream, so a stray `git pull` on it later is refused rather than merged
+            self.assertEqual(sh("git", "config", "--get", "branch.develop.remote", cwd=fork,
+                                check=False), "")
+            self.assertEqual(sh("git", "config", "--get", "branch.develop.merge", cwd=fork,
+                                check=False), "")
 
         def test_land_from_an_unrelated_branch_ends_on_the_trunk(self):
             fork, name, entry = self.shipped()
@@ -10219,6 +10227,34 @@ def run_tests() -> None:
             self.assertIn("(ancestor)", out)
             self.assertNotIn("may still exist", out)                 # a sync: no hint
             self.assert_landed(fork, name, origin_sha(fork, name))
+
+        def test_a_refused_merge_leaves_a_record_a_by_hand_merge_lands_from(self):
+            """Exit 6 says "the branch is pushed; merge by hand, then `forkflow land`" - so
+            that has to work: the platform refuses, a human merges the open request in the
+            UI, and a later `land` finishes from the record the failed run left. The
+            landable state is proven by landing, not by the record's shape alone."""
+            fork = self.self_fork()
+            name = self.feature(fork, commits=2)
+            old = rev(fork, "refs/heads/develop")
+            os.environ["FORKFLOW_FAKE_FAIL"] = "1"
+            with self.on(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 6, err + out)
+            del os.environ["FORKFLOW_FAKE_FAIL"]
+            shipped = origin_sha(fork, name)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"], entry["commit"], entry["mr"]),
+                             ("ship", name, shipped, MERGING_TOOL_URL["glab"]))
+            self.assertEqual(rev(fork, "refs/heads/develop"), old)          # nothing landed
+            self.assertEqual(origin_sha(fork, "develop"), entry["base"])
+            self.assertEqual(sh("git", "symbolic-ref", "--short", "HEAD", cwd=fork), name)
+            # a human merges the request by fast-forward: the bare origin's trunk moves
+            sh("git", "--git-dir=" + os.path.join(self.tmp, "origin.git"),
+               "update-ref", "refs/heads/develop", shipped)
+            code, out, err = run("-C", fork, "land")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("(ancestor)", out)
+            self.assert_landed(fork, name, shipped)
 
         def test_a_merged_request_whose_catch_up_cannot_run_says_so_first(self):
             """The local trunk carries a commit of its own: the platform merged the request,
