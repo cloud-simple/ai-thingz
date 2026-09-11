@@ -257,11 +257,39 @@ def parse_config(text: str, where: str) -> dict:
     return cfg
 
 
+def config_name_in(names: Sequence[str]) -> Optional[str]:
+    """The name among `names` that is `.forkflow.toml` under some spelling of its case:
+    the exact name when it is there, else the first variant, else None."""
+    if CONFIG_FILE in names:
+        return CONFIG_FILE
+    variants = sorted(n for n in names if n.casefold() == CONFIG_FILE.casefold())
+    return variants[0] if variants else None
+
+
 def load_config(root: str) -> dict:
-    """{} when absent. A config that is there but cannot be read is a hard failure."""
-    path = os.path.join(root, CONFIG_FILE)
-    if not os.path.exists(path):
+    """{} when absent. A config that is there but cannot be read is a hard failure.
+
+    Read only from a file listed under exactly its own name. On a case-insensitive
+    filesystem (the macOS and Windows default) opening `.forkflow.toml` opens a
+    `.ForkFlow.toml` just as well, while git matches paths case-exactly: `git show
+    <rev>:.forkflow.toml` and `ls-files` find nothing, so every check of what a sync merge
+    brought in reads "no config on either side" - and `gate`, arbitrary shell, came from
+    upstream. A case variant is refused rather than read or ignored: ignoring it would still
+    leave the file every tool but this one opens as the config."""
+    try:
+        names = os.listdir(root)
+    except OSError as exc:
+        raise Fail(f"{root} cannot be listed to look for {CONFIG_FILE}: {exc}")
+    found = config_name_in(names)
+    if found is None:
         return {}
+    if found != CONFIG_FILE:
+        raise Fail(f"`{found}` is not `{CONFIG_FILE}`: the names differ only in case, and "
+                   f"forkflow reads its config only from a file named exactly "
+                   f"`{CONFIG_FILE}` - on a case-insensitive filesystem that one name opens "
+                   f"both, while git tells them apart, so no check could see what it holds. "
+                   f"Rename it (git mv) or remove it", 2)
+    path = os.path.join(root, CONFIG_FILE)
     try:
         with open(path, "r", encoding="utf-8") as fh:
             text = fh.read()
@@ -1657,17 +1685,27 @@ def gate_commands(ctx: Ctx) -> list:
     return [c for c in (ctx.cfg.get("gate") or []) if c.strip()]
 
 
-def config_text(ctx: Ctx, revision: Optional[str] = None) -> Optional[str]:
-    """`.forkflow.toml` as of `revision`, or from the working tree when `revision` is None.
-    None when it is not there at all."""
-    if revision is None:
-        try:
-            with open(os.path.join(ctx.root, CONFIG_FILE), "r", encoding="utf-8") as fh:
-                return fh.read()
-        except (OSError, UnicodeDecodeError):
-            return None
-    rc, out, _ = git_rc("show", f"{revision}:{CONFIG_FILE}", cwd=ctx.root)
+def config_text(ctx: Ctx, revision: str) -> Optional[str]:
+    """`.forkflow.toml` as of `revision`; None when it is not there at all. (The working
+    tree's is `load_config`'s alone, which refuses a case variant.)
+
+    A committed file whose name differs from `.forkflow.toml` only in case counts as it
+    (the exact name wins where a case-sensitive clone holds both): it is the file a
+    case-insensitive checkout opens under that name, so "what did the merge bring in" has to
+    see it - git's own `<rev>:<path>` matches case-exactly and would read it as absent."""
+    rc, out, _ = git_rc("ls-tree", "-z", "--name-only", revision, cwd=ctx.root)
+    name = config_name_in(out.split("\0")) if rc == 0 else CONFIG_FILE
+    if name is None:
+        return None
+    rc, out, _ = git_rc("show", f"{revision}:{name}", cwd=ctx.root)
     return out if rc == 0 else None
+
+
+def config_tracked(ctx: Ctx) -> bool:
+    """True when the index holds `.forkflow.toml` under any spelling of its case - see
+    `load_config` for why a case variant must count as the file."""
+    out = git("ls-files", "-z", "--", f":(icase){CONFIG_FILE}", cwd=ctx.root, check=False)
+    return config_name_in(out.split("\0")) is not None
 
 
 def gate_at(ctx: Ctx, revision: str) -> Optional[list]:
@@ -2251,8 +2289,10 @@ def merge_mode_arrived_in_merge(ctx: Ctx) -> bool:
     a reviewed fork. The fork's side is the branch before the merge: `HEAD` while the merge
     is uncommitted, `<merge>^1` once it is - the same comparison `gate_arrived_in_merge`
     makes for `gate`. An untracked file is the fork's own: no merge writes one (git refuses
-    a merge that would overwrite it), and it is where `setup` leaves the config."""
-    if not git_ok("ls-files", "--error-unmatch", "--", CONFIG_FILE, cwd=ctx.root):
+    a merge that would overwrite it), and it is where `setup` leaves the config. Tracked
+    means under any case of the name: `ls-files --error-unmatch` matched case-exactly and
+    read upstream's `.ForkFlow.toml` as "untracked, the fork's own"."""
+    if not config_tracked(ctx):
         return False
     if merge_in_progress(ctx):
         side = "HEAD"
@@ -4078,7 +4118,7 @@ def setup_template(ctx: Ctx) -> None:
         with open(path, "w") as fh:
             fh.write(template_text(ctx))
         step("template", cmd, "commented template written")
-    if not git_ok("ls-files", "--error-unmatch", CONFIG_FILE, cwd=ctx.root):
+    if not config_tracked(ctx):
         print(f"    it is untracked: commit {CONFIG_FILE} when you are happy with it, so the "
               f"branch names and the gate are the same for everyone")
 
@@ -4765,6 +4805,32 @@ def run_tests() -> None:
                 load_config(self.tmp)
             self.assertEqual(cm.exception.code, 2)
             self.assertIn("`merge` must be a string", str(cm.exception))
+
+        def test_a_name_that_differs_only_in_case_is_refused(self):
+            """The directory lists `.ForkFlow.toml` and no `.forkflow.toml` - true on every
+            filesystem once that one file is written. A case-insensitive one would open it
+            as the config while git's case-exact paths call it absent; a case-sensitive one
+            would silently ignore the file every other tool there reads. Refused either way,
+            naming the file that was found."""
+            for variant in (".ForkFlow.toml", ".FORKFLOW.TOML", ".forkflow.TOML"):
+                path = write(self.tmp, variant, 'gate = ["true"]\n')
+                self.assertIn(variant, os.listdir(self.tmp))
+                self.assertNotIn(CONFIG_FILE, os.listdir(self.tmp))
+                with self.assertRaises(Fail) as cm:
+                    load_config(self.tmp)
+                self.assertEqual(cm.exception.code, 2, variant)
+                self.assertIn("`%s`" % variant, str(cm.exception))
+                os.unlink(path)
+            self.assertEqual(load_config(self.tmp), {})
+
+        @needs_tomllib
+        def test_the_exact_name_is_read_when_a_variant_sits_beside_it(self):
+            """Only a case-sensitive filesystem can hold both; there git and the open() agree
+            on which file is `.forkflow.toml`, so it is read and the variant is not the
+            config."""
+            write(self.tmp, CONFIG_FILE, 'trunk = "trunk"\n')
+            with mock.patch.object(os, "listdir", return_value=[".ForkFlow.toml", CONFIG_FILE]):
+                self.assertEqual(load_config(self.tmp), {"trunk": "trunk"})
 
     # ------------------------------------------------------------------- #
     # resolve_ctx
@@ -9721,6 +9787,7 @@ def run_tests() -> None:
 
             sh("git", "checkout", "-b", "feat/y", "develop", cwd=fork)
             commit_fork(fork, "ours/y.txt", "y\n", "ours: y")
+            next_utc_second()                              # a second `backup/<time>-pre-ship`
             absent = ["forkflow-no-such-tool", "mr", "create"]
             with on_platform("gitlab"), mock.patch.object(
                     sys.modules[__name__], "mr_command", lambda *a: absent):
@@ -11161,6 +11228,134 @@ def run_tests() -> None:
                              ["mr", "merge", sync_branch_name()])
             self.assertEqual(origin_sha(fork, "develop"), rev(fork, "refs/heads/develop"))
             self.assertEqual(self.pending_of(fork), {})
+
+    def case_insensitive(path: str) -> bool:
+        """Whether the filesystem under `path` opens a file under another case of its name."""
+        probe = os.path.join(path, "forkflow-case-probe")
+        with open(probe, "w"):
+            pass
+        try:
+            return os.path.exists(os.path.join(path, "FORKFLOW-CASE-PROBE"))
+        finally:
+            os.unlink(probe)
+
+    class TestConfigNameCase(ShipBase):
+        """`.forkflow.toml` under another case of its name.
+
+        On a case-insensitive filesystem (the macOS and Windows default) an upstream that
+        commits `.ForkFlow.toml` puts a file in the tree that `open(".forkflow.toml")` reads
+        and git's case-exact `<rev>:.forkflow.toml` and `ls-files` do not see: every check of
+        what the sync merge brought in read "no config on either side", and upstream's `gate`
+        ran with `sh -c` and its `merge = "self"` merged the sync MR. The first two cases hold
+        on any filesystem; the end-to-end ones need a case-insensitive one and skip
+        elsewhere."""
+
+        VARIANT = ".ForkFlow.toml"
+
+        def upstream_variant(self, flag: str) -> None:
+            commit_upstream(self.tmp, self.VARIANT,
+                            'merge = "self"\ngate = ["touch %s"]\n' % flag,
+                            "theirs: forkflow, spelled differently")
+
+        def test_check_refuses_a_variant_in_the_tree_and_runs_no_gate(self):
+            fork = make_fork(self.tmp)
+            flag = os.path.join(self.tmp, "variant-gate-ran")
+            write(fork, self.VARIANT, 'gate = ["touch %s"]\n' % flag)
+            self.assertNotIn(CONFIG_FILE, os.listdir(fork))
+            code, out, err = run("-C", fork, "check")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("`%s`" % self.VARIANT, err)
+            self.assertFalse(os.path.exists(flag))
+
+        def test_a_committed_variant_counts_as_the_config(self):
+            """What "is the config tracked" and "what did this revision carry" answer for a
+            variant - built with plumbing, so no working-tree file is involved and it holds on
+            any filesystem. The exact name wins where a tree holds both."""
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            self.assertFalse(config_tracked(ctx))
+            self.assertIsNone(config_text(ctx, "HEAD"))
+
+            def blob(text: str) -> str:
+                path = write(self.tmp, "blob.txt", text)
+                return sh("git", "hash-object", "-w", path, cwd=fork)
+
+            sh("git", "update-index", "--add", "--cacheinfo",
+               "100644,%s,%s" % (blob("theirs\n"), self.VARIANT), cwd=fork)
+            self.assertTrue(config_tracked(ctx))
+            one = sh("git", "commit-tree", sh("git", "write-tree", cwd=fork), "-p", "HEAD",
+                     "-m", "variant only", cwd=fork)
+            self.assertEqual(config_text(ctx, one), "theirs\n")
+            sh("git", "update-index", "--add", "--cacheinfo",
+               "100644,%s,%s" % (blob("ours\n"), CONFIG_FILE), cwd=fork)
+            both = sh("git", "commit-tree", sh("git", "write-tree", cwd=fork), "-p", "HEAD",
+                      "-m", "both", cwd=fork)
+            self.assertEqual(config_text(ctx, both), "ours\n")
+            self.assertIsNone(config_text(ctx, "HEAD"))                   # still none there
+
+        def test_a_clean_sync_bringing_a_variant_runs_no_gate(self):
+            """A plain `sync` on a fork with no config of its own: the merge is clean, and
+            before the fix `check` ran upstream's gate from the variant."""
+            fork = make_fork(self.tmp)
+            if not case_insensitive(fork):
+                self.skipTest("the filesystem is case-sensitive")
+            flag = os.path.join(self.tmp, "upstream-gate-ran")
+            self.upstream_variant(flag)
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("`%s`" % self.VARIANT, err)
+            self.assertFalse(os.path.exists(flag))
+            name = sync_branch_name()
+            self.assertEqual(checked_out(fork), name)                    # the merge is made
+            self.assertEqual(origin_sha(fork, name), "")                   # nothing pushed
+            # the route the refusal names: the variant removed on the sync branch, committed
+            sh("git", "rm", "-q", self.VARIANT, cwd=fork)
+            sh("git", "commit", "-q", "-m", "drop upstream's config", cwd=fork)
+            code, out, err = run("-C", fork, "sync", "--continue")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+            self.assertFalse(os.path.exists(flag))
+
+        @needs_tomllib
+        def test_a_conflicted_sync_bringing_a_variant_is_not_merged_on_continue(self):
+            fork = make_fork(self.tmp)
+            if not case_insensitive(fork):
+                self.skipTest("the filesystem is case-sensitive")
+            flag = os.path.join(self.tmp, "upstream-gate-ran")
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "ours: shared", push=True)
+            self.upstream_variant(flag)
+            commit_upstream(self.tmp, "shared.tf", self.BASE_TF.replace("count = 1", "count = 3"),
+                            "theirs: shared")
+            merging_tool(self.tmp, "glab")
+            trunk = origin_sha(fork, "develop")
+            with on_platform("gitlab"):
+                self.assertEqual(run("-C", fork, "sync")[0], 4)
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
+            sh("git", "add", "shared.tf", cwd=fork)
+            name = sync_branch_name()
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--continue", "--merge")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("`%s`" % self.VARIANT, err)
+            self.assertFalse(os.path.exists(flag))
+            self.assertEqual(origin_sha(fork, name), "")
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
+            self.assertEqual(origin_sha(fork, "develop"), trunk)
+            # renamed to the exact name, it is upstream's config arriving with the merge:
+            # `--merge` is refused, and the gate is shown rather than run
+            sh("git", "mv", self.VARIANT, CONFIG_FILE, cwd=fork)
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--continue", "--merge")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("came in with this sync's merge", err)
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--continue")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("NOT RUN", out)
+            self.assertFalse(os.path.exists(flag))
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
+            self.assertEqual(origin_sha(fork, "develop"), trunk)
 
     class TestParseArgs(unittest.TestCase):
         def test_common_flags_before_or_after_the_subcommand(self):

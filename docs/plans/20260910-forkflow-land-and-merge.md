@@ -242,6 +242,15 @@ the working-tree `merge` differs from the fork's side of the merge - `HEAD` whil
 uncommitted, `<merge>^1` once committed - the comparison `gate_arrived_in_merge` makes for `gate`;
 an untracked file is the fork's own and is trusted (`merge_mode_arrived_in_merge`).
 
+⚠️ review fix (phase 1, iteration 2 - pre-existing on `main`): a config name differing only in
+case evaded both that check and the `gate` guard. On a case-insensitive filesystem an upstream
+`.ForkFlow.toml` is what `open(".forkflow.toml")` reads, while `git show <rev>:.forkflow.toml` and
+`ls-files` match case-exactly and saw no config on either side - so a plain `sync` ran upstream's
+`gate` and `sync --continue --merge` merged. `load_config` now reads only a file listed under
+exactly `.forkflow.toml` and refuses a case variant (exit 2, naming it); "is it tracked"
+(`config_tracked`, a `:(icase)` pathspec) and "what did this revision carry" (`config_text`, the
+exact name first, else a case variant in the tree) treat a variant as the file.
+
 Placement: in `cmd_ship`, inside/after `ship_preflight` (which already runs before its `--continue`
 branch). In `cmd_sync`, **immediately after `header(ctx, "sync")` and before the `--continue`
 dispatch** - `cmd_sync` dispatches `--continue` on its fourth line, before any preflight, and a
