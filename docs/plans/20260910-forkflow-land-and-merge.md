@@ -338,6 +338,20 @@ every worktree sees one record; the resume entries and `published` stay per work
 worktree refusal names only `forkflow land` in that worktree - a route that works. `save_state`
 writes a temp file and renames it over the old one.
 
+⚠️ review fix (phase 1, iteration 2): one shared record let parallel worktrees overwrite each
+other's (W2's ship replaced W1's; `land` in W1 landed W2's branch; `--merge` re-read and landed
+whatever the file held). `pending` is now a map keyed by branch in the shared file, which
+supersedes "holds the most recent run only" above: a second ship of the same branch replaces its
+entry, ships of other branches keep theirs, and the single bare entry an earlier build wrote reads
+as a map of one. `record_pending` returns the entry it wrote and `--merge` lands that one
+(`land_after_merge(ctx, entry)`), never a re-read. `land` takes `land <branch>`'s record when named
+(a new optional positional - without it `--force` had no way to pick one record in the
+"trunk in the main worktree" layout), else the current branch's, else every record: each verified
+one lands (one fast-forward, then each branch), the rest are listed and kept, none verified is
+exit 2; `--force` with several and none named is exit 2. An entry is cleared only while it still
+has the branch and commit that landed, read again right before the write (`forget_pending`).
+`status` prints one `pending` line per entry; the worktree refusal names `forkflow land <branch>`.
+
 ### `land`
 
 `cmd_land(args)` -> `resolve_ctx(need_upstream=True, need_trunk=True, strict_mirror=False)`, header,

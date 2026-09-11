@@ -26,7 +26,7 @@ Usage:
     forkflow.py check [-C DIR]
     forkflow.py sync [--continue] [--mr] [--merge] [--title T] [-C DIR] [--dry-run] [--force]
     forkflow.py ship [--continue] [--mr] [--merge] [--title T] [--message-file F] [-C DIR] [--dry-run] [--force]
-    forkflow.py land [--force] [-C DIR] [--dry-run]
+    forkflow.py land [BRANCH] [--force] [-C DIR] [--dry-run]
     forkflow.py setup [--upstream NAME] [--upstream-url URL] [--trunk NAME] [--mirror NAME]
                       [-C DIR] [--dry-run] [--force]
     forkflow.py --test                        # run the embedded test suite
@@ -655,7 +655,9 @@ def resolve_ctx(cwd: str, args: Optional[argparse.Namespace] = None, need_upstre
 # What a run of *this worktree* may resume (`sync`, `ship`) and what it published is kept per
 # worktree, beside its HEAD. What is waiting to land is not: a ship made in a linked worktree
 # lands where the trunk is checked out, which is usually the main one - so `pending` lives in
-# the git directory every worktree of the clone shares, and `land` and `status` see it from any
+# the git directory every worktree of the clone shares, and `land` and `status` see it from any.
+# It is a map keyed by branch: worktrees ship different branches at the same time, and one
+# record for the clone let each ship overwrite the other's (`record_pending`)
 SHARED_STATE = ("pending",)
 
 
@@ -756,31 +758,82 @@ def resumable(ctx: Ctx, reason: str, branch: str) -> dict:
 PENDING_FIELDS = ("kind", "branch", "commit", "base")   # what `land` needs; `mr` is display
 
 
-def record_pending(ctx: Ctx, kind: str, branch: str, base: str, url: str = "") -> None:
+def pending_shape(entry: object) -> bool:
+    """True for exactly the shape `record_pending` writes (`mr` may be absent)."""
+    return (isinstance(entry, dict)
+            and all(isinstance(entry.get(k), str) for k in PENDING_FIELDS)
+            and isinstance(entry.get("mr", ""), str))
+
+
+def pending_map(raw: object) -> dict:
+    """{branch: entry} from what the state file holds under `pending`.
+
+    Only entries of the written shape, each under its own branch's name: a state file edited
+    by hand is no state rather than a crash - the same defensive read as `resumable`. The
+    single bare entry an earlier build kept reads as a map of one, so a user who upgrades
+    between a ship and its landing keeps the record."""
+    if pending_shape(raw):
+        return {raw["branch"]: raw}
+    if not isinstance(raw, dict):
+        return {}
+    return {b: e for b, e in raw.items() if pending_shape(e) and e["branch"] == b}
+
+
+def record_pending(ctx: Ctx, kind: str, branch: str, base: str, url: str = "") -> dict:
     """What is waiting to land, for `land` and `status`: the tip this run pushed on `branch`
     and the `origin/<trunk>` it was built on, with the merge request's URL once known.
+    Returns the entry, which is what `--merge` lands - not whatever the file holds by then.
 
     Written right after the push succeeds and before the merge request step, so a merge
     request that fails to open still leaves a landable record, then rewritten with the URL.
-    Only the most recent run is kept: a second ship before the first lands overwrites it,
-    and `land` handles one entry. A dry run writes nothing (`write_state`)."""
-    write_state(ctx, "pending", {"kind": kind, "branch": branch,
-                                 "commit": rev(ctx.root, f"refs/heads/{branch}"),
-                                 "base": base, "mr": url})
+    One entry per branch, in the state file every worktree shares: a second ship of the same
+    branch replaces its entry, and ships of other branches - from other worktrees, at the
+    same time - keep theirs. Read, changed and written back at once, so what another
+    worktree recorded in between is kept. A dry run writes nothing."""
+    entry = {"kind": kind, "branch": branch, "commit": rev(ctx.root, f"refs/heads/{branch}"),
+             "base": base, "mr": url}
+    if not ctx.dry_run:
+        data = read_state(ctx, shared=True)
+        entries = pending_map(data.get("pending"))
+        entries[branch] = entry
+        data["pending"] = entries
+        save_state(ctx, data, shared=True)
+    return entry
 
 
-def pending_entry(ctx: Ctx) -> dict:
-    """The recorded `pending` entry, {} unless it has the shape `record_pending` writes.
+def forget_pending(ctx: Ctx, entry: dict) -> bool:
+    """Clear `entry` once it has landed - only while the record under its branch is still
+    that one (the same branch and commit), read again right before the write: another
+    worktree may have shipped the branch again since, or recorded a ship of its own, and
+    neither is this run's to erase. False when another record stands there now (or in a dry
+    run); True when it was cleared, or there was nothing under the branch to clear."""
+    if ctx.dry_run:
+        return False
+    data = read_state(ctx, shared=True)
+    entries = pending_map(data.get("pending"))
+    now = entries.get(entry["branch"])
+    if not now:
+        return True
+    if now["commit"] != entry["commit"]:
+        return False
+    del entries[entry["branch"]]
+    if entries:
+        data["pending"] = entries
+    else:
+        data.pop("pending", None)
+    save_state(ctx, data, shared=True)
+    return True
 
-    A state file edited by hand, or written by an older version, is no state rather than
-    a crash - the same defensive read as `resumable`. Read from the state every worktree
-    shares (`SHARED_STATE`), so it is the same record whichever worktree asks."""
-    entry = read_state(ctx, shared=True).get("pending")
-    if (isinstance(entry, dict)
-            and all(isinstance(entry.get(k), str) for k in PENDING_FIELDS)
-            and isinstance(entry.get("mr", ""), str)):
-        return entry
-    return {}
+
+def pending_entries(ctx: Ctx) -> dict:
+    """Every recorded `pending` entry, {branch: entry} ({} when there is none). Read from
+    the state every worktree shares (`SHARED_STATE`), so it is the same whichever asks."""
+    return pending_map(read_state(ctx, shared=True).get("pending"))
+
+
+def pending_entry(ctx: Ctx, branch: str) -> dict:
+    """The recorded entry for `branch`, {} when there is none."""
+    return pending_entries(ctx).get(branch, {})
 
 
 # --------------------------------------------------------------------------- #
@@ -1651,9 +1704,10 @@ def cmd_status(args: argparse.Namespace) -> int:
           f"ff-only: {ctx.trunk} {'yes' if ff_trunk else 'no'}, "
           f"{ctx.mirror} {'yes' if ff_mirror else 'no'}")
 
-    entry = pending_entry(ctx)
-    if entry:
-        print(f"  pending  {entry['kind']} {entry['branch']} -> MR {entry.get('mr') or '-'} - "
+    entries = pending_entries(ctx)
+    for branch in sorted(entries):
+        entry = entries[branch]
+        print(f"  pending  {entry['kind']} {branch} -> MR {entry.get('mr') or '-'} - "
               f"{pending_verdict(ctx, entry)}")
 
     todo = []
@@ -2215,25 +2269,27 @@ def finish_sync(ctx: Ctx, args: argparse.Namespace, name: str, commits: Sequence
         if exc.code == 5:
             print(f"  fix that, then: {resume}")
         raise
-    record_pending(ctx, "sync", name, base)            # landable even if the MR step fails
+    entry = record_pending(ctx, "sync", name, base)    # landable even if the MR step fails
 
     title = (getattr(args, "title", None)
              or f"sync: {ctx.up()} {utc_stamp()} ({len(commits)} commits)")
     _, url = open_mr(ctx, name, title, sync_body(ctx, commits, rows, mirror_move, backup_ref),
                      bool(getattr(args, "mr", False)))
     if url:
-        record_pending(ctx, "sync", name, base, url)
+        entry = record_pending(ctx, "sync", name, base, url)
     write_state(ctx, "sync", None)                     # this sync is done: nothing to resume
     if getattr(args, "merge", False):
         merge_mr(ctx, "sync", name, url)               # exit 6 leaves the record above
-        land_after_merge(ctx)
+        land_after_merge(ctx, entry)
         return 0
     print("  after the MR is merged, next: forkflow land")
     return 0
 
 
-def land_after_merge(ctx: Ctx) -> None:
-    """`--merge`'s closing step: the request is merged, so `land` runs in this process.
+def land_after_merge(ctx: Ctx, entry: dict) -> None:
+    """`--merge`'s closing step: the request is merged, so `land` runs in this process -
+    on `entry`, the record this run wrote. Read back from the shared file it could be one
+    another worktree wrote in the meantime, and this run would land (or fail on) that.
 
     A catch-up that cannot run is its own exit 2, but the message has to open with what
     did happen - the merge request *is* merged - so nobody reads a non-zero exit as
@@ -2245,7 +2301,7 @@ def land_after_merge(ctx: Ctx) -> None:
     if ctx.dry_run:
         return
     try:
-        land_pending(ctx, after_merge=True)
+        land_pending(ctx, after_merge=True, entry=entry)
     except Fail as exc:
         if exc.code == EXIT_NOT_MERGED:
             raise
@@ -2687,18 +2743,18 @@ def finish_ship(ctx: Ctx, args: argparse.Namespace, branch: str,
         if exc.code == 5 and rollback:
             print(rollback)
         raise
-    record_pending(ctx, "ship", branch, base)          # landable even if the MR step fails
+    entry = record_pending(ctx, "ship", branch, base)  # landable even if the MR step fails
 
     title = (getattr(args, "title", None)
              or (message.strip().splitlines() or [f"ship {branch}"])[0])
     _, url = open_mr(ctx, branch, title, ship_body(ctx, message, touched),
                      bool(getattr(args, "mr", False)))
     if url:
-        record_pending(ctx, "ship", branch, base, url)
+        entry = record_pending(ctx, "ship", branch, base, url)
     write_state(ctx, "ship", None)                     # this ship is done: nothing to resume
     if getattr(args, "merge", False):
         merge_mr(ctx, "ship", branch, url)             # exit 6 leaves the record above
-        land_after_merge(ctx)
+        land_after_merge(ctx, entry)
         return 0
     print("  after the MR is merged, next: forkflow land")
     return 0
@@ -2940,17 +2996,19 @@ def pending_verdict(ctx: Ctx, entry: dict) -> str:
     return "landed: run forkflow land" if sha else f"not on {ctx.origin}/{ctx.trunk} yet"
 
 
-def trunk_elsewhere(ctx: Ctx) -> None:
+def trunk_elsewhere(ctx: Ctx, resume: str = "forkflow land") -> None:
     """Fail(2) when the trunk is checked out in another worktree: it has to be checked out
     and fast-forwarded there, as `advance_mirror` insists for the mirror.
 
-    That is a route that works: the `pending` record is shared by every worktree of the
-    clone (`SHARED_STATE`), so `land` there finishes the run made here. Removing the other
-    worktree is not offered - the main worktree cannot be removed, and it is the usual one."""
+    That is a route that works: the `pending` records are shared by every worktree of the
+    clone (`SHARED_STATE`), so `resume` there finishes the run made here - it names the
+    branch when this run was landing one record, since HEAD there is on another branch.
+    Removing the other worktree is not offered - the main worktree cannot be removed, and
+    it is the usual one."""
     wt = branch_worktree(ctx, ctx.trunk)
     if wt and os.path.realpath(wt) != os.path.realpath(ctx.root):
-        raise Fail(f"trunk `{ctx.trunk}` is checked out in {wt}: run `forkflow land` there - "
-                   f"every worktree of this clone sees the same pending record")
+        raise Fail(f"trunk `{ctx.trunk}` is checked out in {wt}: run `{resume}` there - "
+                   f"every worktree of this clone sees the same pending records")
 
 
 def land_trunk(ctx: Ctx) -> Tuple[str, str]:
@@ -3009,8 +3067,35 @@ def land_trunk(ctx: Ctx) -> Tuple[str, str]:
     return (old, new)
 
 
-def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False) -> None:
-    """The closing step of a ship or a sync, from the `pending` record: fetch, recognise
+def pending_to_land(ctx: Ctx, entry: Optional[dict], branch: str, force: bool) -> list:
+    """The records this `land` acts on: `entry` when the caller holds it (`--merge` lands
+    the one its own run wrote); the one for `branch` when it is named; the one for the
+    branch HEAD is on; otherwise every record there is - ships from other worktrees wait in
+    the same file, and each that has landed is landed. `force` judges nothing, so it acts
+    on one record only: with several and none chosen, it needs the branch named."""
+    if entry is not None:
+        return [entry]
+    entries = pending_entries(ctx)
+    if not entries:
+        raise Fail("nothing pending: `forkflow ship` or `forkflow sync` first - `land` "
+                   "finishes the run that pushed a branch")
+    names = ", ".join(f"`{b}`" for b in sorted(entries))
+    if branch:
+        if branch not in entries:
+            raise Fail(f"nothing pending for `{branch}` - what is pending: {names}")
+        return [entries[branch]]
+    here = current_branch(ctx)
+    if here in entries:
+        return [entries[here]]
+    if force and len(entries) > 1:
+        raise Fail(f"`--force` lands one record unverified, and {len(entries)} are pending "
+                   f"({names}): name the one - `forkflow land --force <branch>`")
+    return [entries[b] for b in sorted(entries)]
+
+
+def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False,
+                 entry: Optional[dict] = None, branch: str = "") -> None:
+    """The closing step of a ship or a sync, from the `pending` records: fetch, recognise
     the landing, fast-forward the local trunk, delete the landed branch, forget the record.
 
     Works after a human merged the merge request, in any later session, and after a
@@ -3023,18 +3108,21 @@ def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False) -> No
     tool's success that did not land - a merge train, auto-merge - and that is exit 6, not
     "merge it". Rule 5 is reported, not enforced: a ship that landed as a merge commit is
     said out loud. A dry run fetches, decides, and prints every mutating step as `would:`;
-    the record stays (`write_state`)."""
-    entry = pending_entry(ctx)
-    if not entry:
-        raise Fail("nothing pending: `forkflow ship` or `forkflow sync` first - `land` "
-                   "finishes the run that pushed a branch")
-    kind, branch = entry["kind"], entry["branch"]
+    the records stay.
+
+    Which records: see `pending_to_land`. With several, each verified one lands - one
+    fast-forward of the trunk, then each branch - and the rest are reported and kept; none
+    verified is the same exit 2 as for one. Whatever is still pending afterwards is listed
+    as `status` lists it."""
+    chosen = pending_to_land(ctx, entry, branch, force)
+    several = len(chosen) > 1
     if rebase_in_progress(ctx):            # before the tree: a stopped rebase leaves it dirty
         raise Fail("a rebase is in progress: finish it (`git rebase --continue`) or abort "
                    "it (`git rebase --abort`) first")
     if not clean_tree(ctx):
         raise Fail("the working tree has uncommitted changes: commit or stash them first")
-    trunk_elsewhere(ctx)
+    trunk_elsewhere(ctx, "forkflow land" + (" --force" if force else "")
+                    + ("" if several else f" {sh_arg(chosen[0]['branch'])}"))
 
     shown_ref = f"{ctx.origin}/{ctx.trunk}"
     trunk_ref = f"refs/remotes/{shown_ref}"
@@ -3044,87 +3132,127 @@ def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False) -> No
         raise Fail(f"fetch failed: {err.strip()}")
     step("fetch", cmd, result)
 
-    request = entry.get("mr") or f"`{branch}`"
-    commit = entry["commit"]
-    ancestry = f"git merge-base --is-ancestor {sh_arg(short(commit))} {sh_arg(shown_ref)}"
-    try:
-        sha, how = landed(ctx, entry)
-    except Fail:
-        if not force:
-            raise
-        sha, how = None, ""             # nothing to judge - and `--force` judges nothing
-    if sha is None:
-        if not force:
-            step("landed?", ancestry, f"no - {short(commit)} is not on {shown_ref}")
-            if after_merge:
-                raise Fail(f"the platform tool reported the merge request merged, but "
-                           f"{shown_ref} does not have {short(commit)} - the merge is queued "
-                           f"or waiting (a merge train, auto-merge, a required pipeline?); "
-                           f"once it is on {shown_ref}: forkflow land", EXIT_NOT_MERGED)
-            note = ""
-            if kind == "sync":
-                note = (f"; if it was squashed or rebased in the UI, rule 5 was broken (see "
-                        f"rules.md) - `forkflow land --force` fast-forwards anyway")
-            raise Fail(f"MR {request} is not on {shown_ref} yet - merge it, then run "
-                       f"`forkflow land` again{note}")
-        step("landed?", ancestry, "landing not verified (--force): fast-forwarding to "
-                                  f"whatever {shown_ref} holds")
-    else:
-        cmd = ancestry if how == "ancestor" else (
-            f"git cherry {sh_arg(short(commit))} {sh_arg(shown_ref)} "
-            f"{sh_arg(short(entry['base']))}")
-        step("landed?", cmd, f"yes - as {short(sha)} ({how})")
-        if kind == "ship" and how == "ancestor":
-            # a fast-forward puts the shipped commit on the trunk's first-parent line; a
-            # merge commit keeps its SHA too, but hangs it off a second parent
-            first = git("rev-list", "--first-parent", f"{entry['base']}..{trunk_ref}",
-                        cwd=ctx.root, check=False).split()
-            if sha not in first:
-                print(f"  WARNING: the ship MR was merged as a merge commit - rule 5 asks for "
-                      f"a fast-forward; check the project's merge method (`forkflow setup` "
-                      f"reports it)")
+    landings = []                          # (entry, landed sha or None under --force, how)
+    waiting = []                           # (entry, why) - only with several
+    for e in chosen:
+        kind, commit = e["kind"], e["commit"]
+        label = f"`{e['branch']}` " if several else ""
+        ancestry = f"git merge-base --is-ancestor {sh_arg(short(commit))} {sh_arg(shown_ref)}"
+        try:
+            sha, how = landed(ctx, e)
+        except Fail:
+            if several:
+                step("landed?", ancestry, f"{label}cannot verify here - {short(commit)} is "
+                                          f"not in this clone")
+                waiting.append((e, "cannot verify here"))
+                continue
+            if not force:
+                raise
+            sha, how = None, ""         # nothing to judge - and `--force` judges nothing
+        if sha is None:
+            if several:
+                step("landed?", ancestry, f"no - {label}{short(commit)} is not on {shown_ref}")
+                waiting.append((e, f"not on {shown_ref} yet"))
+                continue
+            if not force:
+                step("landed?", ancestry, f"no - {short(commit)} is not on {shown_ref}")
+                if after_merge:
+                    raise Fail(f"the platform tool reported the merge request merged, but "
+                               f"{shown_ref} does not have {short(commit)} - the merge is "
+                               f"queued or waiting (a merge train, auto-merge, a required "
+                               f"pipeline?); once it is on {shown_ref}: forkflow land",
+                               EXIT_NOT_MERGED)
+                note = ""
+                if kind == "sync":
+                    note = (f"; if it was squashed or rebased in the UI, rule 5 was broken "
+                            f"(see rules.md) - `forkflow land --force` fast-forwards anyway")
+                request = e.get("mr") or f"`{e['branch']}`"
+                raise Fail(f"MR {request} is not on {shown_ref} yet - merge it, then run "
+                           f"`forkflow land` again{note}")
+            step("landed?", ancestry, "landing not verified (--force): fast-forwarding to "
+                                      f"whatever {shown_ref} holds")
+        else:
+            cmd = ancestry if how == "ancestor" else (
+                f"git cherry {sh_arg(short(commit))} {sh_arg(shown_ref)} "
+                f"{sh_arg(short(e['base']))}")
+            step("landed?", cmd, f"yes - {label}as {short(sha)} ({how})")
+            if kind == "ship" and how == "ancestor":
+                # a fast-forward puts the shipped commit on the trunk's first-parent line; a
+                # merge commit keeps its SHA too, but hangs it off a second parent
+                first = git("rev-list", "--first-parent", f"{e['base']}..{trunk_ref}",
+                            cwd=ctx.root, check=False).split()
+                if sha not in first:
+                    print(f"  WARNING: the ship MR {label}was merged as a merge commit - rule "
+                          f"5 asks for a fast-forward; check the project's merge method "
+                          f"(`forkflow setup` reports it)")
+        landings.append((e, sha, how))
+    if not landings:                       # only with several: one alone has raised above
+        lines = "".join(f"\n  `{e['branch']}` (MR {e.get('mr') or '-'}): {why}"
+                        for e, why in waiting)
+        raise Fail(f"nothing pending is on {shown_ref} yet - merge, then run `forkflow land` "
+                   f"again:{lines}")
 
     old, new = land_trunk(ctx)
 
-    if sha is not None and branch not in (ctx.trunk, ctx.mirror):
-        # what landed is the commit that was pushed - not whatever the branch holds now. A
-        # commit made on it after the ship is on no trunk and, pushed by nobody, on no remote:
-        # the branch goes only while its tip is still exactly the recorded commit. Then `-d`
-        # for an ancestor landing, and `-D` for a rewritten one, which `-d` refuses (the tip
-        # is unreachable from the trunk) - the patch is verifiably on the trunk, and the tip
-        # is the commit whose patch it is. `-d` alone would not be the guard: `push` sets the
-        # branch's upstream, and `-d` accepts a tip that `origin/<branch>` contains
-        flag = "-d" if how == "ancestor" else "-D"
-        cmd = f"git branch {flag} {sh_arg(branch)}"
-        tip = rev(ctx.root, f"refs/heads/{branch}")
-        if not tip:
-            step("branch", cmd, f"`{branch}` is already gone")
-        elif tip != entry["commit"]:
-            step("branch", f"git rev-parse {sh_arg(branch)}",
-                 f"kept: `{branch}` is at {short(tip)}, not the {short(entry['commit'])} that "
-                 f"was pushed - its later commits did not land")
-        elif ctx.dry_run:
-            step("branch", cmd, f"would delete `{branch}` (landed as {short(sha)})", dry=True)
-        else:
-            rc, out, err = git_rc("branch", flag, branch, cwd=ctx.root)
-            if rc != 0:             # the landing is done; a branch that will not go is said
-                why = ((err or out).strip().splitlines() or [f"git exit {rc}"])[-1]
-                step("branch", cmd, f"NOT deleted: {why}")
-            else:
-                step("branch", cmd, f"deleted (landed as {short(sha)})")
-    elif sha is None:
-        print(f"  `{branch}` is kept: its landing was not verified")
-    remote_leftover = (sha is not None and branch not in (ctx.trunk, ctx.mirror)
-                       and remote_branch_left(ctx, branch))
+    leftovers = []
+    for e, sha, how in landings:
+        name = e["branch"]
+        if sha is not None and name not in (ctx.trunk, ctx.mirror):
+            land_branch(ctx, e, sha, how)
+        elif sha is None:
+            print(f"  `{name}` is kept: its landing was not verified")
+        if (sha is not None and name not in (ctx.trunk, ctx.mirror)
+                and remote_branch_left(ctx, name)):
+            leftovers.append(name)
+        if not forget_pending(ctx, e) and not ctx.dry_run:
+            step("pending", "-", f"kept: the record for `{name}` changed while this ran (a new "
+                                 f"ship of it?) - it is not the one that landed")
 
-    write_state(ctx, "pending", None)
     moved = f"{short(old)}..{short(new)}" if old != new else f"at {short(new)}"
-    said = "landed" if sha is not None else "caught up, landing NOT verified"
+    verified = [e["branch"] for e, sha, _ in landings if sha is not None]
+    said = "landed" if verified else "caught up, landing NOT verified"
+    if several:
+        said += " " + ", ".join(f"`{b}`" for b in verified)
     print(f"  {'would: ' if ctx.dry_run else ''}{said}: {ctx.trunk} {moved} - you are on "
           f"{ctx.trunk}")
-    if remote_leftover and ctx.platform == "github":
-        print(f"  {ctx.origin}/{branch} may still exist: git push {sh_arg(ctx.origin)} "
-              f"--delete {sh_arg(branch)}")
+    if ctx.platform == "github":
+        for name in leftovers:
+            print(f"  {ctx.origin}/{name} may still exist: git push {sh_arg(ctx.origin)} "
+                  f"--delete {sh_arg(name)}")
+    done = {e["branch"] for e, _, _ in landings}
+    rest = {b: e for b, e in pending_entries(ctx).items() if b not in done}
+    for b in sorted(rest):
+        print(f"  pending  {rest[b]['kind']} {b} -> MR {rest[b].get('mr') or '-'} - "
+              f"{pending_verdict(ctx, rest[b])}")
+
+
+def land_branch(ctx: Ctx, entry: dict, sha: str, how: str) -> None:
+    """Delete the landed branch - what landed is the commit that was pushed, not whatever
+    the branch holds now. A commit made on it after the ship is on no trunk and, pushed by
+    nobody, on no remote: the branch goes only while its tip is still exactly the recorded
+    commit. Then `-d` for an ancestor landing, and `-D` for a rewritten one, which `-d`
+    refuses (the tip is unreachable from the trunk) - the patch is verifiably on the trunk,
+    and the tip is the commit whose patch it is. `-d` alone would not be the guard: `push`
+    sets the branch's upstream, and `-d` accepts a tip that `origin/<branch>` contains."""
+    branch = entry["branch"]
+    flag = "-d" if how == "ancestor" else "-D"
+    cmd = f"git branch {flag} {sh_arg(branch)}"
+    tip = rev(ctx.root, f"refs/heads/{branch}")
+    if not tip:
+        step("branch", cmd, f"`{branch}` is already gone")
+    elif tip != entry["commit"]:
+        step("branch", f"git rev-parse {sh_arg(branch)}",
+             f"kept: `{branch}` is at {short(tip)}, not the {short(entry['commit'])} that "
+             f"was pushed - its later commits did not land")
+    elif ctx.dry_run:
+        step("branch", cmd, f"would delete `{branch}` (landed as {short(sha)})", dry=True)
+    else:
+        rc, out, err = git_rc("branch", flag, branch, cwd=ctx.root)
+        if rc != 0:                 # the landing is done; a branch that will not go is said
+            why = ((err or out).strip().splitlines() or [f"git exit {rc}"])[-1]
+            step("branch", cmd, f"NOT deleted: {why}")
+        else:
+            step("branch", cmd, f"deleted (landed as {short(sha)})")
 
 
 def remote_branch_left(ctx: Ctx, branch: str) -> bool:
@@ -3153,7 +3281,8 @@ def remote_branch_left(ctx: Ctx, branch: str) -> bool:
 def cmd_land(args: argparse.Namespace) -> int:
     ctx = resolve_ctx(args.dir, args, need_upstream=True, need_trunk=True, strict_mirror=False)
     header(ctx, "land")
-    land_pending(ctx, force=bool(getattr(args, "force", False)))
+    land_pending(ctx, force=bool(getattr(args, "force", False)),
+                 branch=getattr(args, "branch", None) or "")
     return 0
 
 
@@ -4222,8 +4351,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     sh.add_argument("--title", help="merge-request title")
     sh.add_argument("--message-file", help="file with the squashed commit message")
 
-    sub.add_parser("land", parents=[common],
-                   help="the MR is merged: fast-forward the local trunk and delete the branch")
+    la = sub.add_parser("land", parents=[common],
+                        help="the MR is merged: fast-forward the local trunk and delete the branch")
+    la.add_argument("branch", nargs="?", metavar="BRANCH",
+                    help="land this branch's pending record (default: the current branch's, "
+                         "else every pending one that has landed)")
 
     st = sub.add_parser("setup", parents=[common], help="make the rules mechanical in this clone")
     st.add_argument("--upstream", metavar="NAME", help="remote name of the original project")
@@ -4590,6 +4722,12 @@ def run_tests() -> None:
             return []
         with open(path) as fh:
             return [ln.rstrip("\n") for ln in fh]
+
+    def put_pending(fork: str, *entries: dict) -> None:
+        """The shared `pending` map holding exactly `entries`, keyed by branch as
+        `record_pending` keeps it - for a record no run of this clone could have written."""
+        write_state(ctx_for(fork, need_trunk=False, strict_mirror=False), "pending",
+                    {e["branch"]: e for e in entries})
 
     def local_branches(fork: str) -> str:
         return sh("git", "for-each-ref", "--format=%(refname)", "refs/heads/", cwd=fork)
@@ -5232,9 +5370,8 @@ def run_tests() -> None:
             # a `pending` entry nothing landed, so `land --force --dry-run` prints the
             # checkout it would run, with the trunk's name in it (the fast-forward, the branch
             # deletion and the remote delete: `test_a_verified_landing_prints_every_...`)
-            write_state(ctx_for(fork, strict_mirror=False), "pending",
-                        {"kind": "ship", "branch": "feat/x", "commit": rev(fork, "feat/x"),
-                         "base": origin_sha(fork, self.TRUNK), "mr": ""})
+            put_pending(fork, {"kind": "ship", "branch": "feat/x", "commit": rev(fork, "feat/x"),
+                               "base": origin_sha(fork, self.TRUNK), "mr": ""})
 
             names, seen = (self.TRUNK, self.PREFIX), set()
             for argv in (("status", "--fetch"), ("check",), ("sync", "--dry-run"),
@@ -5258,9 +5395,8 @@ def run_tests() -> None:
             commit = commit_fork(fork, "ours/f.txt", "ours\n", "ours: step")
             sh("git", "push", "origin", "refs/heads/%s:refs/heads/%s" % (feature, feature),
                cwd=fork)
-            write_state(ctx_for(fork, strict_mirror=False), "pending",
-                        {"kind": "ship", "branch": feature, "commit": commit,
-                         "base": origin_sha(fork, self.TRUNK), "mr": ""})
+            put_pending(fork, {"kind": "ship", "branch": feature, "commit": commit,
+                               "base": origin_sha(fork, self.TRUNK), "mr": ""})
             sh("git", "--git-dir=" + os.path.join(self.tmp, "origin.git"), "update-ref",
                "refs/heads/" + self.TRUNK, commit)                  # merged: the trunk moves
             with on_platform("github"):
@@ -5342,11 +5478,11 @@ def run_tests() -> None:
             record_pending(there, "ship", "feat/other", rev(fork, "origin/develop"))
             self.assertEqual(state_path(here, shared=True), state_path(there, shared=True))
             self.assertEqual(state_path(here, shared=True), state_path(here))  # the main one's
-            self.assertEqual(pending_entry(here)["branch"], "feat/other")
-            self.assertEqual(pending_entry(here), pending_entry(there))
+            self.assertEqual(list(pending_entries(here)), ["feat/other"])
+            self.assertEqual(pending_entries(here), pending_entries(there))
             self.assertEqual(resumable(here, "ship", "feat/other"), {})       # not shared
             write_state(here, "pending", None)
-            self.assertEqual(pending_entry(there), {})
+            self.assertEqual(pending_entries(there), {})
             self.assertEqual(resumable(there, "ship", "feat/other")["backup"], "there")
 
         def test_an_interrupted_write_leaves_the_old_file_whole(self):
@@ -5373,28 +5509,78 @@ def run_tests() -> None:
         def test_round_trip_and_the_url_added_afterwards(self):
             fork = make_fork(self.tmp)
             ctx = ctx_for(fork)
-            self.assertEqual(pending_entry(ctx), {})
+            self.assertEqual(pending_entries(ctx), {})
             sh("git", "branch", "feat/x", "develop", cwd=fork)
             base = rev(fork, "origin/develop")
-            record_pending(ctx, "ship", "feat/x", base)
-            self.assertEqual(pending_entry(ctx),
-                             {"kind": "ship", "branch": "feat/x", "commit": rev(fork, "feat/x"),
-                              "base": base, "mr": ""})
-            record_pending(ctx, "ship", "feat/x", base, "https://example.invalid/pull/1")
-            self.assertEqual(pending_entry(ctx)["mr"], "https://example.invalid/pull/1")
-            self.assertEqual(pending_entry(ctx)["commit"], rev(fork, "feat/x"))
-            write_state(ctx, "pending", None)
-            self.assertEqual(pending_entry(ctx), {})
+            written = record_pending(ctx, "ship", "feat/x", base)
+            self.assertEqual(pending_entries(ctx), {"feat/x": {
+                "kind": "ship", "branch": "feat/x", "commit": rev(fork, "feat/x"),
+                "base": base, "mr": ""}})
+            self.assertEqual(written, pending_entry(ctx, "feat/x"))      # what it returns
+            written = record_pending(ctx, "ship", "feat/x", base, "https://example.invalid/pull/1")
+            self.assertEqual(pending_entry(ctx, "feat/x")["mr"], "https://example.invalid/pull/1")
+            self.assertEqual(pending_entry(ctx, "feat/x")["commit"], rev(fork, "feat/x"))
+            self.assertEqual(written, pending_entry(ctx, "feat/x"))
+            self.assertTrue(forget_pending(ctx, written))
+            self.assertEqual(pending_entries(ctx), {})
+            self.assertNotIn("pending", read_state(ctx, shared=True))   # no empty map left
 
-        def test_the_most_recent_run_is_the_only_one_kept(self):
+        def test_one_entry_per_branch(self):
+            """Worktrees ship different branches at the same time: each keeps its own entry,
+            and only a second run of the same branch replaces one."""
             fork = make_fork(self.tmp)
             ctx = ctx_for(fork)
+            base = rev(fork, "origin/develop")
             sh("git", "branch", "feat/x", "develop", cwd=fork)
             sh("git", "branch", "feat/y", "develop", cwd=fork)
-            record_pending(ctx, "ship", "feat/x", rev(fork, "origin/develop"))
-            record_pending(ctx, "sync", "feat/y", rev(fork, "origin/develop"))
-            self.assertEqual((pending_entry(ctx)["kind"], pending_entry(ctx)["branch"]),
-                             ("sync", "feat/y"))
+            record_pending(ctx, "ship", "feat/x", base)
+            record_pending(ctx, "sync", "feat/y", base)
+            self.assertEqual(sorted(pending_entries(ctx)), ["feat/x", "feat/y"])
+            self.assertEqual(pending_entry(ctx, "feat/x")["kind"], "ship")
+            self.assertEqual(pending_entry(ctx, "feat/y")["kind"], "sync")
+            commit_fork(fork, "ours/x.txt", "x\n", "ours: x")             # on develop
+            sh("git", "branch", "-f", "feat/x", "develop", cwd=fork)
+            record_pending(ctx, "ship", "feat/x", base, "https://example.invalid/pull/2")
+            self.assertEqual(pending_entry(ctx, "feat/x")["commit"], rev(fork, "feat/x"))
+            self.assertEqual(pending_entry(ctx, "feat/y")["kind"], "sync")   # untouched
+
+        def test_forget_clears_only_the_entry_that_is_still_the_one_landed(self):
+            """`land` clears what it landed - not a newer ship of the same branch recorded
+            while it ran, and never another branch's entry."""
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            base = rev(fork, "origin/develop")
+            sh("git", "branch", "feat/x", "develop", cwd=fork)
+            sh("git", "branch", "feat/y", "develop", cwd=fork)
+            landed_one = record_pending(ctx, "ship", "feat/x", base)
+            other = record_pending(ctx, "ship", "feat/y", base)
+            commit_fork(fork, "ours/x.txt", "x\n", "ours: x")
+            sh("git", "branch", "-f", "feat/x", "develop", cwd=fork)
+            newer = record_pending(ctx, "ship", "feat/x", base)          # shipped again
+            self.assertFalse(forget_pending(ctx, landed_one))
+            self.assertEqual(pending_entries(ctx), {"feat/x": newer, "feat/y": other})
+            self.assertTrue(forget_pending(ctx, newer))
+            self.assertEqual(pending_entries(ctx), {"feat/y": other})
+            self.assertTrue(forget_pending(ctx, newer))                 # gone already: fine
+            self.assertFalse(forget_pending(ctx_for(fork, dry_run=True), other))
+            self.assertEqual(pending_entries(ctx), {"feat/y": other})
+
+        def test_the_single_record_an_earlier_build_wrote_is_still_read(self):
+            """An upgrade between a ship and its landing: the state file holds one bare
+            entry, not a map. It reads as a map of one, and the next record keeps it."""
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            base = rev(fork, "origin/develop")
+            sh("git", "branch", "feat/x", "develop", cwd=fork)
+            sh("git", "branch", "feat/y", "develop", cwd=fork)
+            old = {"kind": "ship", "branch": "feat/x", "commit": rev(fork, "feat/x"),
+                   "base": base, "mr": ""}
+            save_state(ctx, {"pending": old}, shared=True)
+            self.assertEqual(pending_entries(ctx), {"feat/x": old})
+            new = record_pending(ctx, "ship", "feat/y", base)
+            self.assertEqual(pending_entries(ctx), {"feat/x": old, "feat/y": new})
+            self.assertEqual(read_state(ctx, shared=True)["pending"],
+                             {"feat/x": old, "feat/y": new})              # a map from now on
 
         def test_anything_but_the_written_shape_is_no_entry(self):
             ctx = ctx_for(make_fork(self.tmp))
@@ -5405,10 +5591,13 @@ def run_tests() -> None:
                         dict(good, base=None),
                         dict(good, mr=7),                                # non-string URL
                         "abc"):
-                save_state(ctx, {"pending": bad})
-                self.assertEqual(pending_entry(ctx), {}, repr(bad))
-            save_state(ctx, {"pending": good})                           # `mr` may be absent
-            self.assertEqual(pending_entry(ctx), good)
+                for raw in (bad, {"feat/x": bad}):                       # bare or in the map
+                    save_state(ctx, {"pending": raw})
+                    self.assertEqual(pending_entries(ctx), {}, repr(raw))
+            save_state(ctx, {"pending": {"feat/y": good}})               # under another name
+            self.assertEqual(pending_entries(ctx), {})
+            save_state(ctx, {"pending": {"feat/x": good, "feat/z": dict(good, kind=3)}})
+            self.assertEqual(pending_entries(ctx), {"feat/x": good})     # `mr` may be absent
 
         def test_a_dry_run_records_nothing(self):
             fork = make_fork(self.tmp)
@@ -7353,9 +7542,36 @@ def run_tests() -> None:
             return sh("git", "log", "-1", "--format=%B", ref, cwd=fork).strip()
 
         @staticmethod
-        def pending_of(fork: str) -> dict:
-            """The `pending` record as `land` and `status` read it, {} when there is none."""
-            return pending_entry(ctx_for(fork, need_trunk=False, strict_mirror=False))
+        def pending_of(fork: str, branch: Optional[str] = None) -> dict:
+            """A `pending` entry as `land` and `status` read it: `branch`'s, or without one
+            the only entry there is - {} when there is none. A test with several names the
+            branch (or reads `pending_entries` whole)."""
+            entries = pending_entries(ctx_for(fork, need_trunk=False, strict_mirror=False))
+            if branch is not None:
+                return entries.get(branch, {})
+            if len(entries) > 1:
+                raise AssertionError("several pending entries, name one: %r" % entries)
+            return next(iter(entries.values()), {})
+
+        def human(self, *cmds: Sequence[str]) -> str:
+            """A clone somebody else merges from: origin/develop checked out, each of `cmds`
+            run there, the result pushed; answers with the trunk's new tip.
+
+            Under their own committer identity: a cherry-pick onto the same parent by the
+            same committer in the same second is byte-for-byte the shipped commit again,
+            and a "rewrite" that keeps the SHA would prove nothing."""
+            clone = os.path.join(self.tmp, "human")
+            if not os.path.exists(clone):
+                sh("git", "clone", "-q", os.path.join(self.tmp, "origin.git"), clone)
+                identity(clone)
+            with mock.patch.dict(os.environ, {"GIT_COMMITTER_NAME": "a human",
+                                              "GIT_COMMITTER_EMAIL": "human@example.invalid"}):
+                sh("git", "fetch", "-q", "origin", cwd=clone)
+                sh("git", "checkout", "-q", "-B", "develop", "origin/develop", cwd=clone)
+                for cmd in cmds:
+                    sh("git", *cmd, cwd=clone)
+                sh("git", "push", "-q", "origin", "develop", cwd=clone)
+            return sh("git", "rev-parse", "HEAD", cwd=clone)
 
         def move_trunk(self, sha: str) -> None:
             """A human merged the MR by fast-forward: the bare origin's trunk moves to `sha`."""
@@ -9793,9 +10009,10 @@ def run_tests() -> None:
                     sys.modules[__name__], "mr_command", lambda *a: absent):
                 code, out, err = run("-C", fork, "ship", "--mr")
             self.assertEqual(code, 0, err + out)
-            entry = self.pending_of(fork)                  # the most recent run, URL-less
+            entry = self.pending_of(fork, "feat/y")        # this run's, URL-less
             self.assertEqual((entry["kind"], entry["branch"], entry["mr"]),
                              ("ship", "feat/y", ""))
+            self.assertEqual(self.pending_of(fork, name)["commit"], origin_sha(fork, name))
 
         def test_the_record_is_written_before_the_merge_request_step(self):
             """The branch is on origin the moment the push succeeds; a run that dies in the
@@ -9815,9 +10032,10 @@ def run_tests() -> None:
                                    side_effect=KeyboardInterrupt):
                 code, out, err = run("-C", fork, "sync", "--mr")
             self.assertEqual(code, EXIT_INTERRUPTED, err + out)
-            entry = self.pending_of(fork)
+            entry = self.pending_of(fork, sync_branch_name())
             self.assertEqual((entry["kind"], entry["branch"]), ("sync", sync_branch_name()))
             self.assertEqual(entry["commit"], origin_sha(fork, sync_branch_name()))
+            self.assertEqual(self.pending_of(fork, name)["commit"], origin_sha(fork, name))
 
         def test_a_dry_run_writes_no_record(self):
             fork = make_fork(self.tmp)
@@ -10166,33 +10384,13 @@ def run_tests() -> None:
 
         MR = "https://example.invalid/-/merge_requests/1"
 
-        def human(self, *cmds: Sequence[str]) -> str:
-            """A clone somebody else merges from: origin/develop checked out, each of `cmds`
-            run there, the result pushed; answers with the trunk's new tip.
-
-            Under their own committer identity: a cherry-pick onto the same parent by the
-            same committer in the same second is byte-for-byte the shipped commit again,
-            and a "rewrite" that keeps the SHA would prove nothing."""
-            clone = os.path.join(self.tmp, "human")
-            if not os.path.exists(clone):
-                sh("git", "clone", "-q", os.path.join(self.tmp, "origin.git"), clone)
-                identity(clone)
-            with mock.patch.dict(os.environ, {"GIT_COMMITTER_NAME": "a human",
-                                              "GIT_COMMITTER_EMAIL": "human@example.invalid"}):
-                sh("git", "fetch", "-q", "origin", cwd=clone)
-                sh("git", "checkout", "-q", "-B", "develop", "origin/develop", cwd=clone)
-                for cmd in cmds:
-                    sh("git", *cmd, cwd=clone)
-                sh("git", "push", "-q", "origin", "develop", cwd=clone)
-            return sh("git", "rev-parse", "HEAD", cwd=clone)
-
         def parent_of(self, sha: str) -> str:
             return sh("git", "rev-parse", sha + "^", cwd=os.path.join(self.tmp, "human"))
 
         def with_mr(self, fork: str, entry: dict) -> dict:
             """The record as a run with `--mr` leaves it: the merge request's URL known."""
             entry = dict(entry, mr=self.MR)
-            write_state(ctx_for(fork, strict_mirror=False), "pending", entry)
+            put_pending(fork, entry)
             return entry
 
         def synced(self) -> Tuple[str, str, dict]:
@@ -10383,7 +10581,7 @@ def run_tests() -> None:
             fork, name, shipped = self.shipped()
             elsewhere = commit_upstream(self.tmp, "docs/x.md", "x\n")   # never fetched here
             entry = dict(shipped, commit=elsewhere, branch="feat/other")
-            write_state(ctx_for(fork, strict_mirror=False), "pending", entry)
+            put_pending(fork, entry)
             code, out, err = self.land(fork)
             self.assertEqual(code, 2, err + out)
             self.assertIn("cannot verify", err)
@@ -10480,9 +10678,8 @@ def run_tests() -> None:
             (the trunk catches up) and `main` stays."""
             fork = make_fork(self.tmp)
             mirror = rev(fork, "refs/heads/main")
-            write_state(ctx_for(fork, strict_mirror=False), "pending",
-                        {"kind": "ship", "branch": "main", "commit": mirror,
-                         "base": rev(fork, "refs/remotes/origin/develop"), "mr": ""})
+            put_pending(fork, {"kind": "ship", "branch": "main", "commit": mirror,
+                               "base": rev(fork, "refs/remotes/origin/develop"), "mr": ""})
             code, out, err = self.land(fork)
             self.assertEqual(code, 0, err + out)
             self.assertEqual(rev(fork, "refs/heads/main"), mirror)
@@ -10785,7 +10982,7 @@ def run_tests() -> None:
         def test_the_url_is_shown_when_the_record_has_one(self):
             fork, name, entry = self.shipped()
             url = "https://example.invalid/-/merge_requests/7"
-            write_state(ctx_for(fork, strict_mirror=False), "pending", dict(entry, mr=url))
+            put_pending(fork, dict(entry, mr=url))
             self.assertIn(f"-> MR {url} -", self.pending_line(self.status(fork)))
 
         def test_offline_gives_the_same_verdict(self):
@@ -10805,17 +11002,15 @@ def run_tests() -> None:
             not raise for this line."""
             fork = make_fresh_fork(self.tmp)
             head = rev(fork, "HEAD")
-            write_state(ctx_for(fork, need_trunk=False, strict_mirror=False), "pending",
-                        {"kind": "ship", "branch": "feat/x", "commit": head,
-                         "base": head, "mr": ""})
+            put_pending(fork, {"kind": "ship", "branch": "feat/x", "commit": head,
+                               "base": head, "mr": ""})
             self.assertEqual(self.verdict(self.status(fork)), "cannot verify")
 
         def test_cannot_verify_when_the_commit_is_not_in_this_clone(self):
             """The record is the other clone's: `landed()` would raise, `status` does not."""
             fork = make_fork(self.tmp)
-            write_state(ctx_for(fork, strict_mirror=False), "pending",
-                        {"kind": "ship", "branch": "feat/x", "commit": "1" * 40,
-                         "base": rev(fork, "refs/remotes/origin/develop"), "mr": ""})
+            put_pending(fork, {"kind": "ship", "branch": "feat/x", "commit": "1" * 40,
+                               "base": rev(fork, "refs/remotes/origin/develop"), "mr": ""})
             self.assertEqual(self.verdict(self.status(fork)), "cannot verify")
 
         def test_a_malformed_entry_is_ignored(self):
@@ -11026,6 +11221,220 @@ def run_tests() -> None:
     # ------------------------------------------------------------------- #
     # argument parsing and main
     # ------------------------------------------------------------------- #
+
+    class TestPendingPerBranch(MergeBase):
+        """Worktrees of one clone shipping different branches before either lands.
+
+        `pending` is shared by every worktree, one entry per branch: a ship in one worktree
+        must neither replace nor land another worktree's, `land` on a branch lands that
+        branch's record, `land` off every recorded branch lands whichever have landed and
+        keeps the rest, and `--merge` lands the record its own run wrote. Both trunk layouts:
+        checked out in the main worktree, and checked out nowhere."""
+
+        def entries(self, fork: str) -> dict:
+            return pending_entries(ctx_for(fork, need_trunk=False, strict_mirror=False))
+
+        def worktree(self, fork: str, name: str, path: str = "", content: str = "") -> str:
+            """A linked worktree on a new branch `name` off develop, with one commit of a
+            file of its own (or `content` for shared.tf)."""
+            wt = os.path.join(self.tmp, path or name.replace("/", "-"))
+            sh("git", "worktree", "add", "-q", "-b", name, wt, "develop", cwd=fork)
+            if content:
+                commit_fork(wt, "shared.tf", content, "ours: " + name)
+            else:
+                commit_fork(wt, "ours/%s.txt" % name.replace("/", "-"), name + "\n",
+                            "ours: " + name)
+            return wt
+
+        def ship_in(self, wt: str, *flags: str) -> None:
+            next_utc_second()                     # each ship names a `backup/<time>-pre-ship`
+            code, out, err = run("-C", wt, "ship", *flags)
+            self.assertEqual(code, 0, err + out)
+
+        def two_shipped(self, fork: str) -> Tuple[str, str, dict, dict]:
+            w1, w2 = self.worktree(fork, "feat/a"), self.worktree(fork, "feat/b")
+            self.ship_in(w1)
+            self.ship_in(w2)
+            entries = self.entries(fork)
+            self.assertEqual(sorted(entries), ["feat/a", "feat/b"])     # neither replaced
+            for name, entry in entries.items():
+                self.assertEqual(entry["commit"], origin_sha(fork, name))
+            self.assertEqual(self.entries(w1), entries)                  # one map for all
+            return w1, w2, entries["feat/a"], entries["feat/b"]
+
+        def test_trunk_in_the_main_worktree(self):
+            fork = make_fork(self.tmp)
+            w1, w2, a, b = self.two_shipped(fork)
+            base = rev(fork, "refs/heads/develop")
+
+            # `status` anywhere lists both
+            code, out, err = run("-C", w1, "status", "--offline")
+            self.assertEqual(code, 0, err + out)
+            lines = [ln for ln in out.splitlines() if ln.startswith("  pending  ")]
+            self.assertEqual([ln.split()[2] for ln in lines], ["feat/a", "feat/b"])
+
+            # in W1 the trunk is elsewhere: refused before anything, naming W1's record
+            code, out, err = run("-C", w1, "land")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("run `forkflow land feat/a` there", err)
+            self.assertEqual(self.entries(fork), {"feat/a": a, "feat/b": b})
+
+            # in the main worktree, off every recorded branch: nothing has landed yet
+            code, out, err = run("-C", fork, "land")
+            self.assertEqual(code, 2, err + out)
+            self.assertEqual(rev(fork, "refs/heads/develop"), base)
+            self.assertEqual(self.entries(fork), {"feat/a": a, "feat/b": b})
+
+            # a merges: `land` there lands a - and only a
+            self.move_trunk(a["commit"])
+            code, out, err = run("-C", fork, "land")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(fork, "refs/heads/develop"), a["commit"])
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(self.entries(fork), {"feat/b": b})
+            self.assertEqual(rev(fork, "refs/heads/feat/a"), a["commit"])   # W1 has it out
+            self.assertEqual(rev(fork, "refs/heads/feat/b"), b["commit"])
+            self.assertEqual(checked_out(w1), "feat/a")
+            self.assertEqual(checked_out(w2), "feat/b")
+
+            # b merges later, rebased onto a by the platform: the route W1's refusal named,
+            # with the branch, lands it by patch
+            tip = self.human(("cherry-pick", b["commit"]))
+            code, out, err = run("-C", fork, "land", "feat/b")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(fork, "refs/heads/develop"), tip)
+            self.assertEqual(self.entries(fork), {})
+
+        def test_trunk_checked_out_nowhere(self):
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "-q", "-b", "scratch", "develop", cwd=fork)
+            w1, w2, a, b = self.two_shipped(fork)
+            base = rev(fork, "refs/heads/develop")
+
+            # b merges; `land` in W1 answers for W1's own branch, and a has not landed
+            self.move_trunk(b["commit"])
+            code, out, err = run("-C", w1, "land")
+            self.assertEqual(code, 2, err + out)
+            self.assertEqual(checked_out(w1), "feat/a")                  # HEAD did not move
+            self.assertEqual(rev(fork, "refs/heads/develop"), base)
+            self.assertEqual(rev(fork, "refs/heads/feat/b"), b["commit"])
+            self.assertEqual(self.entries(fork), {"feat/a": a, "feat/b": b})
+
+            # `land` in W2 lands b there
+            code, out, err = run("-C", w2, "land")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(checked_out(w2), "develop")
+            self.assertEqual(rev(fork, "refs/heads/develop"), b["commit"])
+            self.assertEqual(rev(fork, "refs/heads/feat/b"), "")         # landed, deleted
+            self.assertEqual(self.entries(fork), {"feat/a": a})
+            self.assertEqual(checked_out(w1), "feat/a")
+
+            # then a, rebased onto b: the trunk is now out in W2, where `land feat/a` lands it
+            tip = self.human(("cherry-pick", a["commit"]))
+            code, out, err = run("-C", w1, "land")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("run `forkflow land feat/a` there", err)
+            code, out, err = run("-C", w2, "land", "feat/a")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(fork, "refs/heads/develop"), tip)
+            self.assertEqual(self.entries(fork), {})
+            self.assertEqual(rev(fork, "refs/heads/feat/a"), a["commit"])   # W1 has it out
+
+        def test_ship_continue_keeps_the_other_worktrees_record(self):
+            fork = make_fork(self.tmp)
+            w1 = self.worktree(fork, "feat/a",
+                               content=self.BASE_TF.replace("count = 1", "count = 2"))
+            second_clone_commit(self.tmp, path="shared.tf",
+                                content=self.BASE_TF.replace("count = 1", "count = 9"))
+            code, out, err = run("-C", w1, "ship")
+            self.assertEqual(code, 4, err + out)                         # stopped mid-rebase
+            w2 = self.worktree(fork, "feat/b")
+            self.ship_in(w2)
+            b = self.entries(fork)["feat/b"]
+            write(w1, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
+            sh("git", "add", "shared.tf", cwd=w1)
+            sh("git", "rebase", "--continue", cwd=w1)
+            next_utc_second()
+            code, out, err = run("-C", w1, "ship", "--continue")
+            self.assertEqual(code, 0, err + out)
+            entries = self.entries(fork)
+            self.assertEqual(sorted(entries), ["feat/a", "feat/b"])
+            self.assertEqual(entries["feat/b"], b)
+            self.assertEqual(entries["feat/a"]["commit"], origin_sha(fork, "feat/a"))
+
+        def test_merge_lands_its_own_record_while_another_worktree_ships(self):
+            """W1 runs `ship --merge`; while the platform merges, W2 ships feat/b. W1 lands
+            the record its own run wrote - not the one W2 wrote a moment ago - and leaves
+            W2's in place."""
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "-q", "-b", "scratch", "develop", cwd=fork)   # trunk free
+            w1, w2 = self.worktree(fork, "feat/a"), self.worktree(fork, "feat/b")
+            write(w1, CONFIG_FILE, 'merge = "self"\n')                   # untracked, as setup
+            merging_tool(self.tmp, "glab")
+            done, log = os.path.join(self.tmp, "w2-shipped"), os.path.join(self.tmp, "w2.log")
+            fake_tool(os.path.join(self.tmp, "wrap"), "glab", (
+                'if [ "$2" = merge ] && [ ! -e {done} ]; then\n'
+                '  : > {done}; sleep 1.1\n'
+                '  {py} {script} -C {w2} ship > {log} 2>&1\n'
+                'fi\n'
+                'exec {real} "$@"\n').format(
+                    done=shlex.quote(done), py=shlex.quote(sys.executable),
+                    script=shlex.quote(os.path.abspath(__file__)), w2=shlex.quote(w2),
+                    log=shlex.quote(log),
+                    real=shlex.quote(os.path.join(self.tmp, "bin", "glab"))))
+            next_utc_second()
+            with on_platform("gitlab"):
+                code, out, err = run("-C", w1, "ship", "--merge")
+            self.assertTrue(os.path.exists(done))                        # W2 did ship mid-way
+            self.assertEqual(code, 0, err + out)
+            shipped = self.value(self.argv("gitlab", "merge"), "--sha")
+            self.assertEqual(rev(fork, "refs/heads/develop"), shipped)
+            self.assertEqual(checked_out(w1), "develop")
+            self.assertEqual(rev(fork, "refs/heads/feat/a"), "")
+            entries = self.entries(fork)
+            self.assertEqual(sorted(entries), ["feat/b"])                # W2's, kept
+            self.assertEqual(entries["feat/b"]["commit"], origin_sha(fork, "feat/b"))
+            self.assertEqual(entries["feat/b"]["commit"], rev(fork, "refs/heads/feat/b"))
+
+        def test_force_needs_the_record_named_when_several_are_pending(self):
+            """`--force` judges nothing, so it must not pick among several on its own: off
+            every recorded branch it is refused outright - not quietly turned into a plain
+            `land` of whichever has landed - and named it acts on that record only."""
+            fork = make_fork(self.tmp)
+            w1, w2, a, b = self.two_shipped(fork)
+            base = rev(fork, "refs/heads/develop")
+            self.move_trunk(a["commit"])                               # a merged, b not
+            code, out, err = run("-C", fork, "land", "--force")
+            self.assertEqual(code, 2, err + out)
+            self.assertEqual(self.entries(fork), {"feat/a": a, "feat/b": b})
+            self.assertEqual(rev(fork, "refs/heads/develop"), base)
+            code, out, err = run("-C", fork, "land", "feat/nope")
+            self.assertEqual(code, 2, err + out)
+            self.assertEqual(self.entries(fork), {"feat/a": a, "feat/b": b})
+            self.assertEqual(rev(fork, "refs/heads/develop"), base)
+            code, out, err = run("-C", fork, "land", "--force", "feat/b")   # b: closed, say
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(self.entries(fork), {"feat/a": a})
+            self.assertEqual(rev(fork, "refs/heads/develop"), a["commit"])  # whatever origin has
+            self.assertEqual(rev(fork, "refs/heads/feat/b"), b["commit"])   # kept: unverified
+
+        def test_merge_lands_its_own_entry_even_when_the_record_cannot_be_written(self):
+            """`save_state` swallows a write that fails - a restore point that cannot be
+            recorded is still one - so `--merge` must not depend on reading its record back:
+            it lands the entry it holds. The shared state file is made unwritable (a
+            directory where the file goes)."""
+            fork = make_fork(self.tmp, config='merge = "self"\n')
+            name = self.feature(fork)
+            blocker = os.path.join(fork, ".git", STATE_FILE)        # the main worktree's
+            write(fork, os.path.join(".git", STATE_FILE, "keep"), "")
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 0, err + out)
+            shipped = self.value(self.argv("gitlab", "merge"), "--sha")
+            self.assertEqual(rev(fork, "refs/heads/develop"), shipped)
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(rev(fork, "refs/heads/" + name), "")
+            self.assertTrue(os.path.isdir(blocker))
 
     class TestMergeGate(ShipBase):
         """`--merge` is config AND flag, refused before the fetch, the backup and any push.
@@ -11397,15 +11806,21 @@ def run_tests() -> None:
                 args = parse_args(argv)
                 self.assertTrue(args.mr and args.dry_run, argv)
 
-        def test_land_takes_the_common_flags_and_nothing_else(self):
+        def test_land_takes_the_common_flags_and_one_optional_branch(self):
             self.assertIs(COMMANDS["land"], cmd_land)
             for argv in (["land", "--force"], ["--force", "land"]):
                 args = parse_args(argv)
                 self.assertEqual((args.cmd, args.force, args.dry_run), ("land", True, False), argv)
+                self.assertIsNone(args.branch)
             args = parse_args(["land", "--dry-run", "-C", "/x"])
             self.assertEqual((args.force, args.dry_run, args.dir), (False, True, "/x"))
+            for argv in (["land", "feat/a", "--force"], ["--force", "land", "feat/a"]):
+                args = parse_args(argv)
+                self.assertEqual((args.branch, args.force), ("feat/a", True), argv)
             with self.assertRaises(SystemExit):        # `--merge` belongs to sync and ship
                 capture(parse_args, ["land", "--merge"])
+            with self.assertRaises(SystemExit):        # one branch, not a list
+                capture(parse_args, ["land", "feat/a", "feat/b"])
 
         def test_no_subcommand_is_exit_2(self):
             code, _, err = capture(main, [])

@@ -226,7 +226,7 @@ python3 $S status [--fetch] [--offline]
 python3 $S check
 python3 $S sync [--continue] [--mr] [--merge] [--title T]
 python3 $S ship [--continue] [--mr] [--merge] [--title T] [--message-file F]
-python3 $S land [--force]
+python3 $S land [BRANCH] [--force]
 python3 $S setup [--upstream NAME] [--upstream-url URL] [--trunk NAME] [--mirror NAME]
 ```
 
@@ -326,11 +326,14 @@ the MR has merged:
 python3 $S land
 ```
 
-`land` finishes the most recent `ship` or `sync` this clone ran - the run that pushed a branch
-recorded what is waiting to land, so it works in any later session, and `status` shows the record
-on its `pending` line with the same verdict. The record is shared by every worktree of the clone:
-a ship made in a linked worktree lands from the worktree that has the trunk checked out, and
-`land` elsewhere says which one that is before it fetches anything. It fetches; verifies that the recorded commit is on
+`land` finishes what a `ship` or `sync` recorded - every run that pushed a branch recorded what is
+waiting to land, one record per branch, so it works in any later session, and `status` shows each
+record on a `pending` line with the same verdict. The records are shared by every worktree of the
+clone: ships made in linked worktrees land from the worktree that has the trunk checked out, and
+`land` elsewhere names that worktree (and the command to run there) before it fetches anything.
+`land <branch>` lands that branch's record; plain `land` lands the current branch's, or, run from a
+branch with no record (the trunk, usually), every record that has landed - the rest are listed and
+kept. It fetches; verifies that the recorded commit is on
 `origin/<trunk>` - by ancestry, or for a ship by patch, so a "squash and merge" or GitHub's "Rebase
 and merge" that gave the commit a new SHA is recognised too; checks the local trunk out (creating it
 from `origin/<trunk>` in a single-branch clone) and fast-forwards it with `git merge --ff-only`;
@@ -361,7 +364,8 @@ sync squashed or rebased in the UI (a broken rule 5, which `land` says out loud)
 that is no longer in this clone (its branch deleted and pruned): it fast-forwards the local trunk
 to whatever `origin/<trunk>` holds, **keeps** the branch, clears the record, and says the landing
 was not verified. When the landing *is* verified, `--force` changes nothing: the branch is deleted
-as usual.
+as usual. It acts on one record: with several pending and none of their branches checked out it
+needs the branch named (`land --force <branch>`).
 
 After a GitHub "Rebase and merge" of a ship MR the local feature branch is deleted by `land` (its
 SHA was rewritten; the patch is recognised, and the branch's tip is still the commit that was
@@ -420,6 +424,6 @@ marketplace cache directory is named after it). What each one carries:
 
 | version | what changed |
 |---|---|
-| `0.2.0` | `land` subcommand: once the MR is merged, fetch, verify that the pushed commit is on `origin/<trunk>` (by ancestry, or by patch for a ship whose SHA was rewritten), fast-forward the local trunk, delete the landed branch (only while its tip is still the pushed commit) and leave you on the trunk - the printed shell catch-up line is retired for `next: forkflow land`; `--merge` on `sync` and `ship`, behind `merge = "self"` in `.forkflow.toml`, merges the MR the run opened with the method rule 5 requires and a head-commit guard, then lands it; exit `6` for a merge request not created or not merged; `status` shows the `pending` ship or sync and whether it has landed |
+| `0.2.0` | `land` subcommand: once the MR is merged, fetch, verify that the pushed commit is on `origin/<trunk>` (by ancestry, or by patch for a ship whose SHA was rewritten), fast-forward the local trunk, delete the landed branch (only while its tip is still the pushed commit) and leave you on the trunk - the printed shell catch-up line is retired for `next: forkflow land`; `--merge` on `sync` and `ship`, behind `merge = "self"` in `.forkflow.toml`, merges the MR the run opened with the method rule 5 requires and a head-commit guard, then lands it; exit `6` for a merge request not created or not merged; `status` shows every `pending` ship or sync (one record per branch, shared by the worktrees of a clone) and whether it has landed |
 | `0.1.1` | `status` asks the upstream server whether its branch moved instead of trusting the last fetch (`--offline` opts out); `--mr` passes `--yes` to `glab` and runs the tool with stdin closed, so it no longer stops at a confirmation prompt. Earlier fixes that shipped under `0.1.0` and are worth knowing about: every `gh`/`glab` command names the fork with `--repo` rather than resolving to the original project; the sync gate guard compares committed config to committed config; `file://localhost/` spellings of the upstream URL are refused by the hook |
 | `0.1.0` | first release |
