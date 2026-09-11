@@ -192,8 +192,9 @@ trunk anywhere. The mistake is impossible, not merely discouraged.
    branch is confirmed on `origin`.
 5. **Sync MRs are merged as merges; ship MRs fast-forward.** GitLab: merge the sync MR (the sync
    branch's tip *is* the merge commit), `merge_method=ff` for ship MRs. GitHub: "Create a merge
-   commit" for sync, "Rebase and merge" for ship - which rewrites the SHA, so delete the local
-   feature branch afterwards. Never squash or rebase a sync MR: that rewrites upstream's SHAs out of
+   commit" for sync, "Rebase and merge" for ship - which rewrites the SHA, so the local feature
+   branch is deleted afterwards, never reused (`forkflow land` recognises the patch and deletes
+   it). Never squash or rebase a sync MR: that rewrites upstream's SHAs out of
    the trunk's ancestry and every later sync re-conflicts on the same hunks.
 6. **Never commit on the mirror** - it is only ever fast-forwarded to the upstream branch and pushed,
    never with force. The hook rejects a mirror push that is not an ancestor of the last-fetched
@@ -221,7 +222,7 @@ Directly:
 
 ```bash
 S=plugins/forkflow/scripts/forkflow.py
-python3 $S status [--fetch]
+python3 $S status [--fetch] [--offline]
 python3 $S check
 python3 $S sync [--continue] [--mr] [--merge] [--title T]
 python3 $S ship [--continue] [--mr] [--merge] [--title T] [--message-file F]
@@ -234,10 +235,11 @@ after it; `--force` only does something in `sync` (recreate the sync branch), `s
 foreign pre-push hook) and `land` (fast-forward a landing the tool cannot verify).
 `check` is the preflight `sync` and `ship` run themselves (upstream-tracked warning, configured gate
 commands, "is this branch on the trunk's tip"); it has no skill of its own - `status` surfaces it for
-humans. `--dry-run` creates no branch, commit, push, config or hook and moves no mirror, and still
-previews the merge that is pending. It is not read-only: it fetches (that is how it knows what is
-pending), so `refs/remotes/*` and `FETCH_HEAD` are refreshed and the merge simulation writes a tree
-object - nothing that changes a branch, a worktree or a setting.
+humans. `--dry-run` creates no branch, commit, push, config or hook, moves no mirror or trunk,
+deletes no branch and clears no pending record, and still previews the merge that is pending. It is
+not read-only: it fetches (that is how it knows what is pending), so `refs/remotes/*` and
+`FETCH_HEAD` are refreshed and the merge simulation (and `land`'s check that a rewritten patch is
+still on the trunk) writes tree objects - nothing that changes a branch, a worktree or a setting.
 
 `status` on a fork whose feature branch touches a file upstream also owns:
 
@@ -312,7 +314,7 @@ so) and a file of nothing but comments is read as no config at all.
 | `3` | invariant checked by `check`: a gate command failed, or the branch is not on the trunk's tip |
 | `4` | conflicts - resolve them, then rerun with `--continue` |
 | `5` | rewrite safety: backup not confirmed on origin, tree hash differs after the squash, push rejected |
-| `6` | `--merge` only: the merge request was not created or not merged (tool missing or failing, or the head-commit guard refused because the branch moved) - the branch is pushed and the MR, when created, is open; merge it by hand, then `forkflow land` |
+| `6` | `--merge` only: the merge request was not created by this run (or one was already open for the branch) or not merged (tool missing or failing, the head-commit guard refused because the branch moved, or the tool answered "merged" while nothing reached the trunk) - the branch is pushed and the MR, when created, is open; merge it by hand, then `forkflow land` |
 | `130` | interrupted |
 
 ### After the MR is merged
@@ -345,20 +347,28 @@ On a solo fork - one whose `.forkflow.toml` says `merge = "self"` - `ship --merg
 5 requires - on GitLab the project's own merge method (`glab mr merge ... --auto-merge=false`,
 which `setup`'s report insists is `ff`), on GitHub `gh pr merge --merge` for a sync and `--rebase`
 for a ship - always with a head-commit guard (`--sha` / `--match-head-commit`), so only the exact
-commit the run pushed can be merged. A merge that does not happen is exit 6 with the branch pushed
-and the MR open: merge by hand, then `forkflow land`. A merge that happened but whose catch-up could
-not run is exit 2 with a message that opens with "the merge request was merged".
+commit the run pushed can be merged. It merges only the MR this run opened: one already open for
+the branch (its `create` fails) is not merged for you. A merge that does not happen is exit 6 with
+the branch pushed and the MR open: merge by hand, then `forkflow land` - and so is a tool that
+answers "merged" while nothing reaches the trunk (a merge train, auto-merge, a required pipeline).
+A merge that happened but whose catch-up could not run is exit 2 with a message that opens with
+"the merge request was merged". A conflicted `sync --merge` or `ship --merge` prints the resume
+with `--merge` on it (`forkflow sync --continue --merge`), so following it to the letter still
+merges.
 
 `land --force` is the escape for a landing the tool cannot see - an MR closed without merging, a
-sync squashed or rebased in the UI (a broken rule 5, which `land` says out loud): it fast-forwards
-the local trunk to whatever `origin/<trunk>` holds, **keeps** the branch, and clears the record. It
-does not help when the recorded commit is not in this clone at all: `land` needs the clone that ran
-the ship or the sync.
+sync squashed or rebased in the UI (a broken rule 5, which `land` says out loud), a recorded commit
+that is no longer in this clone (its branch deleted and pruned): it fast-forwards the local trunk
+to whatever `origin/<trunk>` holds, **keeps** the branch, clears the record, and says the landing
+was not verified. When the landing *is* verified, `--force` changes nothing: the branch is deleted
+as usual.
 
 After a GitHub "Rebase and merge" of a ship MR the local feature branch is deleted by `land` (its
 SHA was rewritten; the patch is recognised, and the branch's tip is still the commit that was
-pushed), but the remote branch may survive - `land` prints the
-`git push origin --delete <branch>` line and leaves that call to you.
+pushed), but the remote branch survives on GitHub, for a ship and a sync alike - `land` prints the
+`git push origin --delete <branch>` line and leaves that call to you. On GitLab, where
+`--remove-source-branch` removed it, `land` drops the stale `origin/<branch>` ref this clone kept,
+so the name can be shipped again.
 
 ### Adopting forkflow in an existing fork
 

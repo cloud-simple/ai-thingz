@@ -1,6 +1,6 @@
 ---
 name: status
-description: "Report where a fork stands against the project it was forked from: mirror, trunk, origin and upstream, how far the fork has diverged and on how many upstream-tracked files, and what the current branch touches. Use when the user says \"forkflow status\", \"where are we vs upstream\", \"how far behind upstream are we\", \"how much has this fork diverged\", \"is the fork set up\", or asks what state the fork is in before a sync or a ship."
+description: "Report where a fork stands against the project it was forked from: mirror, trunk, origin and upstream, how far the fork has diverged and on how many upstream-tracked files, what the current branch touches, and whether the last ship or sync has landed on the trunk yet. Use when the user says \"forkflow status\", \"where are we vs upstream\", \"how far behind upstream are we\", \"how much has this fork diverged\", \"is the fork set up\", \"has the MR landed yet\", or asks what state the fork is in before a sync or a ship."
 allowed-tools: Bash, Read
 ---
 
@@ -88,7 +88,7 @@ After the `setup` line, only while the most recent `ship` or `sync` has not been
 | `setup    upstream push: DISABLED\|<url> (LIVE)  pre-push hook: installed\|missing\|foreign  ff-only: ...` | which guarantees are actually in place in this clone |
 | `pending  ... - not on origin/<trunk> yet` | the branch the last `ship`/`sync` pushed is not merged yet (as of the refs on disk - `--fetch` to ask again); wait, or offer to check the MR |
 | `pending  ... - landed: run forkflow land` | the merge request is merged and the local trunk has not caught up: offer `/forkflow:land` |
-| `pending  ... - cannot verify here` | `origin/<trunk>` or the pushed commit is not in this clone (a fresh fork, or a clone other than the one that ran the ship); not an error - `land` in that clone, or after a fetch |
+| `pending  ... - cannot verify here` | `origin/<trunk>` or the pushed commit is not in this clone (a fresh fork not fetched yet, or a pushed branch deleted and pruned after its merge request was abandoned); not an error - after a fetch it may resolve; a commit that is gone for good is cleared with `forkflow land --force` (which keeps any branch) |
 
 `status` degrades rather than fails: a missing trunk on origin, a diverged mirror, an unfetched
 upstream, a single-branch clone, a detached HEAD and a pending record it cannot judge are all

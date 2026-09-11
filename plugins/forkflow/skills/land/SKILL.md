@@ -48,14 +48,14 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    sync, and it is a broken rule 5 to report, not a quirk to smooth over.
 
 3. **`--force`** - only when the user says the merge request was merged or closed in a way the
-   tool cannot see (closed without merging, a sync squashed in the UI). It fast-forwards the
-   local trunk to whatever `origin/<trunk>` holds, **keeps** the branch (nothing proved it
-   landed - the run says `is kept: its landing was not verified`), and clears the record. It is
-   the only escape; never `git branch -f`, `git reset` or `git push` the trunk into shape by hand.
-   `--force` does not get past `cannot verify the landing`: that exit 2 means the recorded
-   commit is not in this clone at all (a state file from another clone), and `land` needs the
-   clone that ran the ship or the sync. A verified landing under `--force` is an ordinary landing
-   - the branch is deleted as usual.
+   tool cannot see (closed without merging, a sync squashed in the UI), or when plain `land`
+   says `cannot verify the landing` - the recorded commit is no longer in this clone (its branch
+   deleted and pruned after the request was abandoned). It fast-forwards the local trunk to
+   whatever `origin/<trunk>` holds, **keeps** the branch (nothing proved it landed - the run
+   says `is kept: its landing was not verified` and ends on `caught up, landing NOT verified:`),
+   and clears the record. It is the only escape; never `git branch -f`, `git reset` or
+   `git push` the trunk into shape by hand. A verified landing under `--force` is an ordinary
+   landing - the branch is deleted as usual.
 
 4. **Dry run.** `--dry-run` fetches and decides, prints every mutating step as `would:`
    (checkout, fast-forward, branch deletion), moves nothing and keeps the record. Use it when
@@ -65,9 +65,8 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
 5. **Report.** What landed and how (`ancestor` or `rewritten`, with the trunk commit it is on),
    the fast-forward (`<old>..<new>`, or `up to date` when the local trunk was already there),
    that the user is now on the trunk, which branch was deleted - or kept, and why - and any
-   WARNING. On GitHub, after a ship, pass on the printed line: "Rebase and merge" leaves the
-   remote branch behind, and `git push origin --delete <branch>` is the user's call, never run
-   unasked.
+   WARNING. On GitHub pass on the printed line: GitHub deletes no branch on merge, after a ship
+   or a sync, and `git push origin --delete <branch>` is the user's call, never run unasked.
 
 ## Reading the output
 
@@ -83,13 +82,16 @@ After the usual header (mirror line, trunk line, divergence), one line per step:
   trunk  $ git rev-parse <trunk>  -> up to date at <sha>          (instead, when the local trunk was already there)
   branch  $ git branch -d|-D <branch>  -> deleted (landed as <sha>) | `<branch>` is already gone | NOT deleted: <git's line>
   branch  $ git rev-parse <branch>  -> kept: `<branch>` is at <sha>, not the <sha> that was pushed - its later commits did not land
-  landed: <trunk> <old>..<new> - you are on <trunk>
+  origin  $ git branch -d -r origin/<branch>  -> removed - `<branch>` is gone from origin
+  landed: <trunk> <old>..<new> - you are on <trunk>          (or `landed: <trunk> at <sha>` when nothing moved)
 ```
+
+Under `--dry-run` the mutating steps and the last line carry `would:` (`would: landed: ...`).
 
 | what you see | what it means |
 |---|---|
 | `landed? ... yes - as <sha> (ancestor)` | the commit that was pushed is on the trunk under its own SHA - a fast-forward, or a merge commit |
-| `landed? ... yes - as <sha> (rewritten)` | a ship landed under a new SHA with the same patch ("squash and merge", "rebase and merge"); the local branch is deleted with `-D` |
+| `landed? ... yes - as <sha> (rewritten)` | a ship landed under a new SHA with the same patch ("squash and merge", "rebase and merge") and the trunk's tip still has the change (a patch reverted since is not a landing; an empty ship lands by ancestry only); the local branch is deleted with `-D` |
 | `landed? ... no - <sha> is not on origin/<trunk>` | not merged yet (exit 2, nothing moved); for a sync the message adds the rule-5 note |
 | `landed? ... landing not verified (--force): fast-forwarding to whatever origin/<trunk> holds` | the escape hatch ran; the branch is kept |
 | `WARNING: the ship MR was merged as a merge commit` | rule 5 asks for a fast-forward - the ship's commit is on the trunk but hangs off a merge commit; the landing is done, and the project's merge method wants checking (`forkflow setup` reports it) |
@@ -97,15 +99,18 @@ After the usual header (mirror line, trunk line, divergence), one line per step:
 | `` `<branch>` is kept: its landing was not verified `` | `--force` without a recognised landing - delete the branch yourself only when the user is sure |
 | `` branch ... kept: `<branch>` is at <sha>, not the <sha> that was pushed `` | the landing is done, but the branch has commits made after the ship: they are on no trunk, so the branch stays - tell the user, they ship them or drop them |
 | `branch ... NOT deleted: <line>` | the landing is done; git refused to delete the branch and said why (it is checked out in another worktree, say) |
-| `origin/<branch> may still exist: git push origin --delete <branch>` | GitHub ship: the remote branch is not removed by a rebase merge; the user's call |
-| `landed: <trunk> <old>..<new> - you are on <trunk>` | done; HEAD is on the trunk |
+| `origin ... removed - <branch> is gone from origin` | GitLab's `--remove-source-branch` removed the branch; the stale `origin/<branch>` this clone kept is dropped, so the name can be shipped again |
+| `origin/<branch> may still exist: git push origin --delete <branch>` | GitHub (a ship or a sync): the remote branch is not removed by the merge; the user's call |
+| `landed: <trunk> <old>..<new> - you are on <trunk>` | done; HEAD is on the trunk (`at <sha>` when the local trunk was already there) |
+| `caught up, landing NOT verified: <trunk> ...` | `--force` ran without a recognised landing: the trunk follows origin, the branch is kept |
 
 ## Exits
 
 | exit | what happened | what to do |
 |---|---|---|
-| 0 | landed, or dry run | nothing; the record is cleared (a second `land` is "nothing pending") |
-| 2 | precondition: nothing pending, rebase in progress, dirty tree, trunk checked out in another worktree, the fetch failed, the recorded commit is not in this clone (`cannot verify the landing`), not on `origin/<trunk>` yet, the local trunk carries commits origin lacks, `origin/<trunk>` does not resolve, or the usual setup failures (no `upstream` remote, the trunk not on origin, an origin whose push URL is the original project, an unreadable `.forkflow.toml`) | fix what the message names and rerun. A trunk checked out in another worktree means `forkflow land` in that worktree - it sees the same pending record. "Not yet" means wait for the merge; "commits origin lacks" means somebody committed on the local trunk by hand - show them `git log origin/<trunk>..<trunk>` and let them decide, the plugin never moves that trunk over its own commits |
+| 0 | landed (or caught up under `--force`) | nothing; the record is cleared (a second `land` is "nothing pending") |
+| 0 | dry run | nothing moved and the record is kept - run it without `--dry-run` to land |
+| 2 | precondition: nothing pending, rebase in progress, dirty tree, trunk checked out in another worktree, the fetch failed, the recorded commit is not in this clone (`cannot verify the landing` - `--force` clears it), not on `origin/<trunk>` yet, the local trunk carries commits origin lacks, `origin/<trunk>` does not resolve, or the usual setup failures (no `upstream` remote, the trunk not on origin, an origin whose push URL is the original project, an unreadable `.forkflow.toml`) | fix what the message names and rerun. A trunk checked out in another worktree means `forkflow land` in that worktree - it sees the same pending record. "Not yet" means wait for the merge; "commits origin lacks" means somebody committed on the local trunk by hand - show them `git log origin/<trunk>..<trunk>` and let them decide, the plugin never moves that trunk over its own commits |
 
 ## Notes
 
@@ -115,7 +120,8 @@ After the usual header (mirror line, trunk line, divergence), one line per step:
 - `ship --merge` and `sync --merge` (a fork with `merge = "self"`) run this same landing in the
   same process right after the merge; a merged request whose catch-up could not run exits 2 with
   a message that opens with "the merge request was merged" - then `forkflow land` finishes it
-  once the reason is dealt with.
+  once the reason is dealt with. A tool that answered "merged" while nothing reached the trunk
+  (a merge train, auto-merge) is exit 6 instead: not merged yet, `forkflow land` once it is.
 - Never `git push origin <trunk>`, never rebase the trunk, never `--force` anything: `land`
   fast-forwards only, and a trunk it cannot fast-forward is a message, not a `reset`.
 - `.forkflow.toml` (`gate`, `merge`, branch names) needs Python 3.11+; a present but unreadable

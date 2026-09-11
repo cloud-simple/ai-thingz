@@ -61,7 +61,8 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    ```
 
    It commits the merge, then resumes at the verification with the parents of the merge that was
-   actually made, so nothing that moved in between changes what is checked.
+   actually made, so nothing that moved in between changes what is checked. Resume with the flag
+   the first run had (`--mr` or `--merge`) - the conflict message prints the command with it.
 
 4. **Read the both-sides table.** Every file changed on *both* sides of the merge gets a row -
    not only the conflicted ones. A clean merge is not automatically a correct one.
@@ -128,8 +129,8 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    ```
 
    (`/forkflow:land`; the run prints `next: forkflow land`). It fetches, verifies that the merge
-   commit is an ancestor of `origin/<trunk>`, fast-forwards the local trunk (`setup`'s ff-only
-   config guarantees that can never become a merge commit), deletes the local sync branch and
+   commit is an ancestor of `origin/<trunk>`, fast-forwards the local trunk (`git merge
+   --ff-only`, so it can never become a merge commit), deletes the local sync branch and
    leaves you on the trunk. Not merged yet is exit 2 and not an error. A sync that was squashed
    or rebased in the UI never lands by that check - `land` says rule 5 was broken and names
    `land --force` as the way to fast-forward anyway; report it rather than smoothing it over.
@@ -144,7 +145,7 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
 | 3 | `check` failed after the merge - a `gate` command, or `origin/<trunk>` moved under the branch | read the hint the run printed: a failing gate is fixed with a commit on the sync branch and `sync --continue` (the resume picks up the merge commit, wherever it now sits in the branch); a trunk that moved on means the sync is redone against the new tip with `sync --force` - a sync MR is never rebased |
 | 4 | merge conflicts | resolve, `git add`, `sync --continue` |
 | 5 | rewrite safety: the backup was not confirmed on origin, or a push was rejected | do not work around it; report it - a rejected mirror push usually means the mirror is not a pure copy of upstream |
-| 6 | `--merge` only: the merge request was not created, or was not merged (tool missing or failing, or the head-commit guard refused because the branch moved) - the sync branch is pushed and the request, when created, is open with its URL in the message | merge it by hand **as a merge**, then `forkflow land`; the pending record is kept for it. Never retry the merge through `glab api` / `gh api` yourself |
+| 6 | `--merge` only: the merge request was not created by this run (or one was already open for the branch - `--merge` merges only what it opened), or was not merged (tool missing or failing, the head-commit guard refused because the branch moved, or the tool answered "merged" while nothing reached the trunk - a merge train, auto-merge) - the sync branch is pushed and the request, when created, is open with its URL in the message | merge it by hand **as a merge**, then `forkflow land`; the pending record is kept for it. Never retry the merge through `glab api` / `gh api` yourself |
 
 ## Notes
 

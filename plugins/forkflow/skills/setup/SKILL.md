@@ -95,8 +95,9 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before running it.
    runs.
 
 6. **`.forkflow.toml`.** The template is written commented-out and left **untracked**; tell the
-   user to commit it once the branch names and the `gate` list are right, so everyone in the fork
-   shares them. Reading it needs Python 3.11+ (`tomllib`); a config that is present but unreadable
+   user to commit it once the branch names, the `gate` list and `merge` are right, so everyone in
+   the fork shares them - `merge = "self"` only if whoever opens this fork's merge requests also
+   merges them (it is what lets `--merge` merge; the default `"manual"` refuses it). Reading it needs Python 3.11+ (`tomllib`); a config that is present but unreadable
    is exit 2 for every subcommand - it carries the safety-critical branch names. Committing it
    also matters when the upstream project uses forkflow itself: git refuses a merge that would
    write over an untracked file, so a `sync` bringing upstream's `.forkflow.toml` in stops (exit

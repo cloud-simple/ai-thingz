@@ -60,8 +60,10 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    ```
 
    `--continue` re-runs the full preflight, requires `origin/<trunk>` to be an ancestor of HEAD
-   (otherwise "the rebase did not complete", exit 2) and resumes at the squash. `git rebase
-   --abort` puts the branch back; the pre-ship backup on origin is the other way back.
+   (otherwise "the rebase did not complete", exit 2) and resumes at the squash. Resume with the
+   flag the first run had (`--mr` or `--merge`) - the conflict message prints the command with
+   it. `git rebase --abort` puts the branch back; the pre-ship backup on origin is the other way
+   back.
 
 6. **Upstream-tracked files.** The WARNING list names files the branch touches that upstream also
    owns; every one of them is a permanent merge cost. Show it, do not gate on it. Ask the user
@@ -105,9 +107,10 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    (`/forkflow:land`; the run prints `next: forkflow land`). It fetches, verifies that the
    shipped commit is on `origin/<trunk>` - by ancestry, or by patch when GitHub's "Rebase and
    merge" rewrote its SHA - fast-forwards the local trunk, deletes the local feature branch (kept
-   instead when it carries commits made after the ship) and leaves you on the trunk. Not merged yet is exit 2 and not an error. On GitHub the remote
-   branch may survive a rebase merge; `land` prints the `git push origin --delete <branch>` line
-   for the user. `--merge` runs that landing itself, right after the merge.
+   instead when it carries commits made after the ship) and leaves you on the trunk. Not merged
+   yet is exit 2 and not an error. On GitHub the remote branch survives the merge; `land` prints
+   the `git push origin --delete <branch>` line for the user. `--merge` runs that landing
+   itself, right after the merge.
 
 ## Other exits
 
@@ -118,7 +121,7 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
 | 3 | `check` failed after the rebase and squash - a `gate` command or the tip check; nothing was pushed | fix it on the branch, commit, then `ship --continue` (the squash already happened, so that, not a fresh `ship`, is the resume); the rollback line is printed |
 | 4 | rebase conflicts | resolve, `git rebase --continue`, `ship --continue` |
 | 5 | rewrite safety: backup not confirmed, tree hash changed by the squash, `--force-with-lease` rejected (someone else pushed to the branch) | do not force past it; report it and use the printed rollback line |
-| 6 | `--merge` only: the merge request was not created, or was not merged (tool missing or failing, or the head-commit guard refused because the branch moved) - the branch is pushed and the request, when created, is open with its URL in the message | merge it by hand with the method rule 5 requires, then `forkflow land`; the pending record is kept for it. Never retry the merge through `glab api` / `gh api` yourself |
+| 6 | `--merge` only: the merge request was not created by this run (or one was already open for the branch - `--merge` merges only what it opened), or was not merged (tool missing or failing, the head-commit guard refused because the branch moved, or the tool answered "merged" while nothing reached the trunk - a merge train, auto-merge) - the branch is pushed and the request, when created, is open with its URL in the message | merge it by hand with the method rule 5 requires, then `forkflow land`; the pending record is kept for it. Never retry the merge through `glab api` / `gh api` yourself |
 
 ## Notes
 

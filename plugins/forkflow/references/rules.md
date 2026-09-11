@@ -1,6 +1,6 @@
 # forkflow rules
 
-Read this before running `sync`, `ship` or `setup`. The script enforces these mechanically; you
+Read this before running `sync`, `ship`, `land` or `setup`. The script enforces these mechanically; you
 must not work around them by driving git by hand.
 
 ## Layout
@@ -46,7 +46,8 @@ develop (trunk) ─────────────────────�
      GitHub: "Create a merge commit". Never squash or rebase a sync MR: that rewrites upstream's
      SHAs out of the trunk's ancestry, and every later sync re-conflicts on the same hunks.
    - ship - GitLab: fast-forward (`merge_method=ff`); GitHub: "Rebase and merge". GitHub rewrites
-     the commit SHA, so **delete the local feature branch afterwards** instead of reusing it.
+     the commit SHA, so the local feature branch is **deleted afterwards**, never reused - `land`
+     recognises the patch and deletes it.
 6. **Never commit on the mirror.** It is only ever fast-forwarded to the upstream branch and
    pushed by `sync`, never with force. The hook rejects a mirror push that is not an ancestor of
    the last-fetched upstream ref, and rejects it when that ref is missing or unfetched.
@@ -91,7 +92,8 @@ merges with the method the project is configured for on GitLab - which `setup`'s
 is `ff` - and with the method rule 5 requires per call on GitHub (`--merge` for a sync, `--rebase`
 for a ship), always with a head-commit guard (`--sha` / `--match-head-commit`) so only the exact
 commit the run pushed can be merged; `land` warns when what landed does not have that shape (a
-ship's commit that sits on a merge commit instead of the trunk's first-parent line).
+ship's commit reachable only through a merge commit's second parent, not on the trunk's
+first-parent line).
 
 ## What is never automated
 

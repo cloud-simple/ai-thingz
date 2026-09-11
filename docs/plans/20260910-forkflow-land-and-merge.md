@@ -290,6 +290,14 @@ process. **If the merge succeeded and `land_pending` then fails**, the exit is i
 message opens with `the merge request was merged; the local catch-up did not run: <reason>` so
 nobody reads a merged MR as "nothing happened".
 
+⚠️ as built: `land_after_merge` returns at once under `--dry-run` (`merge_mr` has already printed
+`would: land`, and a dry run wrote no record for `land_pending` to find). ➕ review fix: when the
+tool exits 0 but the recorded commit is not on `origin/<trunk>` (a merge train, auto-merge, a
+required pipeline), `land_pending(after_merge=True)` raises exit 6 "the platform tool reported the
+merge request merged, but ..." and `land_after_merge` passes it on unwrapped - that request is not
+merged, so the "was merged" opening would be false. ➕ `--continue` hints printed by a run that had
+`--merge` (or `--mr`) carry the flag (`continue_cmd`).
+
 ### Exit code 6
 
 Docstring table, README table, `skills/sync/SKILL.md` and `skills/ship/SKILL.md` exit rows:
@@ -341,6 +349,15 @@ landed?    landed(ctx, entry) -> (sha | None, how):
                 with "-" means an equivalent patch is already on the trunk -> (that trunk commit found
                 by patch-id over <base>..origin/<trunk>, "rewritten")
              3. otherwise None
+           ⚠️ as built: step 2 is one `git cherry <commit> origin/<trunk> <base>` (the trunk commits
+           in <base>..origin/<trunk>, marked `-` when they carry the shipped patch - the landed
+           trunk commit comes straight from that line), no `git patch-id` pipe (a new subprocess
+           owner the invariants forbid). ➕ review fix: an empty ship skips step 2 (an empty patch
+           matches every empty commit), and a `-` match counts only while the trunk's tip still
+           has the change (`still_carries`: `merge-tree --write-tree origin/<trunk> <commit>`
+           gives back the trunk's own tree; a conflict or git < 2.38 keeps git cherry's answer) -
+           a patch reverted since is not a landing. A commit not in this clone raises
+           "cannot verify"; ➕ `--force` catches up past that too (it verifies nothing anyway).
            None and not force -> exit 2: "MR <url or branch> is not on origin/<trunk> yet"
                                   + for a sync: "if it was squashed or rebased in the UI, rule 5 was
                                   broken (see rules.md); `land --force` fast-forwards anyway"
@@ -349,6 +366,9 @@ landed?    landed(ctx, entry) -> (sha | None, how):
 rule 5     shape of what landed, reported not enforced:
              ship landed as a merge commit (the landed sha has 2 parents) -> WARNING "the ship MR was
                merged as a merge commit - rule 5 asks for a fast-forward; check the project's merge method"
+             ⚠️ as built: judged by whether the shipped commit is on the trunk's first-parent line
+               (`git rev-list --first-parent <base>..origin/<trunk>`) - an ancestor landing keeps
+               the ship's own single-parent SHA, so counting the landed sha's parents never warned
              sync landed "rewritten" is impossible (step 2 is ship-only); a sync that is not an ancestor
                is the exit-2 message above
 land_trunk local trunk absent (single-branch clone) -> git branch --no-track <trunk> origin/<trunk>
@@ -365,9 +385,17 @@ delete     git branch -d <branch>  when it is neither the trunk nor the mirror a
            commit made on the branch after the ship landed nowhere, and -D destroyed it (-d alone
            is no guard: push sets -u, so -d accepts a tip origin/<branch> contains). A moved
            branch is kept with "kept: <branch> is at <tip>, not the <commit> that was pushed".
+           ⚠️ as built: a `git branch -d/-D` git refuses after the trunk moved ("NOT deleted: <git's
+           line>") still exits 0 with the record cleared - the landing is done.
+           ➕ review fix: after a verified landing, an `origin/<branch>` that origin no longer has
+           (GitLab's --remove-source-branch) is dropped (`git branch -d -r`), or the next ship of
+           that name offers it as a lease and is refused "(stale info)".
 clear      write_state(ctx, "pending", None)
 print      "landed: <trunk> <old>..<new> - you are on <trunk>" ; github ship: "origin/<branch> may
            still exist: git push <origin> --delete <branch>"
+           ➕ review fix: the hint is printed on GitHub for a ship and a sync alike, only after a
+           verified landing and only while origin still has the branch; an unverified `--force`
+           ends "caught up, landing NOT verified: ..." instead of "landed: ..."
 exit 0 ; --dry-run prints every mutating step as would: and moves nothing
 ```
 
@@ -475,6 +503,7 @@ commit is not in this clone the line degrades to `... - cannot verify here` and 
 - Modify: `plugins/forkflow/scripts/forkflow.py`
 
 - [x] `landed(ctx, entry) -> Tuple[Optional[str], str]`: ancestry (`merge-base --is-ancestor`, rc 128 -> `Fail(2)` "cannot verify"), then for `kind == "ship"` `git cherry origin/<trunk> <commit> <base>` and the matching trunk commit by `git patch-id --stable` over `<base>..origin/<trunk>`; `(None, "")` otherwise
+  - ⚠️ built as one `git cherry <commit> origin/<trunk> <base>`, no `patch-id` (see *land* in Technical Details, which also has the review fixes: empty ship, reverted patch)
 - [x] `land_trunk(ctx)`: local trunk absent -> `git branch --no-track <trunk> origin/<trunk>`; local trunk not an ancestor of `origin/<trunk>` -> `Fail(2)`; trunk checked out in another worktree -> `Fail(2)` naming it; `git checkout <trunk>` always; `git merge --ff-only origin/<trunk>` via `git_rc`; invariant edit 2: the ff-only assertion moves out of `test_only_advance_mirror_moves_the_mirror` (which keeps `update-ref` pinned) into `test_the_two_fast_forwards_are_the_mirror_and_the_trunk_landing` asserting `{"advance_mirror", "land_trunk"}`
 - [x] `land_pending(ctx, force)`: preflight (pending, clean tree, no rebase, worktree) -> fetch (`git_rc`, failure -> 2) -> `landed()` (None -> exit 2 with the MR named and the rule-5 note for a sync; `--force` proceeds unverified) -> rule-5 shape warning for a ship that landed as a merge commit -> `land_trunk` -> `git branch -d` (or `-D` for a "rewritten" landing; never under `--force` without a landing) -> `write_state(ctx, "pending", None)` -> `landed: ...` line and the github remote-delete hint; every mutating step `would:` under `--dry-run`; the merged-but-not-landed message contract when called from `--merge`
 - [x] `cmd_land(args)`; `COMMANDS["land"]`; `parse_args` subparser `land` with `parents=[common]`, the subparsers `metavar` and the `--force` help text updated; docstring usage; `--merge` in `finish_sync`/`finish_ship` calls `land_pending` after `merge_mr` succeeds, replacing Task 3's `next: forkflow land` line; the shell catch-up line printed without `--merge` becomes `next: forkflow land`
@@ -534,6 +563,7 @@ commit is not in this clone the line degrades to `... - cannot verify here` and 
 - [x] `git rm docs/backlog/no-post-merge-catch-up-step.md` in this task's commit (backlog lifecycle: the item is removed by the commit that lands its fix)
 - [x] update CLAUDE.md if new patterns discovered (none expected - the repo has no CLAUDE.md) - none discovered; the repo has no CLAUDE.md and none was created
 - [x] move this plan to `docs/plans/completed/` - performed by the exec harness after all phases finish, not by this task
+  - ⚠️ the plan is still in `docs/plans/` while review phases run; the harness moves it at the end - no task or fixer moves it by hand
 
 ## Post-Completion
 *Items requiring manual intervention or external systems - no checkboxes, informational only*
@@ -559,6 +589,7 @@ and `setup-multiple-remotes-hint-ignores-config` remain open and are not affecte
   origin, so no path pushes and then exits 6 for a reason known at gate time
 - landing by patch equivalence (`git cherry` + `patch-id`) replaces tree equality, which fails the
   moment another commit lands first; a human squash merge of a ship is recognised the same way
+  (⚠️ built as a single `git cherry` call, no `patch-id`; see *land* in Technical Details)
 - `land --force` gained a meaning (fast-forward an unverifiable landing, keep the branch, clear the
   entry) instead of being parsed and ignored; it is also how a closed-MR entry is cleared
 - `git checkout` not `switch` (README's git floor is 2.20); the switch is unconditional and `land`
