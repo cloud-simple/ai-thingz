@@ -2911,18 +2911,29 @@ def land_pending(ctx: Ctx, force: bool = False) -> None:
     old, new = land_trunk(ctx)
 
     if sha is not None and branch not in (ctx.trunk, ctx.mirror):
-        # `-d` refuses a branch whose tip is unreachable from the trunk, which a rewritten
-        # landing is by definition; the patch is verifiably on the trunk, so `-D` is safe
+        # what landed is the commit that was pushed - not whatever the branch holds now. A
+        # commit made on it after the ship is on no trunk and, pushed by nobody, on no remote:
+        # the branch goes only while its tip is still exactly the recorded commit. Then `-d`
+        # for an ancestor landing, and `-D` for a rewritten one, which `-d` refuses (the tip
+        # is unreachable from the trunk) - the patch is verifiably on the trunk, and the tip
+        # is the commit whose patch it is. `-d` alone would not be the guard: `push` sets the
+        # branch's upstream, and `-d` accepts a tip that `origin/<branch>` contains
         flag = "-d" if how == "ancestor" else "-D"
         cmd = f"git branch {flag} {sh_arg(branch)}"
-        if ctx.dry_run:
-            step("branch", cmd, f"would delete `{branch}` (landed as {short(sha)})", dry=True)
-        elif not has_ref(ctx.root, f"refs/heads/{branch}"):
+        tip = rev(ctx.root, f"refs/heads/{branch}")
+        if not tip:
             step("branch", cmd, f"`{branch}` is already gone")
+        elif tip != entry["commit"]:
+            step("branch", f"git rev-parse {sh_arg(branch)}",
+                 f"kept: `{branch}` is at {short(tip)}, not the {short(entry['commit'])} that "
+                 f"was pushed - its later commits did not land")
+        elif ctx.dry_run:
+            step("branch", cmd, f"would delete `{branch}` (landed as {short(sha)})", dry=True)
         else:
             rc, out, err = git_rc("branch", flag, branch, cwd=ctx.root)
             if rc != 0:             # the landing is done; a branch that will not go is said
-                step("branch", cmd, f"NOT deleted: {(err or out).strip().splitlines()[-1]}")
+                why = ((err or out).strip().splitlines() or [f"git exit {rc}"])[-1]
+                step("branch", cmd, f"NOT deleted: {why}")
             else:
                 step("branch", cmd, f"deleted (landed as {short(sha)})")
     elif sha is None:
@@ -9947,6 +9958,58 @@ def run_tests() -> None:
             self.assertEqual(code, 0, err + out)
             self.assertIn("(rewritten)", out)
             self.assert_landed(fork, name, tip)
+
+        # -- the branch moved on after the ship: only the pushed commit landed ---------------
+
+        def assert_kept_at(self, fork: str, name: str, tip: str, landed_tip: str) -> None:
+            """The landing is done - trunk caught up, HEAD on it, record cleared - and the
+            branch is still there at `tip`, the commit that did not land."""
+            self.assertEqual(rev(fork, "refs/heads/develop"), landed_tip)
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(self.pending_of(fork), {})
+            self.assertEqual(rev(fork, "refs/heads/" + name), tip)       # kept, not rewound
+            rc, _, _ = git_rc("merge-base", "--is-ancestor", tip, "refs/heads/develop",
+                              cwd=fork)
+            self.assertEqual(rc, 1)                     # the later commit is on no trunk ...
+            self.assertIn("refs/heads/" + name,        # ... and still reachable from a branch
+                          sh("git", "for-each-ref", "--contains", tip,
+                             "--format=%(refname)", "refs/heads/", cwd=fork).splitlines())
+
+        def test_a_commit_after_a_rewritten_ship_keeps_the_branch(self):
+            """"Rebase and merge" of the pushed commit, and one more commit made on the
+            branch after the ship: the patch that landed is the shipped one, so `-D` of the
+            branch would destroy the later commit. It is kept, and the landing still runs."""
+            fork, name, entry = self.shipped()
+            later = commit_fork(fork, "ours/later.txt", "later\n", "ours: after the ship")
+            tip = self.human(("cherry-pick", entry["commit"]))
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("(rewritten)", out)
+            self.assertNotIn("git branch -D", out)
+            self.assert_kept_at(fork, name, later, tip)
+
+        def test_a_commit_after_the_ship_pushed_by_hand_still_keeps_the_branch(self):
+            """The later commit pushed by hand: `push` set the branch's upstream, so a
+            plain `git branch -d` would take the branch now that `origin/<branch>` contains
+            its tip - the recorded commit is the guard, not `-d`."""
+            fork, name, entry = self.shipped()
+            later = commit_fork(fork, "ours/later.txt", "later\n", "ours: after the ship",
+                                push=True)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertEqual(rev(fork, "refs/remotes/origin/" + name), later)
+            tip = self.human(("cherry-pick", entry["commit"]))
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assert_kept_at(fork, name, later, tip)
+
+        def test_a_commit_after_a_fast_forwarded_ship_keeps_the_branch(self):
+            fork, name, entry = self.shipped()
+            later = commit_fork(fork, "ours/later.txt", "later\n", "ours: after the ship")
+            self.move_trunk(entry["commit"])
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("(ancestor)", out)
+            self.assert_kept_at(fork, name, later, entry["commit"])
 
         def test_a_ship_merged_as_a_merge_commit_lands_with_the_rule_5_warning(self):
             fork, name, entry = self.shipped()

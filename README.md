@@ -209,7 +209,7 @@ read is [`plugins/forkflow/references/rules.md`](plugins/forkflow/references/rul
 | `/forkflow:status` | *"where are we vs upstream"*, *"how much has this fork diverged"* | one screen: mirror, trunk, `origin/*` and upstream, divergence and how much of it is upstream-tracked, what the current branch touches, whether the fork is set up, and whether the last ship or sync is still waiting to land. Read-only |
 | `/forkflow:sync` | *"sync upstream"*, *"pull in upstream"* | advance and push the mirror, then bring it into the trunk through `sync/<upstream>-<date>` + one `--no-ff` merge + an MR. Conflicts are resolved in the branch; a "both sides survived" table flags every file changed on both sides, because a clean merge is not automatically a correct one |
 | `/forkflow:ship` | *"ship this branch"*, *"squash and open the MR"* | take a feature branch to the trunk as **one** squashed commit (tree-hash verified) on top of a fresh `origin/<trunk>`, through an MR |
-| `/forkflow:land` | *"forkflow land"*, *"the MR merged"*, *"catch develop up"* | the closing step once the MR is merged: fetch, verify that the pushed commit is on `origin/<trunk>` (by ancestry, or by patch for a ship whose SHA a "squash and merge" or "rebase and merge" rewrote), fast-forward the local trunk, delete the landed local branch, leave you on the trunk. Not merged yet is exit 2, not an error |
+| `/forkflow:land` | *"forkflow land"*, *"the MR merged"*, *"catch develop up"* | the closing step once the MR is merged: fetch, verify that the pushed commit is on `origin/<trunk>` (by ancestry, or by patch for a ship whose SHA a "squash and merge" or "rebase and merge" rewrote), fast-forward the local trunk, delete the landed local branch (only while its tip is still the commit that was pushed), leave you on the trunk. Not merged yet is exit 2, not an error |
 | `/forkflow:setup` | *"set up the fork"*, *"protect the trunk locally"* | make the rules mechanical: upstream push URL disabled, pre-push hook, ff-only merge config, trunk bootstrapped on a fresh fork, and a report of the platform's default branch / merge method / protection with the exact command to fix each mismatch |
 
 The script does the mechanical, testable work - divergence numbers, mirror advance, merge simulation,
@@ -326,7 +326,9 @@ on its `pending` line with the same verdict. It fetches; verifies that the recor
 `origin/<trunk>` - by ancestry, or for a ship by patch, so a "squash and merge" or GitHub's "Rebase
 and merge" that gave the commit a new SHA is recognised too; checks the local trunk out (creating it
 from `origin/<trunk>` in a single-branch clone) and fast-forwards it with `git merge --ff-only`;
-deletes the landed local branch; forgets the record. A local trunk carrying commits origin lacks is
+deletes the landed local branch - only while its tip is still the commit that was pushed: a commit
+made on it after the ship landed nowhere, so the branch is kept and the run says so; forgets the
+record. A local trunk carrying commits origin lacks is
 refused untouched - the plugin never creates those. "Not on `origin/<trunk>` yet" is exit 2 and not
 an error: the MR is not merged, run it again once it is. A ship that landed as a merge commit lands
 with a WARNING - rule 5 asks for a fast-forward, and the shape is judged on the trunk's first-parent
@@ -348,7 +350,8 @@ does not help when the recorded commit is not in this clone at all: `land` needs
 the ship or the sync.
 
 After a GitHub "Rebase and merge" of a ship MR the local feature branch is deleted by `land` (its
-SHA was rewritten; the patch is recognised), but the remote branch may survive - `land` prints the
+SHA was rewritten; the patch is recognised, and the branch's tip is still the commit that was
+pushed), but the remote branch may survive - `land` prints the
 `git push origin --delete <branch>` line and leaves that call to you.
 
 ### Adopting forkflow in an existing fork
@@ -401,6 +404,6 @@ marketplace cache directory is named after it). What each one carries:
 
 | version | what changed |
 |---|---|
-| `0.2.0` | `land` subcommand: once the MR is merged, fetch, verify that the pushed commit is on `origin/<trunk>` (by ancestry, or by patch for a ship whose SHA was rewritten), fast-forward the local trunk, delete the landed branch and leave you on the trunk - the printed shell catch-up line is retired for `next: forkflow land`; `--merge` on `sync` and `ship`, behind `merge = "self"` in `.forkflow.toml`, merges the MR the run opened with the method rule 5 requires and a head-commit guard, then lands it; exit `6` for a merge request not created or not merged; `status` shows the `pending` ship or sync and whether it has landed |
+| `0.2.0` | `land` subcommand: once the MR is merged, fetch, verify that the pushed commit is on `origin/<trunk>` (by ancestry, or by patch for a ship whose SHA was rewritten), fast-forward the local trunk, delete the landed branch (only while its tip is still the pushed commit) and leave you on the trunk - the printed shell catch-up line is retired for `next: forkflow land`; `--merge` on `sync` and `ship`, behind `merge = "self"` in `.forkflow.toml`, merges the MR the run opened with the method rule 5 requires and a head-commit guard, then lands it; exit `6` for a merge request not created or not merged; `status` shows the `pending` ship or sync and whether it has landed |
 | `0.1.1` | `status` asks the upstream server whether its branch moved instead of trusting the last fetch (`--offline` opts out); `--mr` passes `--yes` to `glab` and runs the tool with stdin closed, so it no longer stops at a confirmation prompt. Earlier fixes that shipped under `0.1.0` and are worth knowing about: every `gh`/`glab` command names the fork with `--repo` rather than resolving to the original project; the sync gate guard compares committed config to committed config; `file://localhost/` spellings of the upstream URL are refused by the hook |
 | `0.1.0` | first release |

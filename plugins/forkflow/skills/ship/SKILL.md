@@ -104,8 +104,8 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
 
    (`/forkflow:land`; the run prints `next: forkflow land`). It fetches, verifies that the
    shipped commit is on `origin/<trunk>` - by ancestry, or by patch when GitHub's "Rebase and
-   merge" rewrote its SHA - fast-forwards the local trunk, deletes the local feature branch and
-   leaves you on the trunk. Not merged yet is exit 2 and not an error. On GitHub the remote
+   merge" rewrote its SHA - fast-forwards the local trunk, deletes the local feature branch (kept
+   instead when it carries commits made after the ship) and leaves you on the trunk. Not merged yet is exit 2 and not an error. On GitHub the remote
    branch may survive a rebase merge; `land` prints the `git push origin --delete <branch>` line
    for the user. `--merge` runs that landing itself, right after the merge.
 

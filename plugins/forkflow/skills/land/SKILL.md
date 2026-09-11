@@ -10,8 +10,9 @@ The script never pushes the trunk, never rebases it, and never commits on the mi
 may you. `land` is the one place the plugin moves the local trunk (`setup` only creates it on a
 fresh fork), and only by fast-forward to what `origin/<trunk>` already holds after the platform
 merged the request; it pushes nothing,
-rewrites nothing, and deletes a local branch only once it has seen that branch's commit on the
-trunk.
+rewrites nothing, and deletes a local branch only once it has seen that branch's pushed commit on
+the trunk - and only while the branch's tip is still that commit: a commit made on the branch after
+the ship keeps it.
 
 Script: `${CLAUDE_PLUGIN_ROOT}/scripts/forkflow.py`.
 Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a session.
@@ -32,8 +33,9 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    and merge" or a "rebase and merge" that gave the commit a new SHA is recognised too; create
    the local trunk from `origin/<trunk>` if this clone has none; `git checkout <trunk>`;
    `git merge --ff-only origin/<trunk>`; delete the landed branch (`-d`, or `-D` when the landing
-   was a rewritten copy - the patch is verifiably on the trunk); forget the record; print the
-   `landed:` line. HEAD is on the trunk when it finishes, whichever branch it started from.
+   was a rewritten copy - the patch is verifiably on the trunk) only while its tip is still the
+   commit that was pushed, and otherwise keep it and say so (its later commits did not land);
+   forget the record; print the `landed:` line. HEAD is on the trunk when it finishes, whichever branch it started from.
 
 2. **"Not on origin/<trunk> yet" is exit 2 and not an error.** The merge request named in the
    message has not been merged: say so, and run `forkflow land` again once it is. Nothing moved -
@@ -77,6 +79,7 @@ After the usual header (mirror line, trunk line, divergence), one line per step:
   trunk  $ git merge --ff-only origin/<trunk>  -> <old> -> <new>
   trunk  $ git rev-parse <trunk>  -> up to date at <sha>          (instead, when the local trunk was already there)
   branch  $ git branch -d|-D <branch>  -> deleted (landed as <sha>) | `<branch>` is already gone | NOT deleted: <git's line>
+  branch  $ git rev-parse <branch>  -> kept: `<branch>` is at <sha>, not the <sha> that was pushed - its later commits did not land
   landed: <trunk> <old>..<new> - you are on <trunk>
 ```
 
@@ -89,6 +92,7 @@ After the usual header (mirror line, trunk line, divergence), one line per step:
 | `WARNING: the ship MR was merged as a merge commit` | rule 5 asks for a fast-forward - the ship's commit is on the trunk but hangs off a merge commit; the landing is done, and the project's merge method wants checking (`forkflow setup` reports it) |
 | `trunk ... created at <sha> (no local <trunk> before)` | a single-branch clone had no local trunk; it now has one, on `origin/<trunk>` |
 | `` `<branch>` is kept: its landing was not verified `` | `--force` without a recognised landing - delete the branch yourself only when the user is sure |
+| `` branch ... kept: `<branch>` is at <sha>, not the <sha> that was pushed `` | the landing is done, but the branch has commits made after the ship: they are on no trunk, so the branch stays - tell the user, they ship them or drop them |
 | `branch ... NOT deleted: <line>` | the landing is done; git refused to delete the branch and said why (it is checked out in another worktree, say) |
 | `origin/<branch> may still exist: git push origin --delete <branch>` | GitHub ship: the remote branch is not removed by a rebase merge; the user's call |
 | `landed: <trunk> <old>..<new> - you are on <trunk>` | done; HEAD is on the trunk |

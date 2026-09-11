@@ -336,6 +336,10 @@ land_trunk local trunk absent (single-branch clone) -> git branch --no-track <tr
 delete     git branch -d <branch>  when it is neither the trunk nor the mirror and the landing was
            "ancestor"; when "rewritten", -d refuses (the local commit is unreachable from the trunk)
            and -D is used - the patch is verifiably on the trunk. Never under --force with no landing.
+           ⚠️ review fix: deleted only while refs/heads/<branch> still equals pending.commit - a
+           commit made on the branch after the ship landed nowhere, and -D destroyed it (-d alone
+           is no guard: push sets -u, so -d accepts a tip origin/<branch> contains). A moved
+           branch is kept with "kept: <branch> is at <tip>, not the <commit> that was pushed".
 clear      write_state(ctx, "pending", None)
 print      "landed: <trunk> <old>..<new> - you are on <trunk>" ; github ship: "origin/<branch> may
            still exist: git push <origin> --delete <branch>"
