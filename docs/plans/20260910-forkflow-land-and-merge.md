@@ -266,6 +266,15 @@ exactly `.forkflow.toml` and refuses a case variant (exit 2, naming it); "is it 
 (`config_tracked`, a `:(icase)` pathspec) and "what did this revision carry" (`config_text`, the
 exact name first, else a case variant in the tree) treat a variant as the file.
 
+⚠️ iteration 4 (printed remedies): every command `load_config`'s variant refusal prints first
+copies the working file into the git directory (`test ! -e <copy> && cp -p -- <file> <copy> &&
+...`) and names the copy; the index entries go with `git update-index --force-remove` (no `-f`
+hint, no mid-merge refusal); on the trunk (`origin/HEAD`'s branch or `develop`), on a branch of
+nothing but upstream's commits (the mirror) or a detached HEAD it prints an explanation and no
+command; a merge in progress whose copy left the index gets no command either. `finish_sync`'s
+outer message no longer invites an edit for a variant, and `setup`'s "commit it" says on a
+branch off `origin/<trunk>`, shipped.
+
 ⚠️ iteration 4: condition 1 is `fork_merge_mode(ctx) != "self"` (see the deviation under *Config*);
 `merge_mode_arrived_in_merge` is gone - the working tree is no longer a source, so there is nothing
 for it to compare. On `sync --continue` the refusal still names `sync --continue --mr`.

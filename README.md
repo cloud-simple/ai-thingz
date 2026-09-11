@@ -308,7 +308,12 @@ upstream's `.ForkFlow.toml` is the same file as `.forkflow.toml`, and `sync` tre
 forkflow reads its config only from a file named exactly `.forkflow.toml` and refuses a case
 variant; the way out it prints never deletes or renames the variant in the working tree while
 the fork has a `.forkflow.toml` of its own - on such a filesystem that would take the fork's
-config with it - but puts the fork's copy back from `HEAD` through the index.
+config with it - but puts the fork's copy back from `HEAD` through the index. Every command it
+prints first copies the file as it is into the git directory and names the copy, so an edit
+made before running it is not lost. On the trunk, the mirror (any branch of nothing but
+upstream's commits) or a detached HEAD it prints no command at all - nothing is committed
+there: run forkflow on a branch off `origin/<trunk>`, where the fix it names is committed and
+shipped.
 
 The script itself needs only Python 3.9+ and git 2.20+ (the merge simulation wants 2.38+ and is
 skipped with a note on older git). **Reading `.forkflow.toml` needs Python 3.11+** (`tomllib`): a
