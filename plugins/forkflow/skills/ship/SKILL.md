@@ -97,10 +97,12 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
 
    Worktrees: when the trunk is checked out in another worktree (the usual layout - the main
    worktree on the trunk, the feature in a linked one), `--merge` from the linked worktree
-   always ends with exit 2 "the merge request was merged; the local catch-up did not run: trunk
-   ... is checked out in <path>: run `forkflow land <branch>` there". That is the expected end,
-   not a failure: the merge is done, the record is kept, and `land <branch>` in that worktree
-   catches the trunk up there. It cannot delete the branch while the linked worktree has it
+   ends - once the merge is on the trunk - with exit 2 "the merge request was merged; the local
+   catch-up did not run: trunk ... is checked out in <path>: run `forkflow land <branch>`
+   there". That is the expected end, not a failure: the merge is done, the record is kept, and
+   `land <branch>` in that worktree catches the trunk up there. A merge the tool only queued is
+   exit 6 in this layout too, naming the same `forkflow land <branch>` and worktree for once
+   it is through. It cannot delete the branch while the linked worktree has it
    checked out (`NOT deleted`), and the linked worktree stays on the feature branch - switch it
    off (or remove the worktree), then delete the branch by hand (`git branch -D <branch>` once
    `status` no longer lists it as pending: it has landed).

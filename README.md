@@ -360,10 +360,12 @@ for a ship - always with a head-commit guard (`--sha` / `--match-head-commit`), 
 commit the run pushed can be merged. It merges only the MR this run opened: one already open for
 the branch (its `create` fails) is not merged for you. A merge that does not happen is exit 6 with
 the branch pushed and the MR open: merge by hand, then `forkflow land` - and so is a tool that
-answers "merged" while nothing reaches the trunk (a merge train, auto-merge, a required pipeline).
+answers "merged" while nothing reaches the trunk (a merge train, auto-merge, a required pipeline),
+judged before anything about worktrees: its message names `forkflow land <branch>` and, when the
+trunk is checked out elsewhere, the worktree to run it in once the merge is through.
 A merge that happened but whose catch-up could not run is exit 2 with a message that opens with
 "the merge request was merged". In the usual worktree layout - the trunk checked out in the main
-worktree, the work in a linked one - that is how every `--merge` from the linked worktree ends: the
+worktree, the work in a linked one - that is how a `--merge` from the linked worktree ends: the
 trunk can only be fast-forwarded where it is checked out, so the message names `forkflow land
 <branch>` to run in the main worktree, and the branch stays until the linked worktree lets go of it.
 A conflicted `sync --merge` or `ship --merge` prints the resume with `--merge` on it (`forkflow sync

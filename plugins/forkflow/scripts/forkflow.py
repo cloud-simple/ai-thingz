@@ -3098,12 +3098,24 @@ def pending_verdict(ctx: Ctx, entry: dict) -> str:
     a commit whose branch was deleted and pruned is gone; `landed()` raises for either (git
     cannot resolve what it is asked to compare), which is "cannot verify here", not an
     error. Git only, so the answer is the same under `--offline`; `--fetch` moves the refs it
-    is read from."""
+    is read from.
+
+    The landed verdict names the branch: plain `forkflow land` on a branch with a record of
+    its own lands that record only, so run from there it would answer "not merged yet" about
+    another request and never reach this one. Named, it lands this record from any branch
+    (and from a linked worktree gets a refusal that says where to run it)."""
     try:
         sha, _ = landed(ctx, entry)
     except Fail:
         return "cannot verify here"
-    return "landed: run forkflow land" if sha else f"not on {ctx.origin}/{ctx.trunk} yet"
+    return (f"landed: run forkflow land {sh_arg(entry['branch'])}" if sha
+            else f"not on {ctx.origin}/{ctx.trunk} yet")
+
+
+def trunk_worktree_elsewhere(ctx: Ctx) -> str:
+    """The other worktree the trunk is checked out in, or "" (none, or this one)."""
+    wt = branch_worktree(ctx, ctx.trunk)
+    return wt if wt and os.path.realpath(wt) != os.path.realpath(ctx.root) else ""
 
 
 def trunk_elsewhere(ctx: Ctx, resume: str = "forkflow land") -> None:
@@ -3115,8 +3127,8 @@ def trunk_elsewhere(ctx: Ctx, resume: str = "forkflow land") -> None:
     branch when this run was landing one record, since HEAD there is on another branch.
     Removing the other worktree is not offered - the main worktree cannot be removed, and
     it is the usual one."""
-    wt = branch_worktree(ctx, ctx.trunk)
-    if wt and os.path.realpath(wt) != os.path.realpath(ctx.root):
+    wt = trunk_worktree_elsewhere(ctx)
+    if wt:
         raise Fail(f"trunk `{ctx.trunk}` is checked out in {wt}: run `{resume}` there - "
                    f"every worktree of this clone sees the same pending records")
 
@@ -3131,7 +3143,7 @@ def land_trunk(ctx: Ctx) -> Tuple[str, str]:
     checked out, so its files have to follow. A local trunk with commits origin lacks is
     refused before anything moves: this plugin never creates such commits (rule 2), so they
     are someone's by-hand work and not this script's to lose. A trunk checked out in another
-    worktree is `land_pending`'s preflight, refused before the fetch."""
+    worktree is `land_preflight`'s, refused before anything moves."""
     t = ctx.trunk
     trunk_ref = f"refs/remotes/{ctx.origin}/{t}"
     shown_ref = f"{ctx.origin}/{t}"
@@ -3175,6 +3187,34 @@ def land_trunk(ctx: Ctx) -> Tuple[str, str]:
         raise Fail(f"cannot fast-forward `{t}`:\n{(err or out).strip()}")
     step("trunk", cmd, f"{short(old)} -> {short(new)}")
     return (old, new)
+
+
+def land_preflight(ctx: Ctx, resume: str) -> None:
+    """What `land` cannot do from here, refused by name: a stopped rebase (before the tree -
+    it always leaves the tree dirty), uncommitted changes, the trunk checked out in another
+    worktree (where `resume` has to run)."""
+    if rebase_in_progress(ctx):
+        raise Fail("a rebase is in progress: finish it (`git rebase --continue`) or abort "
+                   "it (`git rebase --abort`) first")
+    if not clean_tree(ctx):
+        raise Fail("the working tree has uncommitted changes: commit or stash them first")
+    trunk_elsewhere(ctx, resume)
+
+
+def landed_others(ctx: Ctx, entry: dict) -> list:
+    """The branches of every other pending record that is on the trunk, as `landed` judges
+    it from the refs this run fetched; one it cannot judge here is left out."""
+    found = []
+    for name, other in sorted(pending_entries(ctx).items()):
+        if name == entry["branch"]:
+            continue
+        try:
+            sha, _ = landed(ctx, other)
+        except Fail:
+            continue
+        if sha:
+            found.append(name)
+    return found
 
 
 def pending_to_land(ctx: Ctx, entry: Optional[dict], branch: str, force: bool) -> list:
@@ -3223,16 +3263,24 @@ def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False,
     Which records: see `pending_to_land`. With several, each verified one lands - one
     fast-forward of the trunk, then each branch - and the rest are reported and kept; none
     verified is the same exit 2 as for one. Whatever is still pending afterwards is listed
-    as `status` lists it."""
+    as `status` lists it. The record of the branch HEAD is on, picked because nothing was
+    named, answers for itself only: when it has not landed, the exit 2 names every other
+    record that has, each as the `forkflow land <branch>` that lands it.
+
+    Order: a plain `land` refuses what it cannot do here (a stopped rebase, a dirty tree, the
+    trunk checked out in another worktree) before it fetches. After `--merge` the verdict
+    comes first: whether the request reached the trunk is the one thing that run has to
+    say, and a queued merge is exit 6 wherever the trunk is checked out - refused as "the
+    trunk is elsewhere" it read as merged, and `land` there then said "merge it" of a request
+    that was already queued."""
     chosen = pending_to_land(ctx, entry, branch, force)
     several = len(chosen) > 1
-    if rebase_in_progress(ctx):            # before the tree: a stopped rebase leaves it dirty
-        raise Fail("a rebase is in progress: finish it (`git rebase --continue`) or abort "
-                   "it (`git rebase --abort`) first")
-    if not clean_tree(ctx):
-        raise Fail("the working tree has uncommitted changes: commit or stash them first")
-    trunk_elsewhere(ctx, "forkflow land" + (" --force" if force else "")
-                    + ("" if several else f" {sh_arg(chosen[0]['branch'])}"))
+    implicit = (entry is None and not branch and not several
+                and chosen[0]["branch"] == current_branch(ctx))
+    resume = ("forkflow land" + (" --force" if force else "")
+              + ("" if several else f" {sh_arg(chosen[0]['branch'])}"))
+    if not after_merge:
+        land_preflight(ctx, resume)
 
     shown_ref = f"{ctx.origin}/{ctx.trunk}"
     trunk_ref = f"refs/remotes/{shown_ref}"
@@ -3267,15 +3315,22 @@ def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False,
             if not force:
                 step("landed?", ancestry, f"no - {short(commit)} is not on {shown_ref}")
                 if after_merge:
+                    there = trunk_worktree_elsewhere(ctx)
+                    where = f" in {there}, where `{ctx.trunk}` is checked out" if there else ""
                     raise Fail(f"the platform tool reported the merge request merged, but "
                                f"{shown_ref} does not have {short(commit)} - the merge is "
                                f"queued or waiting (a merge train, auto-merge, a required "
-                               f"pipeline?); once it is on {shown_ref}: forkflow land",
+                               f"pipeline?); once it is on {shown_ref}, run "
+                               f"`forkflow land {sh_arg(e['branch'])}`{where}",
                                EXIT_NOT_MERGED)
                 note = ""
                 if kind == "sync":
                     note = (f"; if it was squashed or rebased in the UI, rule 5 was broken "
                             f"(see rules.md) - `forkflow land --force` fast-forwards anyway")
+                others = landed_others(ctx, e) if implicit else []
+                if others:
+                    note += ("\n  other merge requests have landed - land each by its name: "
+                             + ", ".join(f"`forkflow land {sh_arg(b)}`" for b in others))
                 request = e.get("mr") or f"`{e['branch']}`"
                 raise Fail(f"MR {request} is not on {shown_ref} yet - merge it, then run "
                            f"`forkflow land` again{note}")
@@ -3302,6 +3357,8 @@ def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False,
         raise Fail(f"nothing pending is on {shown_ref} yet - merge, then run `forkflow land` "
                    f"again:{lines}")
 
+    if after_merge:                        # landed: now what this worktree cannot do
+        land_preflight(ctx, resume)
     old, new = land_trunk(ctx)
 
     leftovers = []
@@ -11451,6 +11508,67 @@ def run_tests() -> None:
             self.assertEqual(checked_out(fork), "develop")
             self.assertEqual(self.pending_of(linked), {})
 
+        def queued(self):
+            """glab arming auto-merge instead of merging - a merge train or a queue look the
+            same: the tool answers 0 and nothing reaches the trunk."""
+            real = merge_command
+
+            def armed(*a):
+                return [c for c in real(*a) if c != "--auto-merge=false"]
+
+            return mock.patch.object(sys.modules[__name__], "merge_command", armed)
+
+        def assert_queued_then_landed_where_it_says(self, fork: str, linked: str, err: str,
+                                                    kind: str, name: str, base: str) -> None:
+            """Exit 6's state - nothing moved, the record intact, both worktrees where they
+            were - then the queue completes and the command it printed, run in the worktree
+            it named, lands the record."""
+            self.assertFalse(err.startswith("forkflow: the merge request was merged"), err)
+            self.assertEqual(origin_sha(fork, "develop"), base)
+            self.assertEqual(rev(fork, "refs/heads/develop"), base)
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(checked_out(linked), name)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"]), (kind, name))
+            self.assertEqual(printed(err, "forkflow land"), "forkflow land " + name)
+            self.assertIn(" in %s," % fork, err)
+            self.move_trunk(entry["commit"])
+            with on_platform("gitlab"):
+                code, out, err2 = run_printed(err, "forkflow land", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.assertEqual(rev(fork, "refs/heads/develop"), entry["commit"])
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(self.pending_of(fork), {})
+
+        def test_a_queued_ship_merge_from_a_linked_worktree_is_exit_6(self):
+            """The usual layout - the trunk in the main worktree, the work in a linked one -
+            and a merge the tool only queued. The landing was judged after "the trunk is
+            checked out elsewhere", so it read "the merge request was merged" (exit 2), and
+            `land` in the main worktree then said "merge it" of a request already queued.
+            The verdict comes first now: exit 6, with the command for once it is through."""
+            fork = self.self_fork()
+            linked = os.path.join(self.tmp, "linked")
+            sh("git", "worktree", "add", "-q", "-b", "feat/x", linked, "develop", cwd=fork)
+            commit_fork(linked, "ours/f0.txt", "line 0\n", "ours: step 0")
+            base = origin_sha(fork, "develop")
+            with on_platform(self.platform("gitlab")), self.queued():
+                code, out, err = run("-C", linked, "ship", "--merge")
+            self.assertEqual(code, 6, err + out)
+            self.assert_queued_then_landed_where_it_says(fork, linked, err, "ship", "feat/x",
+                                                         base)
+
+        def test_a_queued_sync_merge_from_a_linked_worktree_is_exit_6(self):
+            fork = self.self_fork()
+            linked = os.path.join(self.tmp, "linked")
+            sh("git", "worktree", "add", "-q", "-b", "scratch", linked, "develop", cwd=fork)
+            self.upstream_change()
+            base = origin_sha(fork, "develop")
+            with on_platform(self.platform("gitlab")), self.queued():
+                code, out, err = run("-C", linked, "sync", "--merge")
+            self.assertEqual(code, 6, err + out)
+            self.assert_queued_then_landed_where_it_says(fork, linked, err, "sync",
+                                                         sync_branch_name(), base)
+
     # ------------------------------------------------------------------- #
     # argument parsing and main
     # ------------------------------------------------------------------- #
@@ -11668,6 +11786,55 @@ def run_tests() -> None:
             self.assertEqual(checked_out(fork), "develop")
             self.assertEqual(rev(fork, "refs/heads/" + name), "")
             self.assertTrue(os.path.isdir(blocker))
+
+        def b_landed_while_on_a(self) -> Tuple[str, dict, dict]:
+            """One worktree: feat/b shipped, then feat/a shipped and still checked out, and
+            only feat/b's merge request merged."""
+            fork = make_fork(self.tmp)
+            for name in ("feat/b", "feat/a"):          # a patch of its own each, or git cherry
+                self.feature(fork, name, commits=0)    # calls one the other's landing
+                commit_fork(fork, "ours/%s.txt" % name[-1], name + "\n", "ours: " + name)
+                self.ship_in(fork)
+            a, b = self.entries(fork)["feat/a"], self.entries(fork)["feat/b"]
+            self.move_trunk(b["commit"])
+            return fork, a, b
+
+        def assert_b_landed_a_kept(self, fork: str, a: dict, b: dict) -> None:
+            self.assertEqual(rev(fork, "refs/heads/develop"), b["commit"])
+            self.assertEqual(rev(fork, "refs/heads/feat/b"), "")
+            self.assertEqual(rev(fork, "refs/heads/feat/a"), a["commit"])
+            self.assertEqual(self.entries(fork), {"feat/a": a})
+
+        def test_the_landed_command_status_prints_works_from_a_branch_with_its_own_record(self):
+            """`status` said "landed: run forkflow land" of feat/b; run from feat/a, that
+            plain `land` answered for feat/a only - "not merged yet" - and nothing landed.
+            The verdict names the branch, and run as printed it lands feat/b."""
+            fork, a, b = self.b_landed_while_on_a()
+            code, out, err = run("-C", fork, "status", "--fetch")
+            self.assertEqual(code, 0, err + out)
+            line = next(ln for ln in out.splitlines()
+                        if ln.strip().startswith("pending") and " feat/b " in ln)
+            cmd = line.split("landed: run ", 1)[1].strip()
+            self.assertEqual(checked_out(fork), "feat/a")
+            code, out, err = run("-C", fork, *shlex.split(cmd)[1:])
+            self.assertEqual(code, 0, err + out)
+            self.assert_b_landed_a_kept(fork, a, b)
+
+        def test_land_on_an_unlanded_branch_names_the_records_that_landed(self):
+            """Plain `land` on feat/a picks feat/a's record; not merged, it is exit 2 with
+            nothing moved - and it names feat/b, which has landed, as the command that lands
+            it. That command, run as printed, does."""
+            fork, a, b = self.b_landed_while_on_a()
+            develop = rev(fork, "refs/heads/develop")
+            code, out, err = run("-C", fork, "land")
+            self.assertEqual(code, 2, err + out)
+            self.assertEqual(rev(fork, "refs/heads/develop"), develop)
+            self.assertEqual(checked_out(fork), "feat/a")
+            self.assertEqual(self.entries(fork), {"feat/a": a, "feat/b": b})
+            self.assertNotIn("forkflow land feat/a", err)     # only the ones that landed
+            code, out, err2 = run_printed(err, "forkflow land feat/", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.assert_b_landed_a_kept(fork, a, b)
 
     class TestShipAfterTheBranchLeftOrigin(MergeBase):
         """A fetch does not prune, so `origin/<branch>` outlives the branch on origin when

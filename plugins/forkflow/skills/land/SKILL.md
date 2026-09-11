@@ -47,7 +47,9 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
 2. **"Not on origin/<trunk> yet" is exit 2 and not an error.** The merge request named in the
    message has not been merged: say so, and run `forkflow land` again once it is. Nothing moved -
    the trunk, the branch and the record are as they were. With several records and none landed
-   the message lists each with its merge request. For a sync the message adds the
+   the message lists each with its merge request. Plain `land` on a branch that has a record of
+   its own answers for that record only; when it has not landed but others have, the message
+   names each of those as `forkflow land <branch>` - run that one. For a sync the message adds the
    rule-5 note: a sync that was squashed or rebased in the web UI never becomes an ancestor of
    the trunk, so it can never be recognised - that is the one case `--force` exists for on a
    sync, and it is a broken rule 5 to report, not a quirk to smooth over.
@@ -135,7 +137,8 @@ Under `--dry-run` the mutating steps and the last line carry `would:` (`would: l
   same process right after the merge; a merged request whose catch-up could not run exits 2 with
   a message that opens with "the merge request was merged" - then `forkflow land` finishes it
   once the reason is dealt with. A tool that answered "merged" while nothing reached the trunk
-  (a merge train, auto-merge) is exit 6 instead: not merged yet, `forkflow land` once it is.
+  (a merge train, auto-merge) is exit 6 instead, whichever worktree has the trunk: not merged
+  yet - once it is, the `forkflow land <branch>` the message names, in the worktree it names.
 - Never `git push origin <trunk>`, never rebase the trunk, never `--force` anything: `land`
   fast-forwards only, and a trunk it cannot fast-forward is a message, not a `reset`.
 - `.forkflow.toml` (`gate`, `merge`, branch names) needs Python 3.11+; a present but unreadable

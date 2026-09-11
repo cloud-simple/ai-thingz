@@ -65,7 +65,7 @@ After the `setup` line, one line for each branch a `ship` or `sync` pushed that 
 landed yet (in branch order):
 
 ```
-  pending  <ship|sync> <branch> -> MR <url|-> - not on origin/<trunk> yet | landed: run forkflow land | cannot verify here
+  pending  <ship|sync> <branch> -> MR <url|-> - not on origin/<trunk> yet | landed: run forkflow land <branch> | cannot verify here
 ```
 
 | what you see | what it means |
@@ -88,7 +88,7 @@ landed yet (in branch order):
 | `backups  n (...)` | backup branches on origin, newest three; read from remote-tracking refs, no network |
 | `setup    upstream push: DISABLED\|<url> (LIVE)  pre-push hook: installed\|missing\|foreign  ff-only: ...` | which guarantees are actually in place in this clone |
 | `pending  ... - not on origin/<trunk> yet` | the branch a `ship`/`sync` pushed is not merged yet (as of the refs on disk - `--fetch` to ask again); wait, or offer to check the MR |
-| `pending  ... - landed: run forkflow land` | the merge request is merged and the local trunk has not caught up: offer `/forkflow:land` (plain `land` on the trunk lands every landed record; `land <branch>` one) |
+| `pending  ... - landed: run forkflow land <branch>` | the merge request is merged and the local trunk has not caught up: offer `/forkflow:land` with the branch it names - from any branch; plain `land` on a branch with a record of its own answers for that record only (on the trunk it lands every landed record) |
 | `pending  ... - cannot verify here` | `origin/<trunk>` or the pushed commit is not in this clone (a fresh fork not fetched yet, or a pushed branch deleted and pruned after its merge request was abandoned); not an error - after a fetch it may resolve; a commit that is gone for good is cleared with `forkflow land --force <branch>` (which keeps any branch) |
 
 `status` degrades rather than fails: a missing trunk on origin, a diverged mirror, an unfetched

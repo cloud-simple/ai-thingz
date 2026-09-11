@@ -116,6 +116,8 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    `--merge` merges and then ends with exit 2 "the merge request was merged; the local catch-up
    did not run": expected - `forkflow land <sync branch>` in the worktree the message names
    catches the trunk up (it cannot delete a branch the linked worktree still has checked out).
+   A merge the tool only queued is exit 6 there as anywhere, naming the same command and
+   worktree for once it is through.
 
 6. **Report.** Mirror advance (old -> new, pushed), the sync branch name, the merge commit, the
    number of upstream commits taken, the backup name and its rollback line, any `CHECK` rows and
