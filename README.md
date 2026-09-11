@@ -6,7 +6,7 @@ in the `ai-thingz` plugin marketplace.
 | skill | what it does |
 |---|---|
 | [`nocomment`](#nocomment) | turns the current feature branch into a code-only, comment-free review branch `nocomment/<branch>` |
-| [`forkflow`](#forkflow) | works a fork of a moving project: a pristine mirror of upstream, a protected MR-only trunk, and `status` / `sync` / `ship` / `setup` |
+| [`forkflow`](#forkflow) | works a fork of a moving project: a pristine mirror of upstream, a protected MR-only trunk, and `status` / `sync` / `ship` / `land` / `setup` |
 
 ## Install
 
@@ -24,7 +24,7 @@ Or link a single skill as a plain user skill, no plugin machinery:
 ln -s "$PWD/plugins/nocomment/skills/nocomment" ~/.claude/skills/nocomment
 ```
 
-That symlink install does **not** apply to `forkflow`: its four skills reach their script and their
+That symlink install does **not** apply to `forkflow`: its five skills reach their script and their
 rules through `${CLAUDE_PLUGIN_ROOT}`, which only exists when the plugin is installed as a plugin.
 
 Layout:
@@ -202,18 +202,20 @@ trunk anywhere. The mistake is impossible, not merely discouraged.
 Sequence rule: **sync first, then ship; rebase locally, merge globally.** The full text the skills
 read is [`plugins/forkflow/references/rules.md`](plugins/forkflow/references/rules.md).
 
-### The four skills
+### The five skills
 
 | skill | say | what it does |
 |---|---|---|
-| `/forkflow:status` | *"where are we vs upstream"*, *"how much has this fork diverged"* | one screen: mirror, trunk, `origin/*` and upstream, divergence and how much of it is upstream-tracked, what the current branch touches, whether the fork is set up. Read-only |
+| `/forkflow:status` | *"where are we vs upstream"*, *"how much has this fork diverged"* | one screen: mirror, trunk, `origin/*` and upstream, divergence and how much of it is upstream-tracked, what the current branch touches, whether the fork is set up, and whether the last ship or sync is still waiting to land. Read-only |
 | `/forkflow:sync` | *"sync upstream"*, *"pull in upstream"* | advance and push the mirror, then bring it into the trunk through `sync/<upstream>-<date>` + one `--no-ff` merge + an MR. Conflicts are resolved in the branch; a "both sides survived" table flags every file changed on both sides, because a clean merge is not automatically a correct one |
 | `/forkflow:ship` | *"ship this branch"*, *"squash and open the MR"* | take a feature branch to the trunk as **one** squashed commit (tree-hash verified) on top of a fresh `origin/<trunk>`, through an MR |
+| `/forkflow:land` | *"forkflow land"*, *"the MR merged"*, *"catch develop up"* | the closing step once the MR is merged: fetch, verify that the pushed commit is on `origin/<trunk>` (by ancestry, or by patch for a ship whose SHA a "squash and merge" or "rebase and merge" rewrote), fast-forward the local trunk, delete the landed local branch, leave you on the trunk. Not merged yet is exit 2, not an error |
 | `/forkflow:setup` | *"set up the fork"*, *"protect the trunk locally"* | make the rules mechanical: upstream push URL disabled, pre-push hook, ff-only merge config, trunk bootstrapped on a fresh fork, and a report of the platform's default branch / merge method / protection with the exact command to fix each mismatch |
 
 The script does the mechanical, testable work - divergence numbers, mirror advance, merge simulation,
-backups, merges, squash and tree-hash check, invariant checks, pushes, the MR command. Claude does
-the judgment: conflict resolution and MR wording. Nothing about it is specific to any one fork.
+backups, merges, squash and tree-hash check, invariant checks, pushes, the MR command, the opt-in
+merge and the landing. Claude does the judgment: conflict resolution and MR wording. Nothing about
+it is specific to any one fork.
 
 Directly:
 
@@ -221,14 +223,15 @@ Directly:
 S=plugins/forkflow/scripts/forkflow.py
 python3 $S status [--fetch]
 python3 $S check
-python3 $S sync [--continue] [--mr] [--title T]
-python3 $S ship [--continue] [--mr] [--title T] [--message-file F]
+python3 $S sync [--continue] [--mr] [--merge] [--title T]
+python3 $S ship [--continue] [--mr] [--merge] [--title T] [--message-file F]
+python3 $S land [--force]
 python3 $S setup [--upstream NAME] [--upstream-url URL] [--trunk NAME] [--mirror NAME]
 ```
 
 `-C DIR`, `--dry-run` and `--force` are accepted on every subcommand and may be given before or
-after it; `--force` only does something in `sync` (recreate the sync branch) and `setup` (replace a
-foreign pre-push hook).
+after it; `--force` only does something in `sync` (recreate the sync branch), `setup` (replace a
+foreign pre-push hook) and `land` (fast-forward a landing the tool cannot verify).
 `check` is the preflight `sync` and `ship` run themselves (upstream-tracked warning, configured gate
 commands, "is this branch on the trunk's tip"); it has no skill of its own - `status` surfaces it for
 humans. `--dry-run` creates no branch, commit, push, config or hook and moves no mirror, and still
@@ -264,9 +267,17 @@ upstream_branch = "main"     # its branch we track (default: upstream's HEAD)
 mirror = "main"              # our fast-forward-only copy of it (default: upstream_branch)
 trunk = "develop"            # protected, MR-only branch carrying our work
 gate = []                    # e.g. ["make test", "terraform fmt -check -recursive"]
+merge = "manual"             # "self": this fork's MRs are merged by whoever opened them - enables --merge
 sync_prefix = "sync/"
 backup_prefix = "backup/"
 ```
+
+`merge` is the fork's one-time declaration of who merges its merge requests. `"manual"` (the
+default) means somebody reviews and presses the button, and `--merge` is refused with exit 2 before
+anything is pushed; `"self"` means whoever opened the MR merges it, which lets `ship --merge` and
+`sync --merge` do so. Config *and* flag are needed - either alone does nothing - so a reviewed fork
+can never be merged by accident. The key is read from the working tree, tracked or not, which is
+where `setup` leaves the file.
 
 `gate` is the one key that is *run* rather than read - `sh -c` in the repo root, on every `check`,
 `sync` and `ship` - and `.forkflow.toml` is a tracked file a sync is designed to bring in from the
@@ -291,25 +302,54 @@ so) and a file of nothing but comments is read as no config at all.
 
 | code | meaning |
 |---|---|
-| `0` | done, dry run, or nothing to do (already in sync; nothing to ship). Also `--mr` when the tool is missing or fails - the branch is pushed and the command is printed |
+| `0` | done, dry run, or nothing to do (already in sync; nothing to ship). Also `--mr` when the tool is missing or fails, without `--merge` - the branch is pushed and the command is printed |
 | `1` | `--test` had failures |
-| `2` | precondition: dirty tree, detached HEAD, missing remote, unfetched upstream, unreadable `.forkflow.toml`, mirror diverged from upstream, trunk missing on origin, foreign pre-push hook, ... |
+| `2` | precondition: dirty tree, detached HEAD, missing remote, unfetched upstream, unreadable `.forkflow.toml`, mirror diverged from upstream, trunk missing on origin, foreign pre-push hook, `--merge` on a fork whose config does not say `merge = "self"`, `land` with nothing pending or with an MR that is not merged yet, ... |
 | `3` | invariant checked by `check`: a gate command failed, or the branch is not on the trunk's tip |
 | `4` | conflicts - resolve them, then rerun with `--continue` |
 | `5` | rewrite safety: backup not confirmed on origin, tree hash differs after the squash, push rejected |
+| `6` | `--merge` only: the merge request was not created or not merged (tool missing or failing, or the head-commit guard refused because the branch moved) - the branch is pushed and the MR, when created, is open; merge it by hand, then `forkflow land` |
 | `130` | interrupted |
 
 ### After the MR is merged
 
-The plugin never moves the local trunk. Once the MR has merged, catch up by hand - `setup`'s
-`--ff-only` config guarantees this cannot silently become a merge commit:
+The plugin moves the local trunk only by fast-forward, through `land`, and leaves you on it. Once
+the MR has merged:
 
 ```bash
-git fetch origin && git switch develop && git merge --ff-only origin/develop
+python3 $S land
 ```
 
-After a GitHub "Rebase and merge" of a ship MR, also delete the local feature branch: its commit SHA
-was rewritten.
+`land` finishes the most recent `ship` or `sync` this clone ran - the run that pushed a branch
+recorded what is waiting to land, so it works in any later session, and `status` shows the record
+on its `pending` line with the same verdict. It fetches; verifies that the recorded commit is on
+`origin/<trunk>` - by ancestry, or for a ship by patch, so a "squash and merge" or GitHub's "Rebase
+and merge" that gave the commit a new SHA is recognised too; checks the local trunk out (creating it
+from `origin/<trunk>` in a single-branch clone) and fast-forwards it with `git merge --ff-only`;
+deletes the landed local branch; forgets the record. A local trunk carrying commits origin lacks is
+refused untouched - the plugin never creates those. "Not on `origin/<trunk>` yet" is exit 2 and not
+an error: the MR is not merged, run it again once it is. A ship that landed as a merge commit lands
+with a WARNING - rule 5 asks for a fast-forward, and the shape is judged on the trunk's first-parent
+line.
+
+On a solo fork - one whose `.forkflow.toml` says `merge = "self"` - `ship --merge` and `sync
+--merge` are the shortcut: open the MR, merge it, land it, in one run. The merge is the method rule
+5 requires - on GitLab the project's own merge method (`glab mr merge ... --auto-merge=false`,
+which `setup`'s report insists is `ff`), on GitHub `gh pr merge --merge` for a sync and `--rebase`
+for a ship - always with a head-commit guard (`--sha` / `--match-head-commit`), so only the exact
+commit the run pushed can be merged. A merge that does not happen is exit 6 with the branch pushed
+and the MR open: merge by hand, then `forkflow land`. A merge that happened but whose catch-up could
+not run is exit 2 with a message that opens with "the merge request was merged".
+
+`land --force` is the escape for a landing the tool cannot see - an MR closed without merging, a
+sync squashed or rebased in the UI (a broken rule 5, which `land` says out loud): it fast-forwards
+the local trunk to whatever `origin/<trunk>` holds, **keeps** the branch, and clears the record. It
+does not help when the recorded commit is not in this clone at all: `land` needs the clone that ran
+the ship or the sync.
+
+After a GitHub "Rebase and merge" of a ship MR the local feature branch is deleted by `land` (its
+SHA was rewritten; the patch is recognised), but the remote branch may survive - `land` prints the
+`git push origin --delete <branch>` line and leaves that call to you.
 
 ### Adopting forkflow in an existing fork
 
@@ -342,11 +382,16 @@ python3 plugins/forkflow/scripts/forkflow.py --test
 The suite lives inside `forkflow.py` and needs no network and no `glab`/`gh`: it builds throwaway
 `upstream.git` / `origin.git` / work-clone triples, exercises every subcommand end to end, produces
 push rejections with a real `pre-receive` hook and stale leases with a narrowed refspec, drives the
-installed pre-push hook with real `git push` invocations, and fakes the platform CLIs on `PATH`. A
-source-invariant test parses the script with `ast`, maps every line to the function it sits in, and
-asserts that the git argument `push` appears only in the three push helpers, `update-ref` and
-`merge --ff-only` only in `advance_mirror`, `rebase` only in `rebase_onto`, `--force-with-lease` only
-in `push()`, and that no git call anywhere passes `--force` or `--no-verify`.
+installed pre-push hook with real `git push` invocations, and fakes the platform CLIs on `PATH` -
+including one that merges the way the platform would and refuses a head-commit guard that does not
+match, so `--merge` and `land` are exercised end to end. A source-invariant test parses the script
+with `ast`, maps every line to the function it sits in, and asserts that the git argument `push`
+appears only in the three push helpers, `update-ref` only in `advance_mirror`, `merge --ff-only`
+only in `advance_mirror` and `land_trunk` (the plugin's two fast-forwards: the mirror advance and
+the trunk landing), `rebase` only in `rebase_onto`, `--force-with-lease` only in `push()`, that the
+only functions starting a subprocess are the git wrappers, `shell` (the gate), `run_tool` (the
+platform CLI for `--mr` and `--merge`) and `api_get`, and that no git call anywhere passes `--force`
+or `--no-verify`.
 
 ### Versions
 
@@ -356,5 +401,6 @@ marketplace cache directory is named after it). What each one carries:
 
 | version | what changed |
 |---|---|
+| `0.2.0` | `land` subcommand: once the MR is merged, fetch, verify that the pushed commit is on `origin/<trunk>` (by ancestry, or by patch for a ship whose SHA was rewritten), fast-forward the local trunk, delete the landed branch and leave you on the trunk - the printed shell catch-up line is retired for `next: forkflow land`; `--merge` on `sync` and `ship`, behind `merge = "self"` in `.forkflow.toml`, merges the MR the run opened with the method rule 5 requires and a head-commit guard, then lands it; exit `6` for a merge request not created or not merged; `status` shows the `pending` ship or sync and whether it has landed |
 | `0.1.1` | `status` asks the upstream server whether its branch moved instead of trusting the last fetch (`--offline` opts out); `--mr` passes `--yes` to `glab` and runs the tool with stdin closed, so it no longer stops at a confirmation prompt. Earlier fixes that shipped under `0.1.0` and are worth knowing about: every `gh`/`glab` command names the fork with `--repo` rather than resolving to the original project; the sync gate guard compares committed config to committed config; `file://localhost/` spellings of the upstream URL are refused by the hook |
 | `0.1.0` | first release |

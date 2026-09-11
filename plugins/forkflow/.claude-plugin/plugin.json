@@ -1,7 +1,7 @@
 {
   "name": "forkflow",
-  "description": "Fork <-> upstream workflow: a pristine mirror of upstream, a protected MR-only trunk, and status/sync/ship/setup helpers that never push or rebase the trunk",
-  "version": "0.1.1",
+  "description": "Fork <-> upstream workflow: a pristine mirror of upstream, a protected MR-only trunk, and status/sync/ship/land/setup helpers that never push or rebase the trunk",
+  "version": "0.2.0",
   "author": {
     "name": "mtilson"
   },

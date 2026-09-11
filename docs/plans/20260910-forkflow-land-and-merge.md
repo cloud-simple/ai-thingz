@@ -499,11 +499,12 @@ commit is not in this clone the line degrades to `... - cannot verify here` and 
 - Modify: `.claude-plugin/marketplace.json`
 - Delete: `docs/backlog/no-post-merge-catch-up-step.md`
 
-- [ ] README `## forkflow`: the stance sentence becomes "moves the local trunk only by fast-forward, through `land`, and leaves you on it"; *The four skills* becomes five with a `land` row; usage block gains `land [--force]` and `[--merge]`; *Configuration* gains `merge`; *Exit codes* row 0 gains "without `--merge`" and row 6 is added; *After the MR is merged* becomes `forkflow land` (with `--merge` as the solo-fork shortcut, `land --force` as the escape, and the GitHub remote-delete note kept); *Tests* paragraph's invariant prose gains `land_trunk` as the second `merge --ff-only` owner and `run_tool` in place of `open_mr`
-- [ ] README *Versions*: `0.2.0` row - `land` subcommand, `--merge` behind `merge = "self"`, exit 6, `pending` in `status`; `plugin.json` version `0.1.1` -> `0.2.0` and its `description` names the five helpers; `.claude-plugin/marketplace.json`'s forkflow `description` likewise
-- [ ] `git rm docs/backlog/no-post-merge-catch-up-step.md` in this task's commit (backlog lifecycle: the item is removed by the commit that lands its fix)
-- [ ] update CLAUDE.md if new patterns discovered (none expected - the repo has no CLAUDE.md)
-- [ ] move this plan to `docs/plans/completed/`
+- [x] README `## forkflow`: the stance sentence becomes "moves the local trunk only by fast-forward, through `land`, and leaves you on it"; *The four skills* becomes five with a `land` row; usage block gains `land [--force]` and `[--merge]`; *Configuration* gains `merge`; *Exit codes* row 0 gains "without `--merge`" and row 6 is added; *After the MR is merged* becomes `forkflow land` (with `--merge` as the solo-fork shortcut, `land --force` as the escape, and the GitHub remote-delete note kept); *Tests* paragraph's invariant prose gains `land_trunk` as the second `merge --ff-only` owner and `run_tool` in place of `open_mr`
+  - the README's *Tests* paragraph never named `open_mr` or the subprocess invariant, so a clause naming the pinned owner set (git wrappers, `shell`, `run_tool`, `api_get`) was added rather than a word swapped; every claim checked against `cmd_land`, `land_pending`, `land_trunk`, `landed`, `merge_gate`, `merge_mr`, `land_after_merge`, `pending_verdict`, the docstring exit table and the five SKILL.md files (the rule-5 WARNING is judged on the trunk's first-parent line; `--force` does not help when the commit is not in this clone)
+- [x] README *Versions*: `0.2.0` row - `land` subcommand, `--merge` behind `merge = "self"`, exit 6, `pending` in `status`; `plugin.json` version `0.1.1` -> `0.2.0` and its `description` names the five helpers; `.claude-plugin/marketplace.json`'s forkflow `description` likewise
+- [x] `git rm docs/backlog/no-post-merge-catch-up-step.md` in this task's commit (backlog lifecycle: the item is removed by the commit that lands its fix)
+- [x] update CLAUDE.md if new patterns discovered (none expected - the repo has no CLAUDE.md) - none discovered; the repo has no CLAUDE.md and none was created
+- [x] move this plan to `docs/plans/completed/` - performed by the exec harness after all phases finish, not by this task
 
 ## Post-Completion
 *Items requiring manual intervention or external systems - no checkboxes, informational only*
