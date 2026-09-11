@@ -162,7 +162,8 @@ Two additions and one record, in the existing single-script shape:
 
 - **`merge` config key** (`"manual"` default | `"self"`), read like every other key, on `Ctx`. The
   gate for `--merge` is *config AND flag*: the fork declares its model once in `.forkflow.toml`
-  (tracked or not - `load_config` reads the working tree, which is where `setup` leaves the file);
+  (tracked or not - `load_config` reads the working tree, which is where `setup` leaves the file;
+  ⚠️ iteration 4: `merge` alone is read by `fork_merge_mode`, see *Config*);
   the flag asks for it per run; either alone does nothing.
 - **`--merge`** on `ship` and `sync` implies `--mr`, is refused with exit 2 before anything is
   pushed unless `merge == "self"` and the fork's origin can be named, and after `open_mr` runs the
@@ -216,6 +217,20 @@ with `Fail(2)`. `Ctx.merge: str = "manual"`, set in `resolve_ctx`. `finish_sync`
 # merge = "manual"            # "self": this fork's MRs are merged by whoever opened them - enables --merge
 ```
 
+⚠️ deviation (review phase 1, iteration 4): `merge` is NOT read "from the working tree, tracked or
+not". That decision was the root cause of the fourth upstream-writable route to the `--merge` gate
+(the working tree on `--continue`; a case-variant file; a sync branch left checked out, whose tree
+holds upstream's `.forkflow.toml` - `sync --force --merge` from there merged a reviewed fork's sync).
+There is no `Ctx.merge`; one reader, `fork_merge_mode(ctx)`, reads the fork's mode only from the
+`.forkflow.toml` committed on `origin/<trunk>` (case-folding `config_text`) - unless the commit that
+last wrote it there is upstream's (`written_by_upstream`: a trunk bootstrapped from an upstream that
+tracks the file) - or, while none is committed there, the fork's own untracked file (in none of the
+index, HEAD or MERGE_HEAD under any case). Never the checked-out branch's tree. The setup case keeps
+working: a fresh fork's untracked `.forkflow.toml` says "self"; the one ship that first commits it is
+`--mr`, merged by hand. `merge_gate` and `merge_mr` (right before the merge command, fresh and
+resumed runs alike; exit 6 when it no longer says "self") both call it, and
+`TestSourceInvariants.test_every_merge_decision_goes_through_fork_merge_mode` holds that.
+
 ### Flags and dispatch
 
 - `sync` and `ship` gain `--merge` ("open the merge request and merge it; needs merge = \"self\" in
@@ -250,6 +265,10 @@ case evaded both that check and the `gate` guard. On a case-insensitive filesyst
 exactly `.forkflow.toml` and refuses a case variant (exit 2, naming it); "is it tracked"
 (`config_tracked`, a `:(icase)` pathspec) and "what did this revision carry" (`config_text`, the
 exact name first, else a case variant in the tree) treat a variant as the file.
+
+⚠️ iteration 4: condition 1 is `fork_merge_mode(ctx) != "self"` (see the deviation under *Config*);
+`merge_mode_arrived_in_merge` is gone - the working tree is no longer a source, so there is nothing
+for it to compare. On `sync --continue` the refusal still names `sync --continue --mr`.
 
 Placement: in `cmd_ship`, inside/after `ship_preflight` (which already runs before its `--continue`
 branch). In `cmd_sync`, **immediately after `header(ctx, "sync")` and before the `--continue`

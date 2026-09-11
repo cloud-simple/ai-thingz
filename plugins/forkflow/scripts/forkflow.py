@@ -268,6 +268,15 @@ def config_name_in(names: Sequence[str]) -> Optional[str]:
     return variants[0] if variants else None
 
 
+def tracked_config_names(root: str) -> list:
+    """Every path in the index that is `.forkflow.toml` under some case of its name (each
+    stage of an unmerged one once). Every tracked path is read and case-folded, rather
+    than asked for with `:(icase)`, which matches ASCII case only."""
+    rc, out, _ = git_rc("ls-files", "-z", cwd=root)
+    fold = CONFIG_FILE.casefold()
+    return sorted({p for p in out.split("\0") if p and p.casefold() == fold}) if rc == 0 else []
+
+
 def variant_remedy(root: str, found: str) -> str:
     """The way from `found`, a case variant of the config, to `.forkflow.toml` that loses
     nothing - the second half of `load_config`'s refusal.
@@ -288,9 +297,7 @@ def variant_remedy(root: str, found: str) -> str:
 
     Every tracked path is read and case-folded here, rather than asked for with `:(icase)`,
     which matches ASCII case only."""
-    rc, out, _ = git_rc("ls-files", "-z", cwd=root)
-    fold = CONFIG_FILE.casefold()
-    tracked = sorted({p for p in out.split("\0") if p and p.casefold() == fold}) if rc == 0 else []
+    tracked = tracked_config_names(root)
     variants = [p for p in tracked if p != CONFIG_FILE]
     again = "then commit, and run the forkflow command again"
     if git_ok("cat-file", "-e", f"HEAD:{CONFIG_FILE}", cwd=root):
@@ -380,7 +387,7 @@ class Ctx:
     dry_run: bool = False
     sync_prefix: str = DEFAULT_SYNC_PREFIX
     backup_prefix: str = DEFAULT_BACKUP_PREFIX
-    merge: str = MERGE_MODES[0]          # "manual": see CONFIG_STRINGS
+    # no `merge` here: the working tree's config is not where it is read - `fork_merge_mode`
 
     def up(self) -> str:
         return f"{self.upstream}/{self.upstream_branch}"
@@ -657,8 +664,7 @@ def resolve_ctx(cwd: str, args: Optional[argparse.Namespace] = None, need_upstre
               upstream=upstream, upstream_url=upstream_url, upstream_branch=ub,
               trunk=trunk, mirror=mirror,
               dry_run=bool(getattr(args, "dry_run", False)),
-              sync_prefix=sync_prefix, backup_prefix=backup_prefix,
-              merge=cfg.get("merge") or MERGE_MODES[0])
+              sync_prefix=sync_prefix, backup_prefix=backup_prefix)
     ctx.platform = detect_platform(ctx.origin_url)
 
     local_mirror = has_ref(root, f"refs/heads/{ctx.mirror}")
@@ -1644,7 +1650,12 @@ def merge_mr(ctx: Ctx, kind: str, branch: str, url: str) -> None:
     merge - which includes a request already open for the branch, whose `create` fails;
     `--merge` merges only what it opened. A dry run shows the merge and the landing it
     would chain into and runs neither. `merge_gate` has made sure the fork can be named,
-    so `merge_command` always has a command here."""
+    so `merge_command` always has a command here.
+
+    `merge = "self"` is asked again first (`fork_merge_mode`), for a fresh run and a
+    resumed one alike: the gate read `origin/<trunk>` before this run's fetch moved it and
+    before the sync merge touched the tree, and this is the last point where not merging
+    costs nothing - the request stays open for a person to merge, which is exit 6."""
     head = "<pushed head>" if ctx.dry_run else rev(ctx.root, f"refs/heads/{branch}")
     cmd = merge_command(ctx, kind, branch, head)
     shown = " ".join(shlex.quote(c) for c in cmd)
@@ -1652,6 +1663,12 @@ def merge_mr(ctx: Ctx, kind: str, branch: str, url: str) -> None:
         step("merge", shown, "not run (dry run)", dry=True)
         step("land", "forkflow land", "not run (dry run)", dry=True)
         return
+    if fork_merge_mode(ctx) != "self":
+        step("merge", shown, "NOT RUN: this fork's config does not say merge = \"self\" now")
+        raise Fail(f"--merge needs `merge = \"self\"` in this fork's own config - "
+                   f"{fork_merge_source(ctx)} - and after this run's fetch and merge it does "
+                   f"not say that: the branch is pushed and the merge request is open; have "
+                   f"it merged by hand, then: forkflow land", EXIT_NOT_MERGED)
     if not url:
         raise Fail(f"the merge request was not created by this run (or one was already open "
                    f"for `{branch}`) - the branch is pushed; open or find it and merge it by "
@@ -1789,12 +1806,19 @@ def config_text(ctx: Ctx, revision: str) -> Optional[str]:
     (the exact name wins where a case-sensitive clone holds both): it is the file a
     case-insensitive checkout opens under that name, so "what did the merge bring in" has to
     see it - git's own `<rev>:<path>` matches case-exactly and would read it as absent."""
-    rc, out, _ = git_rc("ls-tree", "-z", "--name-only", revision, cwd=ctx.root)
-    name = config_name_in(out.split("\0")) if rc == 0 else CONFIG_FILE
+    name = config_name_at(ctx, revision)
     if name is None:
         return None
     rc, out, _ = git_rc("show", f"{revision}:{name}", cwd=ctx.root)
     return out if rc == 0 else None
+
+
+def config_name_at(ctx: Ctx, revision: str) -> Optional[str]:
+    """The name `.forkflow.toml` has in `revision`'s tree under any case of it (see
+    `config_text`), None when the tree holds none - and the exact name when the tree cannot
+    be listed, so the caller's `git show` gives the answer."""
+    rc, out, _ = git_rc("ls-tree", "-z", "--name-only", revision, cwd=ctx.root)
+    return config_name_in(out.split("\0")) if rc == 0 else CONFIG_FILE
 
 
 def config_tracked(ctx: Ctx) -> bool:
@@ -2195,26 +2219,31 @@ def same_file(root: str, a: str, b: str) -> bool:
         return False
 
 
-def in_the_way_advice(ctx: Ctx, paths: Sequence[str], rerun: str, ship: str) -> str:
+def in_the_way_advice(ctx: Ctx, paths: Sequence[str], rerun: str,
+                      args: Optional[argparse.Namespace]) -> str:
     """What to do about untracked files a sync merge would write over - never "delete them".
 
     The config is its own answer: `setup` leaves `.forkflow.toml` untracked, and it is this
     fork's - a gate, the branch names, `merge`. It goes into the trunk the way everything
     does (a branch, `ship`), and the next sync then meets upstream's copy as a tracked file,
-    where the merge shows the two side by side. Any other file is moved out of the tree: on
-    a case-insensitive filesystem the name git lists may be another spelling of one of the
-    user's own files, so a removal can take a file that was never upstream's."""
+    where the merge shows the two side by side. That ship is `--mr`, not `--merge`: once the
+    file is committed on a branch it is neither untracked nor on `origin/<trunk>`, so
+    `fork_merge_mode` has no `merge = "self"` to read until a person has merged it. Any
+    other file is moved out of the tree: on a case-insensitive filesystem the name git lists
+    may be another spelling of one of the user's own files, so a removal can take a file
+    that was never upstream's."""
     trunk = f"{ctx.origin}/{ctx.trunk}"
     if any(p.casefold() == CONFIG_FILE.casefold() for p in paths):
+        ship = rerun_cmd("ship", argparse.Namespace(mr=bool(getattr(args, "mr", False))))
         return (f"`{CONFIG_FILE}` is this fork's own config, untracked (as `forkflow setup` "
                 f"leaves it), and upstream tracks a `{CONFIG_FILE}` - under that name or "
                 f"another case of it, which a case-insensitive filesystem makes the same "
                 f"file. Do not delete or rename it: commit it on a branch off `{trunk}` and "
-                f"`{ship}` it, so it is on `{trunk}`; then {rerun}")
+                f"`{ship}` it, have that merged, so it is on `{trunk}`; then {rerun}")
     return (f"Move them out of the working tree (they are not deleted that way - on a "
             f"case-insensitive filesystem a name git lists can be another spelling of a file "
             f"of yours), or get them into `{trunk}` first (commit them on a branch and "
-            f"`{ship}` it); then {rerun}")
+            f"`{rerun_cmd('ship', args)}` it); then {rerun}")
 
 
 def rerun_cmd(kind: str, args: Optional[argparse.Namespace], extra: str = "") -> str:
@@ -2267,7 +2296,7 @@ def merge_upstream(ctx: Ctx, name: str, target: str, commits: Sequence[str],
             advice = in_the_way_advice(
                 ctx, paths, f"rerun the sync with `{rerun_cmd('sync', args, ' --force')}` "
                             f"(`{name}` was already created, and only `--force` recreates it)",
-                rerun_cmd("ship", args))
+                args)
             raise Fail(f"the merge would overwrite untracked file(s) in the working tree, "
                        f"which git refuses outright. {advice}:\n{text}")
         raise Fail(f"merge of {short(target)} failed:\n{text}")
@@ -2427,7 +2456,7 @@ def sync_merge_commit(ctx: Ctx) -> str:
 
 def merge_mode_at(ctx: Ctx, revision: str) -> Optional[str]:
     """`merge` as `.forkflow.toml` carried it at `revision`: the default when there is no
-    file there, None when it cannot be read (which the caller treats as changed)."""
+    file there, None when it cannot be read."""
     text = config_text(ctx, revision)
     if text is None:
         return MERGE_MODES[0]
@@ -2438,28 +2467,76 @@ def merge_mode_at(ctx: Ctx, revision: str) -> Optional[str]:
     return cfg.get("merge") or MERGE_MODES[0]
 
 
-def merge_mode_arrived_in_merge(ctx: Ctx) -> bool:
-    """True when the `merge` a `sync --continue` would obey is not the fork's own.
+def written_by_upstream(ctx: Ctx, revision: str) -> bool:
+    """True when the `.forkflow.toml` `revision` holds was last written by a commit of the
+    original project - one reachable from `<upstream>/<branch>` or the mirror on origin -
+    or when that cannot be told.
 
-    `resolve_ctx` reads `merge` from the working tree, and on `--continue` that tree is the
-    sync's merge - upstream's `.forkflow.toml` included. A `merge = "self"` the original
-    project carries would otherwise switch off the half of the `--merge` gate that protects
-    a reviewed fork. The fork's side is the branch before the merge: `HEAD` while the merge
-    is uncommitted, `<merge>^1` once it is - the same comparison `gate_arrived_in_merge`
-    makes for `gate`. An untracked file is the fork's own: no merge writes one (git refuses
-    a merge that would overwrite it), and it is where `setup` leaves the config. Tracked
-    means under any case of the name: `ls-files --error-unmatch` matched case-exactly and
-    read upstream's `.ForkFlow.toml` as "untracked, the fork's own"."""
-    if not config_tracked(ctx):
+    That is the trunk a fresh fork bootstraps: `origin/<trunk>` starts as a copy of
+    upstream, and an upstream that tracks the file hands this fork its `merge` with nobody
+    here having written or reviewed it - which stays so through every later ship that does
+    not touch the file. `git log -- <path>` follows the parent the file came from, so a
+    sync merge that took upstream's copy unchanged answers with upstream's commit too."""
+    name = config_name_at(ctx, revision) or CONFIG_FILE
+    rc, out, _ = git_rc("log", "-1", "--format=%H", revision, "--", name, cwd=ctx.root)
+    last = out.strip()
+    if rc != 0 or not last:
+        return True
+    for ref in (f"refs/remotes/{ctx.up()}", f"refs/remotes/{ctx.origin}/{ctx.mirror}"):
+        if has_ref(ctx.root, ref) and git_ok("merge-base", "--is-ancestor", last, ref,
+                                             cwd=ctx.root):
+            return True
+    return False
+
+
+def own_untracked_config(ctx: Ctx) -> bool:
+    """True when the working tree's `.forkflow.toml` is this fork's own untracked file - the
+    one `setup` leaves: listed under exactly that name, and under no case of the name in
+    the index, in HEAD, or in the MERGE_HEAD of a merge in progress. A file any of those
+    holds may be one a commit of the original project put there."""
+    try:
+        if CONFIG_FILE not in os.listdir(ctx.root):
+            return False
+    except OSError:
         return False
-    if merge_in_progress(ctx):
-        side = "HEAD"
-    else:
-        sha = sync_merge_commit(ctx)
-        if not sha:
-            return False                  # nothing to continue: `cmd_sync_continue` says so
-        side = f"{sha}^1"
-    return merge_mode_at(ctx, side) != ctx.merge
+    if tracked_config_names(ctx.root):
+        return False
+    revisions = ["HEAD"] + (["MERGE_HEAD"] if merge_in_progress(ctx) else [])
+    return all(config_name_at(ctx, rev) is None for rev in revisions)
+
+
+def fork_merge_mode(ctx: Ctx) -> str:
+    """This fork's `merge`, "self" or "manual" - the one reader every `--merge` decision goes
+    through: `merge_gate` before anything is pushed, and `merge_mr` again right before the
+    merge command runs.
+
+    Read only from where the original project cannot write it:
+
+    - the config committed on `origin/<trunk>` (any case of the name, `config_text`) -
+      this fork's reviewed state - unless upstream's commit is what wrote it there
+      (`written_by_upstream`);
+    - while none is committed there, the fork's own untracked `.forkflow.toml`, where
+      `setup` leaves it (`own_untracked_config`).
+
+    Never from the checked-out branch's committed tree, nor from a tree a sync merge has
+    touched: a sync branch carries upstream's `.forkflow.toml`, and reading `merge` from the
+    working tree let upstream's `merge = "self"` merge a reviewed fork's sync four ways -
+    on `--continue`, under a case variant of the name, and from a sync branch left checked
+    out. Anything else - no file, a file that cannot be read - is "manual"."""
+    trunk_ref = f"{ctx.origin}/{ctx.trunk}"
+    if has_ref(ctx.root, f"refs/remotes/{trunk_ref}") and config_name_at(ctx, trunk_ref):
+        if written_by_upstream(ctx, trunk_ref):
+            return MERGE_MODES[0]
+        return merge_mode_at(ctx, trunk_ref) or MERGE_MODES[0]
+    if own_untracked_config(ctx):
+        return load_config(ctx.root).get("merge") or MERGE_MODES[0]
+    return MERGE_MODES[0]
+
+
+def fork_merge_source(ctx: Ctx) -> str:
+    """Where `fork_merge_mode` reads it, for the messages that refuse `--merge`."""
+    return (f"the `{CONFIG_FILE}` committed on `{ctx.origin}/{ctx.trunk}` - or, while none "
+            f"is committed there, an untracked `{CONFIG_FILE}` in the working tree")
 
 
 def cmd_sync_continue(ctx: Ctx, args: argparse.Namespace) -> int:
@@ -2525,24 +2602,22 @@ def merge_gate(ctx: Ctx, args: argparse.Namespace, resume_sync: bool = False,
 
     Config AND flag: the fork declares once, in `.forkflow.toml`, that its merge requests are
     merged by whoever opened them (`merge = "self"`), and the flag asks for it per run. Either
-    alone does nothing, so a reviewed fork can never be merged by accident. On `sync
-    --continue` (`resume_sync`) the declaration has to be the fork's own and not one the
-    sync's merge brought in from the original project (`merge_mode_arrived_in_merge`). The
-    last check is knowable now too: a merge command addresses the fork by URL (`mr_target`),
-    and an origin that names no project would otherwise be a push followed by a failure."""
+    alone does nothing, so a reviewed fork can never be merged by accident. The declaration
+    is the fork's own - `fork_merge_mode`, never the checked-out tree, which on a sync branch
+    or a resumed sync holds upstream's file. The last check is knowable now too: a merge
+    command addresses the fork by URL (`mr_target`), and an origin that names no project
+    would otherwise be a push followed by a failure."""
     if not getattr(args, "merge", False):
         return
-    if ctx.merge != "self":
-        raise Fail(f"--merge needs `merge = \"self\"` in {CONFIG_FILE}: this fork's merge "
-                   f"requests are merged by hand")
-    if resume_sync and merge_mode_arrived_in_merge(ctx):
-        # the resume named keeps `--mr` (which `--merge` implies): it still opens the request
-        # the reviewer has to merge, only the merge itself is left out
-        by_hand = continue_cmd("sync", argparse.Namespace(mr=True))
-        raise Fail(f"--merge: `merge = \"self\"` in {CONFIG_FILE} came in with this sync's "
-                   f"merge - it is not what this fork's own config says. Run `{by_hand}` - "
-                   f"without --merge - and have the merge request merged by hand; the reviewer "
-                   f"sees the config change in it")
+    if fork_merge_mode(ctx) != "self":
+        # a resumed sync has a merge made and a branch to finish: the resume named keeps
+        # `--mr` (which `--merge` implies), so it still opens the request the reviewer merges
+        by_hand = (f" Resume without it - `{continue_cmd('sync', argparse.Namespace(mr=True))}`"
+                   f" - and have the merge request merged by hand." if resume_sync else "")
+        raise Fail(f"--merge needs `merge = \"self\"` in this fork's own config - "
+                   f"{fork_merge_source(ctx)}; a `{CONFIG_FILE}` the checked-out branch "
+                   f"carries is not read for it. This fork's merge requests are merged by "
+                   f"hand.{by_hand}")
     target, reason = mr_target(ctx)
     if not target:
         raise Fail(f"--merge: `{ctx.origin_url or '-'}` names no project to merge on "
@@ -2608,7 +2683,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         raise Fail(f"git refuses a merge that would overwrite an untracked file, and nothing "
                    f"was backed up or branched for this sync. "
                    + in_the_way_advice(ctx, blocked, f"run `{rerun_cmd('sync', args)}` again",
-                                       rerun_cmd("ship", args)))
+                                       args))
 
     log = git("log", "--oneline", "--no-decorate", f"{ctx.origin}/{ctx.trunk}..{target}",
               cwd=ctx.root, check=False)
@@ -3505,7 +3580,7 @@ def template_text(ctx: Ctx) -> str:
         (f'mirror = {toml_string(ctx.mirror)}', "our fast-forward-only copy of it"),
         (f'trunk = {toml_string(ctx.trunk)}', "protected, MR-only branch with our work"),
         ("gate = []", 'e.g. ["make test", "terraform fmt"]'),
-        (f'merge = {toml_string(ctx.merge)}',
+        (f'merge = {toml_string(MERGE_MODES[0])}',
          '"self": this fork\'s MRs are merged by whoever opened them - enables --merge'),
         (f'sync_prefix = {toml_string(ctx.sync_prefix)}', ""),
         (f'backup_prefix = {toml_string(ctx.backup_prefix)}', ""),
@@ -5222,17 +5297,6 @@ def run_tests() -> None:
             ctx = ctx_for(fork)
             self.assertEqual((ctx.trunk, ctx.mirror), ("trunk", "upstream-main"))
             self.assertEqual(ctx.up(), "upstream/main")
-
-        def test_merge_defaults_to_manual(self):
-            """No config, no `merge` key: the fork's merge requests are merged by hand."""
-            self.assertEqual(ctx_for(make_fork(self.tmp)).merge, "manual")
-
-        @needs_tomllib
-        def test_merge_is_read_from_the_config(self):
-            fork = make_fork(self.tmp, config='merge = "self"\n')
-            self.assertEqual(ctx_for(fork).merge, "self")
-            write(fork, CONFIG_FILE, 'merge = "manual"\n')       # the working tree decides
-            self.assertEqual(ctx_for(fork).merge, "manual")
 
         def test_upstream_head_master_fallback(self):
             fork = make_fork(self.tmp)
@@ -12080,6 +12144,134 @@ def run_tests() -> None:
             self.assertEqual(code, 0, err2 + out)
             self.merged_and_landed(fork, name)
 
+    @needs_tomllib
+    class TestForkMergeMode(ShipBase):
+        """`fork_merge_mode` reads `merge` only where the original project cannot write it:
+        the config committed on `origin/<trunk>` by this fork, or - while none is committed
+        there - the fork's own untracked `.forkflow.toml`. Everything else is "manual"."""
+
+        def mode(self, fork: str) -> str:
+            return fork_merge_mode(ctx_for(fork))
+
+        def test_no_config_anywhere_is_manual(self):
+            self.assertEqual(self.mode(make_fork(self.tmp)), "manual")
+
+        def test_the_config_committed_on_the_remote_trunk_is_read(self):
+            """And only that one: the checked-out branch committing, or the working tree
+            holding, another value changes nothing."""
+            fork = make_fork(self.tmp, config='merge = "self"\n')
+            self.assertEqual(self.mode(fork), "self")
+            sh("git", "checkout", "-q", "-b", "feat/x", cwd=fork)
+            commit_fork(fork, CONFIG_FILE, 'merge = "manual"\n', "ours: manual on a branch")
+            self.assertEqual(self.mode(fork), "self")
+            sh("git", "checkout", "-q", "develop", cwd=fork)
+            write(fork, CONFIG_FILE, 'merge = "manual"\n')         # an uncommitted edit
+            self.assertEqual(self.mode(fork), "self")
+
+        def test_the_checked_out_branch_is_not_read(self):
+            """Nothing committed on the trunk: a branch whose tree says "self" - a sync branch
+            carrying upstream's file, or a feature branch - is not this fork's config."""
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "-q", "-b", "sync/upstream-x", cwd=fork)
+            commit_fork(fork, CONFIG_FILE, 'merge = "self"\n', "a tree that says self")
+            self.assertEqual(self.mode(fork), "manual")
+
+        def test_an_untracked_file_is_read_while_nothing_is_committed(self):
+            """Untracked only: staged, the file is on its way into a commit - as a stopped
+            `git cherry-pick` of upstream's commit leaves it, with no MERGE_HEAD to tell."""
+            fork = make_fork(self.tmp)
+            write(fork, CONFIG_FILE, 'merge = "self"\n')
+            self.assertEqual(self.mode(fork), "self")
+            sh("git", "add", CONFIG_FILE, cwd=fork)
+            self.assertEqual(self.mode(fork), "manual")
+
+        def test_the_committed_config_wins_over_an_untracked_file(self):
+            """A branch from before the config was committed, with an untracked file of its
+            own: `origin/<trunk>`'s committed "manual" is what counts."""
+            fork = make_fork(self.tmp, config='merge = "manual"\n')
+            sh("git", "checkout", "-q", "-b", "old", "main", cwd=fork)
+            write(fork, CONFIG_FILE, 'merge = "self"\n')
+            self.assertIn("?? " + CONFIG_FILE, sh("git", "status", "--porcelain", cwd=fork))
+            self.assertEqual(self.mode(fork), "manual")
+
+        def test_a_file_head_or_a_merge_in_progress_holds_is_not_untracked(self):
+            """Taken out of the index by hand, a file HEAD - or the MERGE_HEAD of a merge in
+            progress - holds is still one a commit put there, and may be upstream's."""
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "-q", "-b", "side", cwd=fork)
+            commit_fork(fork, CONFIG_FILE, 'merge = "self"\n', "side: says self")
+            sh("git", "rm", "-q", "--cached", CONFIG_FILE, cwd=fork)
+            self.assertEqual(self.mode(fork), "manual")                   # HEAD holds it
+            sh("git", "reset", "-q", "--hard", "HEAD", cwd=fork)
+            sh("git", "checkout", "-q", "develop", cwd=fork)
+            commit_fork(fork, "src/app.py", "ours\n", "ours: app")
+            sh("git", "checkout", "-q", "side", cwd=fork)
+            commit_fork(fork, "src/app.py", "side\n", "side: app")
+            sh("git", "checkout", "-q", "develop", cwd=fork)
+            sh("git", "merge", "side", cwd=fork, check=False)           # stops on src/app.py
+            self.assertTrue(merge_in_progress(ctx_for(fork)))
+            sh("git", "rm", "-q", "--cached", CONFIG_FILE, cwd=fork)
+            self.assertEqual(self.mode(fork), "manual")                   # MERGE_HEAD holds it
+
+        def test_a_config_upstream_wrote_on_the_trunk_is_not_the_forks(self):
+            """A trunk bootstrapped from an upstream that tracks the file: upstream's
+            `merge = "self"` is on `origin/<trunk>` with nobody here having written it - and
+            stays upstream's through a ship that does not touch it. A commit of this fork's
+            that writes the file makes it the fork's."""
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, CONFIG_FILE, 'merge = "self"\n', "theirs: forkflow")
+            push_upstream_into_origin(self.tmp, "develop")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertEqual(sh("git", "show", "origin/develop:" + CONFIG_FILE, cwd=fork),
+                             'merge = "self"')
+            self.assertEqual(self.mode(fork), "manual")
+            second_clone_commit(self.tmp)                                # a ship, not the file
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertEqual(self.mode(fork), "manual")
+            second_clone_commit(self.tmp, path=CONFIG_FILE,
+                                content='merge = "self"\ngate = []\n')   # the fork writes it
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertEqual(self.mode(fork), "self")
+
+    class TestMergeModeAskedAgainBeforeTheMerge(MergeBase):
+        """The gate reads `origin/<trunk>` before the run's own fetch; `merge_mr` asks
+        `fork_merge_mode` again right before the merge command. A teammate's commit that
+        turned the fork "manual" is on origin but not fetched yet: the gate passes on the
+        stale ref, and the run must end with the request open and nothing merged - exit 6,
+        the record kept for `land`."""
+
+        def stale_self_fork(self) -> Tuple[str, str]:
+            fork = self.self_fork()
+            turned = second_clone_commit(self.tmp, path=CONFIG_FILE,
+                                         content='merge = "manual"\n')
+            self.assertEqual(sh("git", "show", "origin/develop:" + CONFIG_FILE, cwd=fork),
+                             'merge = "self"')                     # what the gate reads
+            return fork, turned
+
+        def not_merged(self, fork: str, branch: str, turned: str, code: int, out: str) -> None:
+            self.assertEqual(code, EXIT_NOT_MERGED, out)
+            self.assertEqual(self.argv("gitlab", "merge"), [])
+            self.assertEqual(self.argv("gitlab", "create")[:2], ["mr", "create"])
+            self.assertEqual(origin_sha(fork, "develop"), turned)
+            self.assertEqual(origin_sha(fork, branch), rev(fork, "refs/heads/" + branch))
+            self.assertEqual(self.pending_of(fork, branch)["commit"],
+                             rev(fork, "refs/heads/" + branch))
+
+        def test_a_sync(self):
+            fork, turned = self.stale_self_fork()
+            self.upstream_change()
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.not_merged(fork, sync_branch_name(), turned, code, err + out)
+
+        def test_a_ship(self):
+            fork, turned = self.stale_self_fork()
+            name = self.feature(fork)
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.not_merged(fork, name, turned, code, err + out)
+
     class TestMergeGate(ShipBase):
         """`--merge` is config AND flag, refused before the fetch, the backup and any push.
 
@@ -12093,7 +12285,7 @@ def run_tests() -> None:
 
         REFUSED = "--merge needs"
         UNNAMED = "names no project"
-        ARRIVED = "came in with this sync's merge"
+        ARRIVED = "Resume without it"
 
         def feature(self, fork: str, name: str = "feat/x", commits: int = 1,
                     push: bool = False) -> str:
@@ -12225,6 +12417,31 @@ def run_tests() -> None:
             self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
             # still `--mr`: the request the reviewer merges by hand is opened
             self.assertEqual(tool_argv(self.tmp, "glab", "create")[:2], ["mr", "create"])
+
+        @needs_tomllib
+        def test_refused_on_a_sync_branch_left_carrying_upstreams_merge_self(self):
+            """The fork has no config ("manual"); upstream's `.forkflow.toml` says `merge =
+            "self"`. `sync --mr` leaves the user on the sync branch, whose tree holds
+            upstream's file: `sync --merge` from there - and `sync --force --merge`, which the
+            old refusal printed and which published `<name>-2` and merged it - are both
+            refused before anything is pushed, and origin's trunk never gets upstream's
+            config unreviewed."""
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, CONFIG_FILE, 'merge = "self"\n', "theirs: forkflow")
+            merging_tool(self.tmp, "glab")
+            trunk = origin_sha(fork, "develop")
+            with on_platform("gitlab"):
+                self.assertEqual(run("-C", fork, "sync", "--mr")[0], 0)
+            name = sync_branch_name()
+            self.assertEqual(checked_out(fork), name)
+            with open(os.path.join(fork, CONFIG_FILE)) as fh:
+                self.assertIn('merge = "self"', fh.read())               # upstream's, in the tree
+            os.unlink(os.path.join(self.tmp, "glab-create-argv.txt"))   # that request is open
+            next_utc_second()
+            self.refused(fork, "sync", "--merge")
+            self.refused(fork, "sync", "--force", "--merge")
+            self.assertEqual(origin_sha(fork, name + "-2"), "")
+            self.assertEqual(origin_sha(fork, "develop"), trunk)
 
         @needs_tomllib
         def test_refused_when_the_origin_names_no_project(self):
@@ -12405,12 +12622,13 @@ def run_tests() -> None:
             self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
             self.assertEqual(origin_sha(fork, "develop"), trunk)
             # renamed to the exact name, it is upstream's config arriving with the merge:
-            # `--merge` is refused, and the gate is shown rather than run
+            # `--merge` is refused (the fork's own config says nothing), and the gate is
+            # shown rather than run
             sh("git", "mv", self.VARIANT, CONFIG_FILE, cwd=fork)
             with on_platform("gitlab"):
                 code, out, err = run("-C", fork, "sync", "--continue", "--merge")
             self.assertEqual(code, 2, err + out)
-            self.assertIn("came in with this sync's merge", err)
+            self.assertIn("--merge needs", err)
             with on_platform("gitlab"):
                 code, out, err = run_printed(err, "forkflow sync --continue", fork)
             self.assertEqual(code, 0, err + out)
@@ -12540,12 +12758,19 @@ def run_tests() -> None:
             with open(path) as fh:
                 self.assertEqual(fh.read(), ours)
 
-            # commit it on a branch off the trunk and ship it (as printed: with --merge)
+            # commit it on a branch off the trunk and ship it - as printed, `--mr`: committed
+            # on a branch it is neither untracked nor on origin/develop, so nothing says
+            # "self" until a person has merged it - then land it
             sh("git", "checkout", "-q", "-b", "cfg", "origin/develop", cwd=fork)
             sh("git", "add", CONFIG_FILE, cwd=fork)
             sh("git", "commit", "-q", "-m", "ours: forkflow config", cwd=fork)
             with on_platform("gitlab"):
                 code, out, err2 = run_printed(err, "forkflow ship", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.assertEqual(tool_argv(self.tmp, "glab", "create")[:2], ["mr", "create"])
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
+            self.move_trunk(origin_sha(fork, "cfg"))                     # merged by a person
+            code, out, err2 = run("-C", fork, "land")
             self.assertEqual(code, 0, err2 + out)
             self.assertEqual(sh("git", "show", "origin/develop:" + CONFIG_FILE, cwd=fork),
                              ours.strip())
@@ -12557,8 +12782,7 @@ def run_tests() -> None:
                 code, out, err = run_printed(err, "forkflow sync", fork)
             self.assertEqual(code, 2, err + out)
             self.assertFalse(os.path.exists(theirs_flag))
-            self.assertEqual(tool_argv(self.tmp, "glab", "merge")[:3],
-                             ["mr", "merge", "cfg"])                  # only the config's ship
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])    # nothing merged yet
             sh("sh", "-c", printed(err, "git rm --cached"), cwd=fork)
             with open(path) as fh:
                 self.assertEqual(fh.read(), ours)
@@ -12821,6 +13045,47 @@ def run_tests() -> None:
                     built.add(owner)
             self.assertEqual(spelled, set())
             self.assertEqual(built, {"rerun_cmd", "header"})
+
+        def test_every_merge_decision_goes_through_fork_merge_mode(self):
+            """The `merge` a `--merge` run trusts was read from a place upstream can write -
+            the working tree on `--continue`, a case variant, a sync branch left checked out -
+            once per route, each closed alone. So the key has one reader, `fork_merge_mode`;
+            the gate refuses on it before anything is pushed; and the merge command is run in
+            `merge_mr` alone, only after a refusal on it - so every path to a merge, fresh or
+            resumed, passes it, and the gate sits before every road into `merge_mr`."""
+            import ast
+            funcs = {n.name: n for n in ast.walk(self.tree)
+                     if isinstance(n, ast.FunctionDef) and n.lineno < self.limit}
+
+            def calls(func: str, name: str) -> list:
+                return sorted(c.lineno for c in ast.walk(funcs[func]) if isinstance(c, ast.Call)
+                              and isinstance(c.func, ast.Name) and c.func.id == name)
+
+            def refuses_on(func: str, name: str) -> bool:
+                """An `if` whose test asks `name` and whose body raises."""
+                return any(isinstance(n, ast.If) and any(
+                    isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                    and c.func.id == name for c in ast.walk(n.test))
+                    and any(isinstance(b, ast.Raise) for b in ast.walk(n))
+                    for n in ast.walk(funcs[func]))
+
+            self.assertEqual(self.owners('get("merge")'),
+                             {"parse_config", "merge_mode_at", "fork_merge_mode"})
+            self.assertEqual(self.owners('["merge"]'), set())
+            self.assertTrue(refuses_on("merge_gate", "fork_merge_mode"))
+            self.assertTrue(refuses_on("merge_mr", "fork_merge_mode"))
+            self.assertEqual(self.owners("merge_command("), {"merge_command", "merge_mr"})
+            self.assertLess(calls("merge_mr", "fork_merge_mode")[0], calls("merge_mr", "run_tool")[0])
+            # the roads into `merge_mr`, and the gate before each
+            self.assertEqual(self.owners("merge_mr("), {"merge_mr", "finish_sync", "finish_ship"})
+            self.assertEqual(self.owners("finish_sync("),
+                             {"finish_sync", "cmd_sync", "cmd_sync_continue"})
+            self.assertEqual(self.owners("cmd_sync_continue("), {"cmd_sync_continue", "cmd_sync"})
+            self.assertEqual(self.owners("finish_ship("), {"finish_ship", "cmd_ship"})
+            gate = calls("cmd_sync", "merge_gate")[0]
+            self.assertLess(gate, min(calls("cmd_sync", "cmd_sync_continue")
+                                      + calls("cmd_sync", "finish_sync")))
+            self.assertLess(calls("cmd_ship", "merge_gate")[0], calls("cmd_ship", "finish_ship")[0])
 
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()

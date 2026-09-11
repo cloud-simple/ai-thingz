@@ -100,10 +100,12 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    mirror advance, the backup and any push, on a plain run and on `--continue` alike - unless
    **both** hold: the fork's `.forkflow.toml` says `merge = "self"` (the fork has declared that
    whoever opens its merge requests merges them; the default is `"manual"`), and the origin URL
-   names a project the merge command can address with `--repo` (`rules.md`). On `--continue` the
-   `merge = "self"` has to be the fork's own: one that came in with this sync's merge (upstream's
-   `.forkflow.toml`) is refused too - resume with the command it prints (`sync --continue
-   --mr`: the MR is opened, not merged) and have the MR merged by hand.
+   names a project the merge command can address with `--repo` (`rules.md`). The `merge =
+   "self"` has to be the fork's own: it is read only from the `.forkflow.toml` committed on
+   `origin/<trunk>` (or, while none is, an untracked one) - never from the sync branch, whose
+   tree holds upstream's file. Refused on `--continue`, resume with the command it prints (`sync
+   --continue --mr`: the MR is opened, not merged) and have the MR merged by hand. It is asked
+   again right before the merge; a fork that stopped saying `"self"` meanwhile is exit 6.
    Never work around that gate - a reviewed fork is meant to stop here. The merge is the one rule 5 requires, with
    a head-commit guard so only the merge commit this run pushed can be merged: GitLab `glab mr
    merge <sync branch> --repo <fork> --sha <head> --auto-merge=false --remove-source-branch

@@ -84,7 +84,10 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    plain run and on `--continue` alike - unless **both** hold: the fork's `.forkflow.toml` says
    `merge = "self"` (the fork has declared that whoever opens its merge requests merges them;
    the default is `"manual"`), and the origin URL names a project the merge command can address
-   with `--repo` (`rules.md`). Never work around that gate - a reviewed fork is meant to stop
+   with `--repo` (`rules.md`). `merge` is read only from the `.forkflow.toml` committed on
+   `origin/<trunk>` (or, while none is, an untracked one) - not from the branch being shipped,
+   so the ship that first commits the config is a plain `--mr`, merged by hand. Never work
+   around that gate - a reviewed fork is meant to stop
    here. The merge is the method rule 5 requires with a head-commit guard, so only the exact
    commit this run pushed can be merged: GitLab `glab mr merge <branch> --repo <fork> --sha
    <head> --auto-merge=false --remove-source-branch --yes` (the project's own merge method,

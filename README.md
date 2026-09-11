@@ -280,10 +280,16 @@ anything is pushed; `"self"` means whoever opened the MR merges it, which lets `
 `sync --merge` do so. Config *and* flag are needed - either alone does nothing - so a reviewed fork
 can never be merged by accident. `--merge` also needs an origin URL that names a GitLab or GitHub
 project the merge command can address with `--repo`; one that does not is the same exit 2, before
-anything is pushed. The key is read from the working tree, tracked or not, which is
-where `setup` leaves the file - except on `sync --continue`, where that tree is the sync's merge:
-there a `merge = "self"` that came in with upstream's `.forkflow.toml` is refused, and only the
-fork's own side of the merge counts.
+anything is pushed. Unlike every other key, `merge` is read only where the original project
+cannot write it: the `.forkflow.toml` this fork committed on `origin/<trunk>`, or - while none
+is committed there - an untracked `.forkflow.toml` in the working tree, where `setup` leaves it.
+The checked-out branch's own copy is never read for it: a sync branch carries upstream's file, so
+upstream's `merge = "self"` can never switch the gate off, and a config upstream wrote onto the
+trunk (a trunk bootstrapped from an upstream that tracks the file) counts as no declaration at all.
+It is asked again right before the merge command runs; a fork that no longer says `"self"` by then
+(a teammate's commit the run's fetch brought in) gets exit 6 with the MR open. So the ship that
+first commits the config is `--mr`, merged by hand: once committed on a branch it is neither
+untracked nor on the trunk yet.
 
 `gate` is the one key that is *run* rather than read - `sh -c` in the repo root, on every `check`,
 `sync` and `ship` - and `.forkflow.toml` is a tracked file a sync is designed to bring in from the
