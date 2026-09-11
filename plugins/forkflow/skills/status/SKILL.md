@@ -34,7 +34,8 @@ needs 3.11+). The layout and the rules it enforces: `${CLAUDE_PLUGIN_ROOT}/refer
    which remotes the last fetch reached, and after a `ship` that is often `origin only`.
 
 2. **Read the output.** Header first (mirror line, trunk line, divergence), then the branch line,
-   the upstream-tracked WARNING list, backups, and the setup line.
+   the upstream-tracked WARNING list, backups, the setup line, and - when a ship or a sync is
+   waiting to land - the `pending` line.
 
 3. **Explain, don't just paste.** Say in plain words where the fork stands: how far the trunk is
    ahead of upstream and behind it, whether the mirror is behind upstream or unpushed, whether the
@@ -59,6 +60,12 @@ forkflow status  origin=<url>  upstream=<url>  platform=<gitlab|github|unknown>
   upstream  $ git ls-remote --heads upstream refs/heads/<ub>  -> server at <sha> = fetched | server at <sha>, fetched <sha> - upstream moved since the last fetch: ... | server not reachable (...) | not asked (--offline)
 ```
 
+After the `setup` line, only while the most recent `ship` or `sync` has not been landed:
+
+```
+  pending  <ship|sync> <branch> -> MR <url|-> - not on origin/<trunk> yet | landed: run forkflow land | cannot verify here
+```
+
 | what you see | what it means |
 |---|---|
 | `-` in a branch column | no local copy of that branch (single-branch clone) - not a problem |
@@ -78,9 +85,14 @@ forkflow status  origin=<url>  upstream=<url>  platform=<gitlab|github|unknown>
 | `touches upstream-tracked files (WARNING, m)` | this branch edits files upstream also owns; a warning, never a blocker |
 | `backups  n (...)` | backup branches on origin, newest three; read from remote-tracking refs, no network |
 | `setup    upstream push: DISABLED\|<url> (LIVE)  pre-push hook: installed\|missing\|foreign  ff-only: ...` | which guarantees are actually in place in this clone |
+| `pending  ... - not on origin/<trunk> yet` | the branch the last `ship`/`sync` pushed is not merged yet (as of the refs on disk - `--fetch` to ask again); wait, or offer to check the MR |
+| `pending  ... - landed: run forkflow land` | the merge request is merged and the local trunk has not caught up: offer `/forkflow:land` |
+| `pending  ... - cannot verify here` | `origin/<trunk>` or the pushed commit is not in this clone (a fresh fork, or a clone other than the one that ran the ship); not an error - `land` in that clone, or after a fetch |
 
 `status` degrades rather than fails: a missing trunk on origin, a diverged mirror, an unfetched
-upstream, a single-branch clone and a detached HEAD are all reported with exit 0. The one failure
+upstream, a single-branch clone, a detached HEAD and a pending record it cannot judge are all
+reported with exit 0. The `pending` verdict is git-only (ancestry, or the patch for a ship), so it
+is the same under `--offline`; `--fetch` moves the refs it is read from. The one failure
 is a missing `upstream` remote - exit 2 with the `forkflow setup --upstream-url <URL>` hint; offer
 `/forkflow:setup` then.
 

@@ -8,8 +8,10 @@ allowed-tools: Bash, Read, AskUserQuestion
 
 The script never pushes the trunk, never rebases it, and never commits on the mirror - and neither
 may you. The trunk moves only through the merge request this produces; you never merge that MR
-yourself. Rule 5 matters here: a sync MR is merged **as a merge**, never squashed and never
-rebased.
+yourself - *unless the fork's `.forkflow.toml` says `merge = "self"` and the user asked for
+`--merge`*, in which case the script merges it, as rule 5 requires and with a head-commit
+guard, and lands it. Rule 5 matters here: a sync MR is merged **as a merge**, never squashed
+and never rebased. The local trunk catches up through `forkflow land`, never by hand.
 
 Script: `${CLAUDE_PLUGIN_ROOT}/scripts/forkflow.py`.
 Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a session.
@@ -28,7 +30,8 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    conflicting files, before doing it.
 
    `sync` needs a clean tree and an attached HEAD (exit 2 otherwise) and starts from whatever
-   branch the user is on; it announces that it leaves that branch and stays on the sync branch.
+   branch the user is on; it announces that it leaves that branch and stays on the sync branch
+   (or, with `--merge`, ends on the trunk once the landing is done).
 
 2. **Run it.**
 
@@ -91,30 +94,55 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    the command and its stderr are printed and the exit stays 0 - the branch is pushed, only the MR
    is left; hand the user the command.
 
+   **`--merge`** (implies `--mr`) opens the merge request and merges it in the same run, then
+   lands it (step 7). It is refused - exit 2, right after the header and before the fetch, the
+   mirror advance, the backup and any push, on a plain run and on `--continue` alike - unless
+   **both** hold: the fork's `.forkflow.toml` says `merge = "self"` (the fork has declared that
+   whoever opens its merge requests merges them; the default is `"manual"`), and the origin URL
+   names a project the merge command can address with `--repo` (`rules.md`). Never work around
+   that gate - a reviewed fork is meant to stop here. The merge is the one rule 5 requires, with
+   a head-commit guard so only the merge commit this run pushed can be merged: GitLab `glab mr
+   merge <sync branch> --repo <fork> --sha <head> --auto-merge=false --remove-source-branch
+   --yes` (the project's own merge method - a fast-forward of the sync branch, whose tip *is*
+   the merge commit); GitHub `gh pr merge <sync branch> --repo <fork> --match-head-commit <head>
+   --merge`. A merge that does not happen - tool missing, failing, the guard refusing, or no
+   merge request created - is exit 6: the sync branch is pushed and the request (when created) is
+   open, so merge it by hand **as a merge** and run `forkflow land`. With `--merge` the run ends
+   on the trunk, not on the sync branch. `--dry-run` shows `would: merge` and `would: land` and
+   runs neither.
+
 6. **Report.** Mirror advance (old -> new, pushed), the sync branch name, the merge commit, the
    number of upstream commits taken, the backup name and its rollback line, any `CHECK` rows and
-   what you concluded about them, the MR URL or command - and what was *not* done: the MR is not
-   merged and the trunk has not moved.
+   what you concluded about them, the MR URL or command - and what was *not* done: without
+   `--merge` the MR is not merged and the trunk has not moved; with it, what the merge step and
+   the landing did (step 7).
 
-   Close with the manual step, which is deliberately not automated:
+7. **Land it.** Tell the user the MR must be merged **as a merge** - GitLab: merge/fast-forward
+   the sync branch; GitHub: "Create a merge commit" - never squash, never rebase. Once it is
+   merged, the closing step is
 
    ```bash
-   git fetch origin && git switch <trunk> && git merge --ff-only origin/<trunk>
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/forkflow.py" land
    ```
 
-   (`setup`'s ff-only config guarantees that can never become a merge commit.) Tell the user the
-   MR must be merged **as a merge** - GitLab: merge/fast-forward the sync branch; GitHub: "Create
-   a merge commit" - never squash, never rebase.
+   (`/forkflow:land`; the run prints `next: forkflow land`). It fetches, verifies that the merge
+   commit is an ancestor of `origin/<trunk>`, fast-forwards the local trunk (`setup`'s ff-only
+   config guarantees that can never become a merge commit), deletes the local sync branch and
+   leaves you on the trunk. Not merged yet is exit 2 and not an error. A sync that was squashed
+   or rebased in the UI never lands by that check - `land` says rule 5 was broken and names
+   `land --force` as the way to fast-forward anyway; report it rather than smoothing it over.
+   `--merge` runs that landing itself, right after the merge.
 
 ## Other exits
 
 | exit | what happened | what to do |
 |---|---|---|
-| 0 | done, dry run, or "already in sync" | nothing; the mirror may still have been advanced and pushed |
+| 0 | done, dry run, or "already in sync"; also `--mr` when the tool is missing or fails, without `--merge` | after a done run, `forkflow land` once the MR is merged; the mirror may still have been advanced and pushed |
 | 2 | precondition: dirty tree, detached HEAD, sync branch already exists locally or on origin, mirror checked out in another worktree, mirror diverged, untracked file blocking the mirror fast-forward, untracked file the merge would write over (`setup` leaves `.forkflow.toml` untracked, and an upstream that uses forkflow tracks it - commit or remove it; nothing was pushed), or a `.forkflow.toml` the merge brought in that cannot be read (the merge commit, the sync branch, the mirror push and the backup are already made and the message says so - fix the file on the sync branch, commit it, then `sync --continue`) | fix what the message names; `--force` recreates an existing sync branch, and that is the only thing `--force` does here - when that name is already on origin the rerun publishes the next free `<name>-N` instead (a sync branch is never force-pushed), and the stale merge request is closed by hand |
 | 3 | `check` failed after the merge - a `gate` command, or `origin/<trunk>` moved under the branch | read the hint the run printed: a failing gate is fixed with a commit on the sync branch and `sync --continue` (the resume picks up the merge commit, wherever it now sits in the branch); a trunk that moved on means the sync is redone against the new tip with `sync --force` - a sync MR is never rebased |
 | 4 | merge conflicts | resolve, `git add`, `sync --continue` |
 | 5 | rewrite safety: the backup was not confirmed on origin, or a push was rejected | do not work around it; report it - a rejected mirror push usually means the mirror is not a pure copy of upstream |
+| 6 | `--merge` only: the merge request was not created, or was not merged (tool missing or failing, or the head-commit guard refused because the branch moved) - the sync branch is pushed and the request, when created, is open with its URL in the message | merge it by hand **as a merge**, then `forkflow land`; the pending record is kept for it. Never retry the merge through `glab api` / `gh api` yourself |
 
 ## Notes
 
@@ -124,5 +152,7 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
   never force-push anything the script did not (the pre-push hook refuses all of it anyway - do
   not use `--no-verify` to get past it, report it instead).
 - A sync MR that goes stale is redone with `forkflow sync`, not rebased in the web UI.
-- `.forkflow.toml` (`gate`, branch names) needs Python 3.11+; if the config is present but
-  unreadable every subcommand exits 2 rather than guessing branch names.
+- After the push the run records what is waiting to land (`forkflow status` shows it on its
+  `pending` line); `forkflow land` reads that record, so it works in a later session too.
+- `.forkflow.toml` (`gate`, `merge`, branch names) needs Python 3.11+; if the config is present
+  but unreadable every subcommand exits 2 rather than guessing branch names.

@@ -2747,7 +2747,7 @@ def landed(ctx: Ctx, entry: dict) -> Tuple[Optional[str], str]:
     if rc != 1:
         raise Fail(f"cannot verify the landing: {short(commit)} (the pushed `{entry['branch']}`) "
                    f"is not in this clone - `land` needs the clone that ran the ship or the "
-                   f"sync, or `land --force` to fast-forward unverified")
+                   f"sync (`--force` does not help here: there is nothing to judge)")
     if entry["kind"] != "ship":
         return (None, "")
     # `git cherry <upstream> <head> <limit>`: the commits in `<limit>..<head>` (here, what

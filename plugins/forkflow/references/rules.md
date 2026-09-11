@@ -86,6 +86,13 @@ against the tool's own default host (github.com, gitlab.com) and not the one the
 the command on exactly as printed. When the origin URL names no project at all, forkflow prints no
 command and says which URL it could not address: open that merge request in the web UI.
 
+`--merge` (on `sync` and `ship`, only on a fork whose `.forkflow.toml` says `merge = "self"`)
+merges with the method the project is configured for on GitLab - which `setup`'s report insists
+is `ff` - and with the method rule 5 requires per call on GitHub (`--merge` for a sync, `--rebase`
+for a ship), always with a head-commit guard (`--sha` / `--match-head-commit`) so only the exact
+commit the run pushed can be merged; `land` warns when what landed does not have that shape (a
+ship's commit that sits on a merge commit instead of the trunk's first-parent line).
+
 ## What is never automated
 
 A fork whose mirror branch already carries its own work is a migration, not a setup: it rewrites
