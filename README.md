@@ -303,7 +303,9 @@ A `gate` the merge left alone still runs: the guard is keyed on the commands, no
 have to write over it - which git refuses. `sync` says so and names the file before the backup
 and the sync branch, so there is nothing to clean up. Do not delete it - it is this fork's
 config: commit it on a branch and `ship` it, and the next sync meets upstream's copy as a
-tracked file, in the open. On a case-insensitive filesystem (the macOS and Windows default)
+tracked file, in the open. A `.forkflow.toml` kept out of `git status` with `info/exclude` is
+one git *would* write over without a word - it counts ignored files as expendable - so `sync`
+looks for it in the working tree itself and refuses that collision the same way. On a case-insensitive filesystem (the macOS and Windows default)
 upstream's `.ForkFlow.toml` is the same file as `.forkflow.toml`, and `sync` treats it so.
 forkflow reads its config only from a file named exactly `.forkflow.toml` and refuses a case
 variant; the way out it prints never deletes or renames the variant in the working tree while

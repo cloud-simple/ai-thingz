@@ -266,6 +266,12 @@ exactly `.forkflow.toml` and refuses a case variant (exit 2, naming it); "is it 
 (`config_tracked`, a `:(icase)` pathspec) and "what did this revision carry" (`config_text`, the
 exact name first, else a case variant in the tree) treat a variant as the file.
 
+➕ iteration 4: `untracked_in_the_way` also looks at the root listing itself, so a git-IGNORED
+`.forkflow.toml` (or a case variant of it) is in the way too - git writes over an ignored file
+without a word, and a fork keeping setup's config in `info/exclude` lost it to a sync. And
+`sync --continue` refuses when a config that is in the index is gone from the working tree (a
+conflict "resolved" with `git rm` of the variant): without it the resumed sync checked nothing.
+
 ⚠️ iteration 4 (printed remedies): every command `load_config`'s variant refusal prints first
 copies the working file into the git directory (`test ! -e <copy> && cp -p -- <file> <copy> &&
 ...`) and names the copy; the index entries go with `git update-index --force-remove` (no `-f`

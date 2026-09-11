@@ -2253,6 +2253,17 @@ def untracked_in_the_way(ctx: Ctx, target: str) -> list:
         return []
     out = git("ls-files", "--others", "--exclude-standard", "-z", cwd=ctx.root, check=False)
     others = [f for f in out.split("\0") if f]
+    # an IGNORED untracked file is one git writes over without a word - it counts ignored
+    # files as expendable - and a fork keeping setup's `.forkflow.toml` in `info/exclude`
+    # lost its `merge`, `gate` and branch names that way. The config lives at the top of the
+    # tree, so the listing there is asked, whatever the ignore rules say
+    try:
+        names = os.listdir(ctx.root)
+    except OSError:
+        names = []
+    tracked = set(tracked_config_names(ctx.root))
+    others += [n for n in names if n.casefold() == CONFIG_FILE.casefold()
+               and n not in tracked and n not in others]
     blocked = added & set(others)
     by_fold: dict = {}
     for f in others:
@@ -2616,6 +2627,21 @@ def cmd_sync_continue(ctx: Ctx, args: argparse.Namespace) -> int:
                      "file(s) still unmerged")
         raise Fail(f"resolve the conflicts and `git add` them, "
                    f"then run `{continue_cmd('sync', args)}` again")
+
+    # a conflict on upstream's `.ForkFlow.toml` resolved with `git rm` takes the one file a
+    # case-insensitive filesystem holds for both names: the fork's `.forkflow.toml` stays in
+    # the index and is gone from the tree, and this run would go on with no config - no gate
+    staged = config_name_in(tracked_config_names(ctx.root))
+    try:
+        on_disk = config_name_in(os.listdir(ctx.root))
+    except OSError:
+        on_disk = staged
+    if staged and on_disk is None:
+        raise Fail(f"`{staged}` is in the index but not in the working tree - removed by hand, "
+                   f"maybe as another case of its name, which a case-insensitive filesystem "
+                   f"makes the same file - and without it this sync would check nothing. Put "
+                   f"it back from the index with `git checkout -- {sh_arg(staged)}` (nothing is "
+                   f"there for it to overwrite), then run `{continue_cmd('sync', args)}` again")
 
     merging = merge_in_progress(ctx)
     merge_sha = sync_merge_commit(ctx)
@@ -12921,6 +12947,71 @@ def run_tests() -> None:
                 self.assertEqual(untracked_in_the_way(ctx, target), [CONFIG_FILE])
             with mock.patch.object(os.path, "samefile", return_value=False):
                 self.assertEqual(untracked_in_the_way(ctx, target), [])
+            # git-ignored, the file is one git would write over without a word: still in the way
+            with open(os.path.join(fork, ".git", "info", "exclude"), "a") as fh:
+                fh.write(CONFIG_FILE + "\n")
+            self.assertNotIn(CONFIG_FILE, sh("git", "status", "--porcelain", cwd=fork))
+            with mock.patch.object(os.path, "samefile", side_effect=one_file):
+                self.assertEqual(untracked_in_the_way(ctx, target), [CONFIG_FILE])
+
+        @needs_tomllib
+        def test_an_ignored_untracked_config_is_in_the_way_before_the_backup(self):
+            """setup's `.forkflow.toml`, kept out of `git status` with `info/exclude`, and
+            upstream starts tracking one: git writes over an ignored file without a word, and
+            `sync --merge` merged and landed upstream's config - this fork's `merge`, `gate`
+            and settings gone. Refused before the backup, the file untouched."""
+            fork = make_fork(self.tmp)
+            ours = 'merge = "self"\ngate = ["true"]\n# my settings\n'
+            path = write(fork, CONFIG_FILE, ours)
+            with open(os.path.join(fork, ".git", "info", "exclude"), "a") as fh:
+                fh.write(CONFIG_FILE + "\n")
+            self.assertEqual(sh("git", "status", "--porcelain", cwd=fork), "")
+            commit_upstream(self.tmp, CONFIG_FILE, 'gate = ["true"]\n', "theirs: forkflow")
+            merging_tool(self.tmp, "glab")
+            trunk = origin_sha(fork, "develop")
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.assertEqual(code, 2, err + out)
+            self.assertEqual(sh("git", "ls-remote", "origin", "refs/heads/backup/*", cwd=fork),
+                             "")
+            self.assertNotIn(sync_branch_name(), local_branches(fork))
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(origin_sha(fork, "develop"), trunk)
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
+            with open(path) as fh:
+                self.assertEqual(fh.read(), ours)
+
+        @needs_tomllib
+        def test_a_config_gone_from_the_tree_mid_sync_is_put_back_before_it_goes_on(self):
+            """A conflict on upstream's `.ForkFlow.toml` resolved with `git rm` deletes the one
+            file a case-insensitive filesystem holds for both names: the fork's
+            `.forkflow.toml` is still in the index and gone from the tree, and `sync
+            --continue` went on with no config - "gate none configured". Built on any
+            filesystem by removing the file; the command printed, run as printed, puts it back
+            and the resumed sync runs the fork's gate."""
+            flag = os.path.join(self.tmp, "fork-gate-ran")
+            config = 'gate = ["touch %s"]\n' % flag
+            fork = make_fork(self.tmp, config=config)
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "ours: shared", push=True)
+            commit_upstream(self.tmp, "shared.tf", self.BASE_TF.replace("count = 1", "count = 3"),
+                            "theirs: shared")
+            self.assertEqual(run("-C", fork, "sync")[0], 4)
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
+            sh("git", "add", "shared.tf", cwd=fork)
+            os.unlink(os.path.join(fork, CONFIG_FILE))
+            code, out, err = run("-C", fork, "sync", "--continue")
+            self.assertEqual(code, 2, err + out)
+            name = sync_branch_name()
+            self.assertEqual(origin_sha(fork, name), "")
+            self.assertFalse(os.path.exists(flag))
+            sh("sh", "-c", printed(err, "git checkout"), cwd=fork)
+            with open(os.path.join(fork, CONFIG_FILE)) as fh:
+                self.assertEqual(fh.read(), config)
+            code, out, err = run_printed(err, "forkflow sync --continue", fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertTrue(os.path.exists(flag))
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
 
         @needs_tomllib
         def test_an_untracked_config_meets_upstreams_variant_before_the_backup(self):
@@ -13233,13 +13324,15 @@ def run_tests() -> None:
             `rerun_cmd` (behind `continue_cmd`) is the one place that writes `forkflow
             <subcommand>`, and `header`'s title line the one other `forkflow {...}`. Every
             string literal and f-string is read, adjacent pieces joined as Python joins them;
-            docstrings are prose and are skipped (comments never reach the tree)."""
+            docstrings are prose and are skipped (comments never reach the tree). A string
+            that ends in the word `forkflow` is the head of one assembled with `+` or
+            `str.join` - `argparse`'s program name is the one there is."""
             import ast
             prose = {id(n.value) for n in ast.walk(self.tree)
                      if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)}
             parts = {id(v) for n in ast.walk(self.tree) if isinstance(n, ast.JoinedStr)
                      for v in n.values}
-            spelled, built = set(), set()
+            spelled, built, headed = set(), set(), set()
             for n in ast.walk(self.tree):
                 if getattr(n, "lineno", self.limit) >= self.limit:
                     continue
@@ -13256,8 +13349,11 @@ def run_tests() -> None:
                     spelled.add(owner)
                 if re.search(r"forkflow\s+(\{|%)", text):
                     built.add(owner)
+                if re.search(r"(^|\s)forkflow\s*$", text):
+                    headed.add(owner)
             self.assertEqual(spelled, set())
             self.assertEqual(built, {"rerun_cmd", "header"})
+            self.assertEqual(headed, {"parse_args"})
 
         def test_every_merge_decision_goes_through_fork_merge_mode(self):
             """The `merge` a `--merge` run trusts was read from a place upstream can write -
