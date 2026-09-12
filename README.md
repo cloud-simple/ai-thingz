@@ -235,11 +235,15 @@ after it; `--force` only does something in `sync` (recreate the sync branch), `s
 foreign pre-push hook) and `land` (fast-forward a landing the tool cannot verify).
 `check` is the preflight `sync` and `ship` run themselves (upstream-tracked warning, configured gate
 commands, "is this branch on the trunk's tip"); it has no skill of its own - `status` surfaces it for
-humans. `--dry-run` creates no branch, commit, push, config or hook, moves no mirror or trunk,
-deletes no branch and clears no pending record, and still previews the merge that is pending. It is
-not read-only: it fetches (that is how it knows what is pending), so `refs/remotes/*` and
-`FETCH_HEAD` are refreshed and the merge simulation (and `land`'s check that a rewritten patch is
-still on the trunk) writes tree objects - nothing that changes a branch, a worktree or a setting.
+humans. `--dry-run` writes nothing at all: no branch, commit, push, config or hook, no mirror or
+trunk moved, no branch deleted, no pending record cleared - and nothing in the git directory either.
+It does not fetch, because a fetch rewrites `FETCH_HEAD`, moves `refs/remotes/*` and brings objects
+in; it asks `git ls-remote` instead, which is one round trip that writes none of those, and the
+`fetch` line prints what each remote has beside what this clone has. The merge simulation still runs
+(`git merge-tree --write-tree` with the objects it makes sent to a scratch directory), so a dry run
+still previews the pending merge and its conflicts. What it cannot do is judge a landing that has
+not reached this clone's refs: `land --dry-run` says so in those words and names the run without
+`--dry-run` that fetches and decides, rather than reporting "not merged" about a merged request.
 
 `status` on a fork whose feature branch touches a file upstream also owns:
 

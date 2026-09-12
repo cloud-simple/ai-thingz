@@ -27,7 +27,10 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    It changes nothing (no branch, no backup, no push, the mirror is not moved) and still previews
    the *pending* merge: the upstream commits that would be taken, and the merge simulation's
    verdict - clean or the list of conflicting paths. Tell the user what is coming, especially the
-   conflicting files, before doing it.
+   conflicting files, before doing it. It does not fetch either: the `fetch` line shows a
+   `git ls-remote` of each remote beside what this clone has, and the preview is of the upstream
+   commits already fetched - when that line says `NOT fetched (dry run)`, upstream has more, and
+   the real run (or a `git fetch upstream`) is what brings it into view.
 
    `sync` needs a clean tree and an attached HEAD (exit 2 otherwise) and starts from whatever
    branch the user is on; it announces that it leaves that branch and stays on the sync branch

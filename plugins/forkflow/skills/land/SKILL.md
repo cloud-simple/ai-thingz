@@ -67,10 +67,14 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    HEAD on none of their branches it is refused (exit 2) until the branch is named -
    `forkflow land --force <branch>`.
 
-4. **Dry run.** `--dry-run` fetches and decides, prints every mutating step as `would:`
-   (checkout, fast-forward, branch deletion), moves nothing and keeps the record. Use it when
-   the user wants to see what would land before it does, or to answer "has it merged yet?"
-   without side effects (`forkflow status` answers that too, on its `pending` line).
+4. **Dry run.** `--dry-run` writes nothing at all, so it does not fetch either: it asks
+   `git ls-remote` what origin has, prints that beside what this clone has, and decides from
+   the refs on disk. When the landing is already in those refs - after `ship --merge`, or after
+   a merge and any fetch - it prints every mutating step as `would:` (checkout, fast-forward,
+   branch deletion), moves nothing and keeps the record. When it is not, the dry run says it
+   could not tell and names the same command without `--dry-run`, which fetches and decides;
+   it never reports "not merged" about a request that is merged. `forkflow status --fetch`
+   answers "has it merged yet?" by fetching, on its `pending` line.
 
 5. **Report.** What landed and how (`ancestor` or `rewritten`, with the trunk commit it is on),
    the fast-forward (`<old>..<new>`, or `up to date` when the local trunk was already there),
@@ -126,6 +130,7 @@ Under `--dry-run` the mutating steps and the last line carry `would:` (`would: l
 |---|---|---|
 | 0 | landed (or caught up under `--force`) | nothing; the landed records are cleared, and any still pending are listed and kept |
 | 0 | dry run | nothing moved and the records are kept - run it without `--dry-run` to land |
+| 2 | dry run, and the landing is not in this clone's refs (`did not fetch, so it cannot tell`) | run the same command without `--dry-run`: it fetches and decides |
 | 2 | precondition: nothing pending (or nothing for the named branch), rebase in progress, dirty tree, trunk checked out in another worktree, the fetch failed, the recorded commit is not in this clone (`cannot verify the landing` - `--force` clears it), not on `origin/<trunk>` yet (with several records: none of them), `--force` with several records and none named, the local trunk carries commits origin lacks, `origin/<trunk>` does not resolve, or the usual setup failures (no `upstream` remote, the trunk not on origin, an origin whose push URL is the original project, an unreadable `.forkflow.toml`) | fix what the message names and rerun. A trunk checked out in another worktree means the command the message names, in that worktree - it sees the same pending records. "Not yet" means wait for the merge; "commits origin lacks" means somebody committed on the local trunk by hand - show them `git log origin/<trunk>..<trunk>` and let them decide, the plugin never moves that trunk over its own commits |
 
 ## Notes

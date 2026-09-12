@@ -56,6 +56,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -135,12 +136,44 @@ def git_ok(*args: str, cwd: Optional[str] = None) -> bool:
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True).returncode == 0
 
 
-def git_rc(*args: str, cwd: Optional[str] = None) -> Tuple[int, str, str]:
-    """(returncode, stdout, stderr) - for every call whose failure has its own exit code."""
-    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True)
+def git_rc(*args: str, cwd: Optional[str] = None,
+           env: Optional[dict] = None) -> Tuple[int, str, str]:
+    """(returncode, stdout, stderr) - for every call whose failure has its own exit code.
+
+    `env` replaces this process's environment for the one call (`merge_tree` sends the
+    objects git writes somewhere other than this repository)."""
+    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, env=env)
     return (p.returncode,
             p.stdout.decode("utf-8", "replace"),
             p.stderr.decode("utf-8", "replace"))
+
+
+def merge_tree(root: str, *args: str) -> Tuple[int, str, str]:
+    """`git merge-tree --write-tree ...` with the objects it writes sent somewhere other
+    than this repository's object database.
+
+    `--write-tree` is the only form modern git offers, and it writes the merged tree and a
+    blob per conflicting file - a real write, inside a `--dry-run` that promises none and
+    inside a `status` that only reports. Nothing needs those objects to survive the call:
+    both callers read stdout and throw the tree away. So they go to a temporary directory
+    (`GIT_OBJECT_DIRECTORY`) with this repository's own object database named as an
+    alternate to read from (`GIT_ALTERNATE_OBJECT_DIRECTORIES` - git follows alternates
+    transitively, so a clone that has its own still resolves everything), and the directory
+    is removed afterwards. The answer is identical to the unredirected call's.
+
+    When git cannot say where the objects live, the call is made as it always was: a
+    simulation that does not run is worse than a few unreachable objects."""
+    real = git_path(root, "objects")
+    if not real:
+        return git_rc("merge-tree", *args, cwd=root)
+    alternates = os.environ.get("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+    env = dict(os.environ, GIT_OBJECT_DIRECTORY=tempfile.mkdtemp(prefix="forkflow-odb-"),
+               GIT_ALTERNATE_OBJECT_DIRECTORIES=(real + os.pathsep + alternates
+                                                 if alternates else real))
+    try:
+        return git_rc("merge-tree", *args, cwd=root, env=env)
+    finally:
+        shutil.rmtree(env["GIT_OBJECT_DIRECTORY"], ignore_errors=True)
 
 
 def shell(cmd: str, cwd: str) -> Tuple[int, str]:
@@ -1404,6 +1437,43 @@ def header(ctx: Ctx, sub: str, server: Optional[str] = None) -> None:
         print(f"  divergence: {n_files} files, {n_tracked} upstream-tracked")
 
 
+def fetch_preview(ctx: Ctx, remotes: Sequence[str],
+                  refs: Sequence[str]) -> Tuple[int, str, str, str]:
+    """What a fetch would have found, for a `--dry-run` that must write nothing.
+
+    `git ls-remote` asks the same server over the same transport in one round trip and
+    writes nothing at all - no `FETCH_HEAD`, no remote-tracking ref, no object - so each
+    named ref can be reported as it is HERE and as it is on the remote. What the rest of the
+    run then reasons from is the refs on disk, unchanged, which is why the line says so
+    rather than reading like a fetch that happened. With no ref named there is nothing to
+    compare, so nothing is asked of the network either.
+
+    A failure to reach the remote is the caller's to handle exactly as a failed fetch is:
+    the dry run of a command that could not have run is not a dry run that passed."""
+    shown, moved, stale = [], [], False
+    for ref in refs:
+        remote, _, branch = ref.partition("/")     # the callers name `<remote>/<branch>`
+        if not branch or remote not in remotes:
+            continue
+        cmd = f"git ls-remote {sh_arg(remote)} {sh_arg('refs/heads/' + branch)}"
+        shown.append(cmd)
+        rc, out, err = git_rc("ls-remote", remote, "refs/heads/" + branch, cwd=ctx.root)
+        if rc != 0:
+            return (rc, cmd, "", err)
+        here, there = rev(ctx.root, ref), (out.split("\t")[0] if out.strip() else "")
+        moved.append(f"{ref} {short(here) or '-'} here"
+                     + ("" if here == there else
+                        f", {short(there) or 'gone'} on {remote}"))
+        stale = stale or here != there
+    if not shown:
+        args = ["fetch"] + (["--multiple"] if len(remotes) > 1 else []) + list(remotes)
+        return (0, "git " + " ".join(sh_arg(a) for a in args),
+                "not run (dry run): the refs on disk are as the last fetch left them", "")
+    tail = (" - NOT fetched (dry run): everything below is judged from the refs on disk"
+            if stale else " (nothing to fetch)")
+    return (0, " && ".join(shown), ", ".join(moved) + tail, "")
+
+
 def fetch(ctx: Ctx, remotes: Sequence[str],
           refs: Sequence[str] = ()) -> Tuple[int, str, str, str]:
     """Refresh `remotes` and say what moved: (returncode, command, result, stderr).
@@ -1411,7 +1481,13 @@ def fetch(ctx: Ctx, remotes: Sequence[str],
     `result` is the `step()` line a successful fetch deserves - one `<ref> <old>..<new>` (or
     `<ref> unchanged`) per named ref, or "remote-tracking refs refreshed" when the caller
     names none. Nothing is printed and nothing is raised here: whether a failure stops the run
-    or is only reported is the caller's, and `status` still has the refs on disk to report."""
+    or is only reported is the caller's, and `status` still has the refs on disk to report.
+
+    A dry run does not fetch (`fetch_preview`): `git fetch` rewrites `FETCH_HEAD`, moves
+    remote-tracking refs and brings objects in - three writes in the one command every
+    `--dry-run` path used to run before it promised to write nothing."""
+    if ctx.dry_run:
+        return fetch_preview(ctx, remotes, refs)
     args = ["fetch"] + (["--multiple"] if len(remotes) > 1 else []) + list(remotes)
     cmd = "git " + " ".join(sh_arg(a) for a in args)
     before = dict((r, rev(ctx.root, r)) for r in refs)
@@ -1562,6 +1638,16 @@ def advance_mirror(ctx: Ctx, target: str) -> Tuple[str, str]:
     old = rev(ctx.root, f"refs/heads/{m}")
     if old and old != target:
         rc, _, _ = git_rc("merge-base", "--is-ancestor", old, target, cwd=ctx.root)
+        if rc == 1 and ctx.dry_run:
+            # the target is `<upstream>/<branch>` as the LAST FETCH left it, and this run did
+            # not fetch (a dry run writes nothing). A teammate's sync legitimately puts the
+            # mirror ahead of a stale upstream ref, and calling that rule 6 would be a guess
+            raise Fail(f"this dry run did not fetch, so it cannot preview the sync: `{m}` is "
+                       f"not an ancestor of {short(target)}, which is `{ctx.up()}` as the "
+                       f"last fetch left it - the `fetch` line above says what "
+                       f"`{ctx.upstream}` has now. Run `git fetch {sh_arg(ctx.upstream)}` and "
+                       f"try again, or run the same command without `--dry-run`, which "
+                       f"fetches first")
         if rc == 1:
             raise Fail(f"`{m}` is not an ancestor of {short(target)}: the mirror only ever "
                        f"moves forward. {README_POINTER}")
@@ -1688,8 +1774,8 @@ def simulate_merge(ctx: Ctx, target: str) -> Optional[Tuple[bool, list]]:
     if git_version() < MERGE_TREE_GIT:
         step("simulate", cmd, "simulation needs git 2.38+, skipping")
         return None
-    rc, out, err = git_rc("merge-tree", "--write-tree", "--name-only",
-                          f"{ctx.origin}/{ctx.trunk}", target, cwd=ctx.root)
+    rc, out, err = merge_tree(ctx.root, "--write-tree", "--name-only",
+                              f"{ctx.origin}/{ctx.trunk}", target)
     if rc == 0:
         step("simulate", cmd, "merges clean")
         return (True, [])
@@ -3685,7 +3771,7 @@ def still_carries(ctx: Ctx, trunk_ref: str, commit: str) -> bool:
     merge simulation needs cannot ask, so both keep `git cherry`'s answer."""
     if git_version() < MERGE_TREE_GIT:
         return True
-    rc, out, _ = git_rc("merge-tree", "--write-tree", trunk_ref, commit, cwd=ctx.root)
+    rc, out, _ = merge_tree(ctx.root, "--write-tree", trunk_ref, commit)
     merged = out.split()[:1]
     if rc != 0 or not merged:
         return True
@@ -3921,6 +4007,17 @@ def judge_landings(ctx: Ctx, chosen: Sequence[dict], force: bool, after_merge: b
                     note += ("\n  other merge requests have landed - land each by its name: "
                              + ", ".join(f"`{land_cmd(b)}`" for b in others))
                 request = e.get("mr") or f"`{e['branch']}`"
+                if ctx.dry_run:
+                    # a dry run does not fetch - a fetch writes FETCH_HEAD, the
+                    # remote-tracking refs and objects - so the ancestry above was asked of
+                    # the refs on disk. Saying "merge it" on that would be a guess; the
+                    # `fetch` line says what the server has, and this says what it means
+                    raise Fail(f"this dry run did not fetch, so it cannot tell whether MR "
+                               f"{request} has landed: from the refs on disk "
+                               f"{short(commit)} is not on {trunk_name}, and the `fetch` "
+                               f"line above says what {ctx.origin} has now. Run "
+                               f"`{land_cmd()}` without `--dry-run` to fetch and "
+                               f"decide{note}")
                 raise Fail(f"MR {request} is not on {trunk_name} yet - merge it, then run "
                            f"`{land_cmd()}` again{note}")
             step("landed?", ancestry, "landing not verified (--force): fast-forwarding to "
@@ -5395,6 +5492,16 @@ def run_tests() -> None:
     def checked_out(fork: str) -> str:
         return sh("git", "symbolic-ref", "-q", "--short", "HEAD", cwd=fork, check=False)
 
+    def odb(root: str) -> set:
+        """Every file in a clone's object database - loose objects, packs and their indexes.
+
+        What a `--dry-run` must leave exactly as it found it, along with `FETCH_HEAD` and the
+        remote-tracking refs: `git fetch` writes all three and `git merge-tree --write-tree`
+        writes objects, and the earlier rounds' snapshots covered neither."""
+        objects = git_path(root, "objects")
+        return {os.path.join(where, name)
+                for where, _, names in os.walk(objects) for name in names}
+
     def origin_sha(fork: str, branch: str) -> str:
         out = sh("git", "ls-remote", "origin", "refs/heads/" + branch, cwd=fork)
         return out.split("\t")[0] if out else ""
@@ -6004,9 +6111,15 @@ def run_tests() -> None:
                 self.assertEqual(code, 0, " ".join(argv) + ": " + err + out)
             sh("git", "switch", "-c", "feat/x", cwd=fork)
             commit_fork(fork, "ours/a.txt", "a\n", "ours: a")
-            code, out, err = run("-C", fork, "ship", "--dry-run")   # fetches origin only
+            code, out, err = run("-C", fork, "ship", "--dry-run")   # origin only, and no fetch
             self.assertEqual(code, 0, err + out)
-            code, out, err = run("-C", fork, "sync", "--dry-run")   # fetches upstream itself
+            # a dry run writes nothing, so it does not fetch either - and against an
+            # `upstream/*` this stale it says that, rather than calling a teammate's sync
+            # rule 6. The real run fetches upstream itself and goes through
+            code, out, err = run("-C", fork, "sync", "--dry-run")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("did not fetch", err)
+            code, out, err = run("-C", fork, "sync")
             self.assertEqual(code, 0, err + out)
 
         def test_a_commit_on_top_of_a_teammates_mirror_is_still_divergence(self):
@@ -6307,6 +6420,7 @@ def run_tests() -> None:
                                "base": origin_sha(fork, self.TRUNK), "mr": ""})
             sh("git", "--git-dir=" + os.path.join(self.tmp, "origin.git"), "update-ref",
                "refs/heads/" + self.TRUNK, commit)                  # merged: the trunk moves
+            sh("git", "fetch", "-q", "origin", cwd=fork)     # a dry run of its own does not
             with on_platform("github"):
                 code, out, err = run("-C", fork, "land", "--dry-run")
             self.assertEqual(code, 0, err + out)
@@ -7102,6 +7216,35 @@ def run_tests() -> None:
             self.assertEqual(cm.exception.code, 2)
             self.assertIn("merge", str(cm.exception))
 
+        @unittest.skipIf(git_version() < MERGE_TREE_GIT, "needs git 2.38+")
+        def test_the_simulation_writes_no_object_into_this_clone(self):
+            """`merge-tree --write-tree` writes the merged tree and a blob per conflicting
+            file into the object database. Nothing needs them after the call - both callers
+            read stdout - and a `--dry-run` that promises to write nothing, and a `status`
+            that only reports, both reach this. So they go to a scratch directory and the
+            answer is the same one the unredirected call gives."""
+            fork = make_fork(self.tmp)
+            commit_fork(fork, "shared.tf",
+                        'resource "null_resource" "a" {\n  count = 2\n}\n', "ours: shared",
+                        push=True)
+            commit_upstream(self.tmp, "shared.tf",
+                            'resource "null_resource" "a" {\n  count = 3\n}\n')
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n")
+            sh("git", "fetch", "upstream", cwd=fork)
+            ctx = ctx_for(fork)
+            target = rev(fork, ctx.up())
+            before = odb(fork)
+            result, _, _ = capture(simulate_merge, ctx, target)
+            self.assertEqual(result, (False, ["shared.tf"]))
+            self.assertEqual(odb(fork), before)               # not one object
+            # the same question asked the way git would answer it on its own
+            plain = git_rc("merge-tree", "--write-tree", "--name-only",
+                           "origin/develop", target, cwd=fork)
+            redirected = merge_tree(fork, "--write-tree", "--name-only",
+                                    "origin/develop", target)
+            self.assertEqual(redirected, plain)
+            self.assertNotEqual(odb(fork), before)            # git's own call did write
+
         def test_nothing_is_written_and_the_worktree_is_untouched(self):
             fork = make_fork(self.tmp)
             commit_fork(fork, "shared.tf",
@@ -7651,6 +7794,7 @@ def run_tests() -> None:
             before_trunk = origin_sha(fork, "develop")
             before_mirror = origin_sha(fork, "main")
             before_local_mirror = rev(fork, "refs/heads/main")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)   # the dry run of its own does not
 
             code, out, err = run("-C", fork, "sync", "--dry-run")
             self.assertEqual(code, 0, err + out)
@@ -7667,6 +7811,35 @@ def run_tests() -> None:
             self.assertNotIn("backup/", local_branches(fork))
             self.assertNotIn(self.sync_name(), local_branches(fork))
             self.assertEqual(checked_out(fork), "develop")
+
+        def test_a_dry_run_fetches_nothing_and_simulates_without_writing_objects(self):
+            """The no-write contract against the two writing steps a `sync --dry-run` took.
+            `git fetch` rewrites `FETCH_HEAD`, moves the remote-tracking refs and brings
+            objects in: `git ls-remote` asks the same server, writes none of them, and the
+            line says what upstream has and that what follows is judged from the refs on
+            disk. `git merge-tree --write-tree` writes the merged tree and a blob per
+            conflict: the simulation still runs, with the objects sent to a scratch
+            directory (`merge_tree`), so the answer is the same and the clone gains
+            nothing."""
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            commit_upstream(self.tmp, "docs/more.md", "more\n", "theirs: more")   # unfetched
+            fetch_head = git_path(fork, "FETCH_HEAD")
+            if os.path.exists(fetch_head):
+                os.unlink(fetch_head)
+            before, refs = odb(fork), sh("git", "for-each-ref", cwd=fork)
+
+            code, out, err = run("-C", fork, "sync", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("git ls-remote upstream refs/heads/main", out)
+            self.assertIn("NOT fetched (dry run)", out)
+            self.assertIn("1 upstream commit(s) to take", out)       # from the refs on disk
+            if git_version() >= MERGE_TREE_GIT:
+                self.assertIn("merges clean", out)                   # simulated all the same
+            self.assertFalse(os.path.exists(fetch_head))
+            self.assertEqual(odb(fork), before)
+            self.assertEqual(sh("git", "for-each-ref", cwd=fork), refs)
 
         def test_existing_sync_branch_is_exit_2(self):
             fork = make_fork(self.tmp)
@@ -11440,6 +11613,7 @@ def run_tests() -> None:
         def test_a_dry_run_runs_nothing_and_writes_nothing(self):
             fork = self.self_fork()
             self.upstream_change()
+            sh("git", "fetch", "-q", "upstream", cwd=fork)   # a dry run of its own does not
             before = (origin_sha(fork, "develop"), origin_sha(fork, "main"))
             self.platform("gitlab")
             with on_platform("gitlab"):
@@ -12002,16 +12176,46 @@ def run_tests() -> None:
             self.assert_landed(fork, name, entry["commit"])
 
         def test_a_dry_run_moves_nothing_and_keeps_the_record(self):
+            """The landing is already in this clone's refs - `ship --merge` and a merge by
+            hand both leave it fetched - so the dry run judges it and previews every step."""
             fork, name, entry = self.shipped()
             self.move_trunk(entry["commit"])
+            sh("git", "fetch", "-q", "origin", cwd=fork)      # a dry run of its own does not
             code, out, err = self.land(fork, "--dry-run")
             self.assertEqual(code, 0, err + out)
             self.assertIn("would: checkout  $ git checkout develop", out)
             self.assertIn("would: trunk  $ git merge --ff-only origin/develop", out)
             self.assertIn("would: branch  $ git branch -d " + name, out)
             self.assertIn("would: landed", out)
-            self.assertEqual(rev(fork, "refs/remotes/origin/develop"), entry["commit"])  # fetched
+            self.assertEqual(rev(fork, "refs/remotes/origin/develop"), entry["commit"])
             self.assert_untouched(fork, name, entry, on=name)
+
+        def test_a_dry_run_fetches_nothing_and_says_what_it_could_not_tell(self):
+            """The no-write contract, against the one writing step every `--dry-run` path
+            took: `git fetch` rewrites `FETCH_HEAD`, moves the remote-tracking refs and
+            brings objects in. `git ls-remote` asks the same server and writes none of them,
+            so the run says what origin has and that the verdict below it is from the refs
+            on disk - rather than fetching, or saying "merge it" about a request that is
+            merged. The refusal names the run that can decide."""
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            fetch_head = git_path(fork, "FETCH_HEAD")
+            if os.path.exists(fetch_head):
+                os.unlink(fetch_head)
+            before = odb(fork)
+            code, out, err = self.land(fork, "--dry-run")
+            self.assertEqual(code, EXIT_PRECONDITION, err + out)
+            self.assertIn("did not fetch", err)
+            self.assertIn("without `--dry-run`", err)
+            self.assertIn("git ls-remote origin refs/heads/develop", out)
+            self.assertIn("NOT fetched (dry run)", out)
+            self.assertFalse(os.path.exists(fetch_head))             # no FETCH_HEAD
+            self.assertEqual(odb(fork), before)                      # no objects
+            self.assertNotEqual(rev(fork, "refs/remotes/origin/develop"), entry["commit"])
+            self.assert_untouched(fork, name, entry, on=name)
+            code, out, err = self.land(fork)                         # the named run decides
+            self.assertEqual(code, 0, err + out)
+            self.assert_landed(fork, name, entry["commit"])
 
     class TestStatusPending(ShipBase):
         """`status`'s `pending` line: the record a ship or a sync left and whether it has
@@ -14237,6 +14441,18 @@ def run_tests() -> None:
             `land` came: the local trunk moves only by fast-forward, only there, and never
             by a ref move (`git branch -f` stays blocked, `update-ref` stays the mirror's)."""
             self.assertEqual(self.owners('"merge", "--ff-only"'), {"advance_mirror", "land_trunk"})
+
+        def test_a_dry_run_reaches_no_command_that_writes(self):
+            """`--dry-run` promises to write nothing, and two git commands were writing
+            under it: `git fetch` rewrites `FETCH_HEAD`, moves the remote-tracking refs and
+            brings objects in, and `git merge-tree --write-tree` writes the merged tree and
+            a blob per conflict. So `fetch` is spelled in one place, which answers a dry run
+            with `ls-remote` instead (`fetch_preview` - one round trip, nothing written),
+            and `merge-tree` is spelled in one place, which sends the objects it writes to a
+            scratch directory. A caller added later cannot spell either for itself."""
+            self.assertEqual(self.owners('"merge-tree"'), {"merge_tree"})
+            self.assertEqual(self.owners('["fetch"]'), {"fetch", "fetch_preview"})
+            self.assertEqual(self.owners("fetch_preview("), {"fetch_preview", "fetch"})
 
         def test_the_only_rebase_is_of_a_feature_branch(self):
             self.assertEqual(self.owners('"rebase"'), {"rebase_onto"})

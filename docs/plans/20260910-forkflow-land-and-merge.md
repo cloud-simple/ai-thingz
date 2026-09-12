@@ -542,6 +542,26 @@ print      "landed: <trunk> <old>..<new> - you are on <trunk>" ; github ship: "o
 exit 0 ; --dry-run prints every mutating step as would: and moves nothing
 ```
 
+⚠️ deviation (review phase 3, external, iteration 1): a `--dry-run` no longer fetches, and the merge
+simulation no longer writes into this repository's object database. The contract is stated in the
+README, in the plan and in three skills, and two git commands were breaking it: `git fetch` rewrites
+`FETCH_HEAD`, moves the remote-tracking refs and brings objects in, and `git merge-tree
+--write-tree` writes the merged tree and a blob per conflicting file. Earlier rounds checked "every
+`--dry-run` writes nothing" with snapshots of refs, branches, HEAD and the state file, which covered
+neither. Now: `fetch()` answers a dry run through `fetch_preview`, which asks `git ls-remote` for
+each named ref - one round trip, nothing written - and prints what is here beside what the remote
+has, ending `NOT fetched (dry run): everything below is judged from the refs on disk` when they
+differ; and `merge_tree()` runs `merge-tree` with `GIT_OBJECT_DIRECTORY` pointed at a scratch
+directory and this repository's object database named in `GIT_ALTERNATE_OBJECT_DIRECTORIES`, so the
+answer is identical and the clone gains nothing (`status` stops writing objects too, which it did
+through `still_carries`). `TestSourceInvariants.test_a_dry_run_reaches_no_command_that_writes` pins
+`"merge-tree"` to `merge_tree` and `["fetch"]` to `fetch`/`fetch_preview`. What a dry run cannot do
+is judge a landing that has not reached this clone's refs: `land --dry-run` then says "this dry run
+did not fetch, so it cannot tell whether MR ... has landed" and names the same command without
+`--dry-run`, instead of "not merged" about a merged request. README, `land/SKILL.md`,
+`ship/SKILL.md`, `sync/SKILL.md` and `setup/SKILL.md` say this; the dry-run tests now assert on
+`FETCH_HEAD` and on every file in `.git/objects` (`odb()`).
+
 Every printed command goes through `sh_arg`. **Invariant edit 2:** `land_trunk` is the second owner
 of the `"merge", "--ff-only"` needle. `test_only_advance_mirror_moves_the_mirror` keeps
 `"update-ref"` pinned to `advance_mirror` under its existing name; the ff-only assertion moves to a

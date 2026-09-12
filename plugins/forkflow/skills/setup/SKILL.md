@@ -37,9 +37,10 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before running it.
 
    Every step that would change something is printed as `would:` - the read-only steps (`remote`,
    `fetch`, `names`, `target`, `mirror`, `trunk`, `platform`) print without it; no config, no hook,
-   no template, no branch, no push. (The
-   fetch still runs, and the platform report still runs - every one of its calls is a GET.) A dry
-   run that would have to *add* the remote stops there: there is nothing to preview yet.
+   no template, no branch, no push. (Nothing is fetched either - a fetch writes `FETCH_HEAD`, the
+   remote-tracking refs and objects - so the preview is built from the refs on disk and the
+   `fetch` line says so; the platform report still runs, and every one of its calls is a GET.) A
+   dry run that would have to *add* the remote stops there: there is nothing to preview yet.
 
 3. **Run it.**
 

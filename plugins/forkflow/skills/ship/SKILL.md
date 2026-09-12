@@ -27,9 +27,11 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/forkflow.py" ship --dry-run
    ```
 
-   Nothing is created, rebased, squashed or pushed (it does fetch). Use it to show the user the
-   commits that will become one, and the upstream-tracked WARNING list it prints where the real
-   run prints it after the squash.
+   Nothing is created, rebased, squashed or pushed, and nothing is fetched: the `fetch` line
+   shows a `git ls-remote` that says what `origin/<trunk>` is here and what origin has, and the
+   preview is built from the refs on disk. Use it to show the user the commits that will become
+   one, and the upstream-tracked WARNING list it prints where the real run prints it after the
+   squash.
 
 3. **Run it.**
 
