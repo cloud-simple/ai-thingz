@@ -2741,18 +2741,23 @@ def in_the_way_advice(ctx: Ctx, paths: Sequence[str], rerun: str,
         ship = rerun_cmd("ship", argparse.Namespace(mr=bool(getattr(args, "mr", False))))
         mine = (f"`{CONFIG_FILE}` is this fork's own config, untracked (as `forkflow setup` "
                 f"leaves it)")
-        if config_is_upstreams(ctx, working_config_text(ctx)):
-            # not the fork's: upstream's own file, brought in by a sync and untracked since.
-            # Committed and shipped it puts upstream's bytes on the trunk, where `merge` is
-            # still upstream's word - so the sentence that names the ship says so too
+        here = working_config_text(ctx)
+        note = ""
+        if config_is_upstreams(ctx, here):
+            # not the fork's: bytes the original project has. Committed and shipped it puts
+            # those on the trunk, where `merge` is still not this fork's word - so the
+            # sentence that names the ship says so too. WHERE they were found is
+            # `config_match_note`'s to say, at the end: this used to assert a sync brought
+            # them in, which it cannot know - a teammate's fork of this fork carries this
+            # fork's own config and reads exactly the same way
             mine = (f"the `{CONFIG_FILE}` here is the original project's own file, byte for "
-                    f"byte - brought in by a sync and untracked since, not one this fork "
-                    f"wrote, so `--merge` stays refused until you edit it yourself (any "
-                    f"edit of your own makes it this fork's)")
+                    f"byte - not one this fork wrote, so `--merge` stays refused until you "
+                    f"edit it yourself (any edit of your own makes it this fork's)")
+            note = config_match_note(ctx, here)
         return (f"{mine}, and upstream tracks a `{CONFIG_FILE}` - under that name or "
                 f"another case of it, which a case-insensitive filesystem makes the same "
                 f"file. Do not delete or rename it: commit it on a branch off `{trunk}` and "
-                f"`{ship}` it, have that merged, so it is on `{trunk}`; then {rerun}")
+                f"`{ship}` it, have that merged, so it is on `{trunk}`; then {rerun}.{note}")
     return (f"Move them out of the working tree (they are not deleted that way - on a "
             f"case-insensitive filesystem a name git lists can be another spelling of a file "
             f"of yours), or get them into `{trunk}` first (commit them on a branch and "
@@ -3046,16 +3051,69 @@ def config_digest(text: str) -> str:
     return hashlib.sha256(config_fingerprint(text).encode("utf-8")).hexdigest()
 
 
+def config_record_ok(kept) -> bool:
+    """Is what the state file holds under `upstream_configs` a shape it can be read from?
+
+    Either shape: the {repository: [digest]} record written now, or the flat [digest] list
+    earlier runs of this branch wrote before the record carried where each came from.
+    Anything else is damaged or hand-edited, and `config_memory_unprovable` refuses `--merge`
+    rather than reading a memory that is short by an unknown amount."""
+    if isinstance(kept, list):
+        return all(isinstance(d, str) for d in kept)
+    if isinstance(kept, dict):
+        return all(isinstance(rid, str) and isinstance(ds, list)
+                   and all(isinstance(d, str) for d in ds) for rid, ds in kept.items())
+    return False
+
+
+def remembered_config_record(ctx: Ctx) -> dict:
+    """What this clone has written down of the original project's `.forkflow.toml`s, as
+    {the `repo_id` of the repository it came from: [digests], oldest first} - {} when it has
+    written down none.
+
+    "" is the key of a flat list an earlier run of this branch wrote, which did not record
+    where each digest came from; those are kept and always counted, because dropping them
+    would be forgetting, and the next write puts what it writes under a repository."""
+    kept = read_state(ctx, shared=True).get("upstream_configs")
+    if isinstance(kept, list):
+        return {"": [d for d in kept if isinstance(d, str)]}
+    if not isinstance(kept, dict):
+        return {}
+    return {rid: [d for d in ds if isinstance(d, str)]
+            for rid, ds in kept.items()
+            if isinstance(rid, str) and isinstance(ds, list)}
+
+
 def remembered_upstream_configs(ctx: Ctx) -> list:
     """The `config_digest`s of the original project's `.forkflow.toml`s this clone has
-    written down, oldest first ({} entries when it has written down none)."""
-    kept = read_state(ctx, shared=True).get("upstream_configs")
-    return [d for d in (kept if isinstance(kept, list) else []) if isinstance(d, str)]
+    written down AND still has a remote for, oldest first ([] when there are none).
+
+    Written down under the repository each came from, and counted only while some remote of
+    this clone still names that repository. A record of what SOME remote once carried was a
+    trap: a teammate's fork of this fork, or the fork's own second host, added as a remote
+    for an afternoon, put this fork's OWN config in as the original project's and refused
+    `--merge` for good - `git remote remove` and a prune changed nothing, and the only way
+    back anybody found was deleting the state file (`q2/A2.sh`, `q1/colleague.py`,
+    `q1/mem2.py n03`).
+
+    NOTHING IS DROPPED to make that work. The record keeps every digest it was ever given,
+    so re-adding the remote answers exactly as before; it is what the record is READ for
+    that follows the remotes this clone has now.
+
+    This gives nothing away where the memory matters. The memory exists to answer a version
+    the original project has WITHDRAWN from every ref, and the remote that version came from
+    is the upstream remote - which upstream cannot take away, because remotes are local git
+    config. For that repository this counts exactly as an unconditional record would."""
+    record = remembered_config_record(ctx)
+    here = {rid for _name, rid, _refs in foreign_remote_groups(ctx) if rid}
+    return [d for rid, ds in record.items() if rid == "" or rid in here for d in ds]
 
 
-def remember_upstream_configs(ctx: Ctx, digests: set) -> Tuple[set, str]:
-    """Write down each of `digests` this clone has not written down before, and answer
-    everything it now remembers - or why it could not be written, which is a refusal.
+def remember_upstream_configs(ctx: Ctx, by_repo: dict) -> Tuple[set, str]:
+    """Write down each digest in `by_repo` - {the `repo_id` of the repository whose
+    history carried it: its digests} - that this clone has not written down under that
+    repository before, and answer everything it now remembers; or why it could not be
+    written, which is a refusal.
 
     YOU CANNOT PROVE ABSENCE FROM A HISTORY YOU NO LONGER HOLD. Upstream force-pushes the
     branch, withdraws it, or this fork prunes, and the version that reached this working
@@ -3066,14 +3124,31 @@ def remember_upstream_configs(ctx: Ctx, digests: set) -> Tuple[set, str]:
     that no longer holds it.
 
     So the fork REMEMBERS, in the one place upstream cannot write - `.git/forkflow-state.json`,
-    through the one locked writer (`change_state`), as hashes and never as contents. What
-    was once the original project's stays the original project's, and a withdrawal changes
-    nothing at all.
+    through the one locked writer (`change_state`), as hashes and never as contents.
 
-    Only what `foreign_remote_refs` carried is written down. That is the frame upstream
-    cannot choose; the refs the config names widen the answer for the run that reads them
-    and are left out of the memory on purpose, because a config naming this fork's own
-    trunk would otherwise write the fork's own bytes in for good.
+    WHAT THE PROMISE ACTUALLY IS, because it used to be written here as an absolute - "what
+    was once the original project's stays the original project's, and a withdrawal changes
+    nothing at all". It holds for a version a `--merge` run SAW on a walked ref: that one is
+    written down, and a withdrawal after it changes nothing. A version that reached this
+    working tree and left every walked ref again with no `--merge` run in between was never
+    seen here, so nothing about it is written down, and the live walk is then all there is.
+
+    What covers most of that gap is not this record. It is the fork's own MIRROR, which rule
+    6 keeps a fast-forward-only copy of the original project's history: a version that
+    arrived through a sync is still in it, so the withdrawal route stays closed even in a
+    fresh clone with no memory at all. `upstream_tag_versions` covers the rest of what this
+    clone still physically holds. A fork that takes a config straight off
+    `upstream/<branch>` without a sync, holds it under no tag, and never runs `--merge`
+    before the project withdraws it, has none of the three - `q1/withdraw.py` case A - and
+    that is the honest scope of this.
+
+    WHAT IS WRITTEN DOWN CARRIES WHERE IT CAME FROM: the `repo_id` of the repository whose
+    history the walk read it out of (`foreign_remote_groups`), which is why removing a
+    remote takes its digests back out of the answer - see `remembered_upstream_configs` for
+    why that is not a way to make this forget anything that matters. The frame is the
+    remotes, and upstream cannot add, move or remove one. The refs the CONFIG names widen
+    the answer for the run that reads them and are never written down at all, because a
+    config naming this fork's own trunk would otherwise write the fork's own bytes in.
 
     A fork that ADOPTS a config of upstream's and then edits it is not trapped: edited bytes
     are different bytes with a different digest, in no remembered set, and that is the way
@@ -3101,24 +3176,39 @@ def remember_upstream_configs(ctx: Ctx, digests: set) -> Tuple[set, str]:
 
     A dry run writes nothing (the no-write contract) and answers with the memory plus what
     was just walked."""
-    kept = remembered_upstream_configs(ctx)
-    known = set(kept)
-    fresh = [d for d in sorted(digests) if d not in known]
-    if len(kept) + len(fresh) > UPSTREAM_CONFIG_KEEP:
+    record = remembered_config_record(ctx)
+    known = set(remembered_upstream_configs(ctx))
+    seen = {d for ds in by_repo.values() for d in ds}
+    fresh = {rid: [d for d in sorted(ds) if d not in set(record.get(rid, ()))]
+             for rid, ds in by_repo.items()}
+    fresh = {rid: new for rid, new in fresh.items() if new}
+    held = sum(len(ds) for ds in record.values())
+    if held + sum(len(new) for new in fresh.values()) > UPSTREAM_CONFIG_KEEP:
         if ctx.dry_run:                             # a dry run answers, and writes nothing
             return (set(), memory_full_refusal(ctx))
         failed = change_state(ctx, True, lambda data: data.update({CONFIG_MEMORY_FULL: True}))
         return (set(), failed or memory_full_refusal(ctx))
     if not fresh or ctx.dry_run:
-        return (known | set(digests), "")
+        return (known | seen, "")
 
     def change(data: dict) -> None:
-        now = [d for d in (data.get("upstream_configs") or []) if isinstance(d, str)]
-        here = set(now)
-        now.extend(d for d in fresh if d not in here)
-        if len(now) > UPSTREAM_CONFIG_KEEP:   # another run wrote between the read and here
-            data[CONFIG_MEMORY_FULL] = True   # - nothing is dropped, the memory is full
-            now = now[:UPSTREAM_CONFIG_KEEP]
+        now = data.get("upstream_configs")
+        if isinstance(now, list):                  # what an earlier run of this branch
+            now = {"": [d for d in now if isinstance(d, str)]}    # wrote, with no source
+        elif isinstance(now, dict):
+            now = {rid: [d for d in ds if isinstance(d, str)]
+                   for rid, ds in now.items()
+                   if isinstance(rid, str) and isinstance(ds, list)}
+        else:
+            now = {}
+        room = UPSTREAM_CONFIG_KEEP - sum(len(ds) for ds in now.values())
+        if sum(len(new) for new in fresh.values()) > room:
+            data[CONFIG_MEMORY_FULL] = True   # another run wrote between the read and here
+            return                            # - and nothing is dropped to make room
+        for rid, new in fresh.items():
+            there = now.setdefault(rid, [])
+            have = set(there)
+            there.extend(d for d in new if d not in have)
         data["upstream_configs"] = now
 
     why = change_state(ctx, True, change)
@@ -3131,7 +3221,7 @@ def remember_upstream_configs(ctx: Ctx, digests: set) -> Tuple[set, str]:
                        f"Nothing else is refused: fix that and run this again, or run the "
                        f"same command without `--merge` and have the merge request merged "
                        f"by hand")
-    return (known | set(digests), "")
+    return (known | seen, "")
 
 
 def memory_full_refusal(ctx: Ctx) -> str:
@@ -3184,10 +3274,9 @@ def config_memory_unprovable(ctx: Ctx) -> str:
     if data.get(CONFIG_MEMORY_FULL):
         return memory_full_refusal(ctx)
     kept = data.get("upstream_configs")
-    if kept is not None and not (isinstance(kept, list)
-                                 and all(isinstance(d, str) for d in kept)):
+    if kept is not None and not config_record_ok(kept):
         return (f"`{state_path(ctx, shared=True)}` holds an `upstream_configs` that is not a "
-                f"list of digests, so what this clone has written down of the original "
+                f"record of digests, so what this clone has written down of the original "
                 f"project's `{CONFIG_FILE}`s cannot be read and a version the project has "
                 f"since withdrawn would read as one it never had. Put that key back as a "
                 f"list of strings, or delete the file and accept losing every record in it - "
@@ -3196,21 +3285,124 @@ def config_memory_unprovable(ctx: Ctx) -> str:
     return ""
 
 
-def foreign_remote_refs(ctx: Ctx) -> list:
-    """Every remote-tracking ref that is not `origin`'s.
+def same_repo_remotes(ctx: Ctx) -> list:
+    """The remotes of this clone, other than `origin`, whose URL resolves to the REPOSITORY
+    `origin` names - an ssh/https alias of the fork, a `fork` or `mirror` remote kept for
+    backups, the fork's own second host.
 
-    The one frame in this clone the original project cannot write, and so the basis of
-    every provenance answer. Remotes are local git config: upstream cannot add one here,
-    cannot move a ref under one, and cannot make this clone forget one. `origin` is the
-    fork itself and stays out - its branches carry the fork's OWN configs, which is what
-    upstream's are compared against.
+    `repo_id` is the fold `setup` and the generated hook already use, so what counts as one
+    repository is one rule in every place that asks it."""
+    if not ctx.origin_url:
+        return []
+    ours = repo_id(ctx.origin_url, ctx.root)
+    return [name for name in git("remote", cwd=ctx.root, check=False).splitlines()
+            if name and name != ctx.origin
+            and repo_id(git("remote", "get-url", name, cwd=ctx.root, check=False),
+                        ctx.root) == ours]
+
+
+def foreign_remote_groups(ctx: Ctx) -> list:
+    """[(remote name, the `repo_id` of its URL - "" when no remote answers to that name any
+    more, its remote-tracking refs)], for every remote of some OTHER repository.
+
+    The one frame in this clone the original project cannot write, and so the basis of every
+    provenance answer. Remotes are local git config: upstream cannot add one here, cannot
+    move a ref under one, and cannot make this clone forget one.
+
+    `origin` stays out - its branches carry the fork's OWN configs, which is what upstream's
+    are compared against - AND SO DOES EVERY OTHER NAME FOR THE SAME REPOSITORY. "Not
+    `origin`" was standing in for "the original project", and the two are not one question:
+    a second remote for the fork itself - `git remote add fork <the same repository over
+    ssh>`, a backup mirror, the fork's own second host - made this fork's own reviewed
+    `merge = "self"` read as the original project's, byte for byte, with nobody else
+    involved at all (scratchpad `q2/A4.sh`, `q1/mem2.py n03`). That remote IS the fork; its
+    refs carry the very bytes being compared, and a thing is not evidence against itself.
+    What decides is `repo_id`, off `origin`'s own URL - local git config, which upstream
+    cannot write - so this narrowing is not one a `.forkflow.toml` can reach.
+
+    A remote of some OTHER repository that happens to carry the same bytes - a teammate's
+    fork of this fork - is NOT excluded. That stays a refusal, and it is the direction this
+    walk fails in on purpose: the scope has to be a superset the config cannot narrow. What
+    changed is that the refusal is no longer PERMANENT. The refs are grouped by the
+    repository they came from, the memory is written down under that repository, and a
+    digest is counted only while this clone still has a remote for it - so
+    `git remote remove` gives `--merge` back, which is the way back the refusal now prints.
+
+    A ref under `refs/remotes/` that no current remote answers to - what an interrupted
+    removal can leave behind - is grouped by its first path segment with no repository at
+    all. It is still walked, because a ref this clone holds is still evidence; it is simply
+    not written down, since there is no repository to write it down under and so nothing
+    that undoing could ever take it out again.
 
     A broken symref (`<remote>/HEAD` after its target is deleted) is not listed by
     `for-each-ref` at all, so nothing here has to filter one out."""
-    ours = f"refs/remotes/{ctx.origin}/"
-    listing = git("for-each-ref", "--format=%(refname)", "refs/remotes/",
-                  cwd=ctx.root, check=False)
-    return [ref for ref in listing.splitlines() if ref and not ref.startswith(ours)]
+    ours = set([ctx.origin] + same_repo_remotes(ctx))
+    names = sorted((n for n in git("remote", cwd=ctx.root, check=False).splitlines() if n),
+                   key=len, reverse=True)   # a remote may be named `a/b`: the longest wins
+    groups: dict = {}
+    order = []
+    for ref in git("for-each-ref", "--format=%(refname)", "refs/remotes/",
+                   cwd=ctx.root, check=False).splitlines():
+        if not ref:
+            continue
+        who = next((n for n in names if ref.startswith(f"refs/remotes/{n}/")), None)
+        if who in ours:
+            continue
+        key = who if who is not None else ref[len("refs/remotes/"):].split("/")[0]
+        if key not in groups:
+            groups[key] = (who, [])
+            order.append(key)
+        groups[key][1].append(ref)
+    out = []
+    for key in order:
+        who, refs = groups[key]
+        out.append((key, repo_id(git("remote", "get-url", who, cwd=ctx.root, check=False),
+                                 ctx.root) if who else "", refs))
+    return out
+
+
+def foreign_remote_refs(ctx: Ctx) -> list:
+    """Every remote-tracking ref that belongs to a remote of some OTHER repository, flat.
+
+    `foreign_remote_groups` is the same frame with the repository each ref came from still
+    attached, which is what the memory is written down under; this is the one answer the
+    callers that only need the SCOPE ask for."""
+    return sorted(ref for _name, _rid, refs in foreign_remote_groups(ctx) for ref in refs)
+
+
+def config_match_note(ctx: Ctx, text: Optional[str]) -> str:
+    """Where these `.forkflow.toml` bytes were found, as a sentence a refusal can carry -
+    and, where that is a remote other than the one this fork takes the original project
+    from, the way back removing it gives. "" when they are in no history and no record this
+    clone holds.
+
+    The refusals used to say "A sync brought it in", and they could not know that. The bytes
+    are in SOME history here; WHICH one decides what the user should do about it, and naming
+    the wrong cause sends somebody to fix what is not broken - a teammate's fork of this
+    fork, added as a remote for an afternoon, carries this fork's own config and reads
+    exactly like a sync that took the original project's file (`q2/A2.sh`).
+
+    Walked per remote, and only on the way to a refusal: the happy path never asks."""
+    if text is None:
+        return ""
+    digest = config_digest(text)
+    for name, _rid, refs in foreign_remote_groups(ctx):
+        found, why = config_versions_in(ctx, refs)
+        if why or digest not in found:
+            continue
+        if name == ctx.upstream:
+            return (f" Those bytes are in the history of `{name}`, the remote this fork "
+                    f"takes the original project from.")
+        return (f" Those bytes are in the history of the remote `{name}`, which is not "
+                f"`{ctx.upstream}` - the remote this fork takes the original project from. "
+                f"If `{name}` is another fork and not the original project, "
+                f"`git remote remove {sh_arg(name)}` and run this again: what this clone "
+                f"wrote down of a repository it has no remote for is not counted.")
+    if digest in remembered_upstream_configs(ctx):
+        return (f" Those bytes are in what this clone wrote down of the original project's "
+                f"versions (`{state_path(ctx, shared=True) or STATE_FILE}`) on an earlier "
+                f"run, while a remote here still carried them.")
+    return ""
 
 
 def upstream_scope_refs(ctx: Ctx) -> list:
@@ -3306,6 +3498,77 @@ def history_unprovable(ctx: Ctx) -> str:
     return ""
 
 
+def upstream_tag_versions(ctx: Ctx) -> Tuple[set, str]:
+    """(every `.forkflow.toml` a TAG in this clone carries that the fork's OWN repository
+    does not reach, as `config_digest`s; "" - or why this clone cannot be read for them,
+    which is a refusal).
+
+    `refs/tags/*` was in no scope at all, and a tag is a ref like any other: the original
+    project's config version can sit under a tag this clone fetched while every branch that
+    carried it has moved on, and nothing walked it (`q1/withdraw.py` case B).
+
+    WHAT THE FORK'S OWN REPOSITORY REACHES IS TAKEN OUT, and that is the whole of the care
+    this needs. Tags are one flat namespace: the project's fetched tags and the fork's own
+    release tags sit side by side under it with nothing to tell them apart by name, so a
+    plain `refs/tags/*` would read a fork's own release tag as the original project's and
+    refuse `--merge` to every fork that tags a release with its own config committed. `--not`
+    over `origin` (and over every other name for that same repository) and over this clone's
+    branches tells them apart inside the walk, at no extra reads. It cannot be narrowed by
+    a `.forkflow.toml`: what it names is `origin` and `--branches`, never the mirror or the
+    trunk the config names.
+
+    A tag on a commit no branch and no `origin` ref reaches - tagged, then the branch deleted
+    - is counted as the original project's. That is the fail-closed direction, and it costs a
+    refusal with a way back rather than a gate.
+
+    One `--glob` rather than a list of refs, because a clone with 20,000 tags must not turn
+    into 20,000 `git show`s; and it is a WALK only - a tag's tree is never checked out, so
+    the tip-by-name reading `config_versions_in` does for a case-folding spelling has
+    nothing to do here. With no tags at all the glob simply matches nothing.
+
+    Walked and never written down: a tag is not a remote, so there is no repository to write
+    it down under and so nothing that undoing could ever take out again."""
+    mine = [f"--glob=refs/remotes/{name}/*"
+            for name in [ctx.origin] + same_repo_remotes(ctx)]
+    return config_versions_walked(ctx, ["--glob=refs/tags/*", "--not", *mine, "--branches"])
+
+
+def config_versions_walked(ctx: Ctx, args: Sequence[str]) -> Tuple[set, str]:
+    """(every `.forkflow.toml` version a `git rev-list` over `args` reaches, as
+    `config_digest`s; "" - or why this clone cannot be read for them, which is a refusal
+    wherever it is asked).
+
+    The one place a walk's blobs are turned into digests, so the FAIL-CLOSED reading is
+    written once and every scope that walks gets it: a walk git refuses, and a blob that
+    cannot be read, are each answered with the reason instead of a short set, because
+    neither is evidence that the original project never had those bytes and each, read as
+    absence, is an open gate."""
+    rc, listing, err = git_rc("rev-list", "--objects", "--full-history", *args, "--",
+                              f":(icase){CONFIG_FILE}", cwd=ctx.root)
+    if rc != 0:
+        why = tail_lines(err, 1)
+        return (set(), f"this clone's history cannot be walked for `{CONFIG_FILE}` "
+                       f"({why[0] if why else 'git gave no reason'}) - complete the clone, "
+                       f"or have the merge request merged by hand")
+    fold = CONFIG_FILE.casefold()
+    blobs = set()
+    for line in listing.splitlines():
+        sha, _, name = line.partition(" ")
+        if name.casefold() == fold:           # commits and trees come with no name at all
+            blobs.add(sha)
+    digests = set()
+    for sha in sorted(blobs):
+        rc, text, _ = git_rc("cat-file", "blob", sha, cwd=ctx.root)
+        if rc != 0:
+            return (set(), f"the `{CONFIG_FILE}` this clone's history lists at {short(sha)} "
+                           f"cannot be read - the object is not here (a filtered or damaged "
+                           f"clone), and a version the original project had would be read "
+                           f"as one it never had; complete the clone, or have the merge "
+                           f"request merged by hand")
+        digests.add(config_digest(text))
+    return (digests, "")
+
+
 def config_versions_in(ctx: Ctx, refs: Sequence[str]) -> Tuple[set, str]:
     """(every `.forkflow.toml` any of `refs` has EVER carried, as `config_digest`s; "" - or
     why this clone cannot be read for them, which is a refusal wherever it is asked).
@@ -3338,14 +3601,13 @@ def config_versions_in(ctx: Ctx, refs: Sequence[str]) -> Tuple[set, str]:
     spelling is not - `load_config` refuses to read any such file in the working tree, so
     it cannot be the file whose provenance is in question.
 
-    FAIL CLOSED, everywhere the reading can fail. A blob that cannot be read, a tree that
-    cannot be listed, a walk git refuses - none of them is evidence that upstream never had
-    those bytes, and treated as absence each one is an open gate. So each answers with the
-    reason instead of a short set, on top of the whole-repository conditions
-    `history_unprovable` names."""
+    FAIL CLOSED, everywhere the reading can fail. A tip that cannot be read is answered
+    with the reason instead of a short set here, and the walk's own failures the same way in
+    `config_versions_walked` - none of them is evidence that upstream never had those bytes,
+    and treated as absence each one is an open gate. On top of the whole-repository
+    conditions `history_unprovable` names."""
     if not refs:
         return (set(), "")
-    fold = CONFIG_FILE.casefold()
     digests = set()
     for revision in refs:
         name = config_name_at(ctx, revision)  # None: no file in its tree; the exact name
@@ -3359,28 +3621,8 @@ def config_versions_in(ctx: Ctx, refs: Sequence[str]) -> Tuple[set, str]:
                            f"original project has may be missing here; complete the clone, "
                            f"or have the merge request merged by hand")
         digests.add(config_digest(text))
-    rc, listing, err = git_rc("rev-list", "--objects", "--full-history", *refs, "--",
-                              f":(icase){CONFIG_FILE}", cwd=ctx.root)
-    if rc != 0:
-        why = tail_lines(err, 1)
-        return (set(), f"this clone's history cannot be walked for `{CONFIG_FILE}` "
-                       f"({why[0] if why else 'git gave no reason'}) - complete the clone, "
-                       f"or have the merge request merged by hand")
-    blobs = set()
-    for line in listing.splitlines():
-        sha, _, name = line.partition(" ")
-        if name.casefold() == fold:           # commits and trees come with no name at all
-            blobs.add(sha)
-    for sha in sorted(blobs):
-        rc, text, _ = git_rc("cat-file", "blob", sha, cwd=ctx.root)
-        if rc != 0:
-            return (set(), f"the `{CONFIG_FILE}` this clone's history lists at {short(sha)} "
-                           f"cannot be read - the object is not here (a filtered or damaged "
-                           f"clone), and a version the original project had would be read "
-                           f"as one it never had; complete the clone, or have the merge "
-                           f"request merged by hand")
-        digests.add(config_digest(text))
-    return (digests, "")
+    walked, why = config_versions_walked(ctx, refs)
+    return (set(), why) if why else (digests | walked, "")
 
 
 def config_path_names(root: str, listed: Sequence[str]) -> list:
@@ -3766,8 +4008,13 @@ def upstream_config_digests(ctx: Ctx) -> Tuple[set, str]:
 
     Three parts, and each is there because of a route that was open without it:
 
-    - what the refs upstream cannot choose carry NOW (`foreign_remote_refs`), read over
-      their whole histories (`config_versions_in`);
+    - what the refs upstream cannot choose carry NOW, read over their whole histories and
+      GROUPED by the repository each came from (`foreign_remote_groups`,
+      `config_versions_in`) - grouped because the group is what the memory is written down
+      under, and so what removing a remote can take back out of it;
+    - what a TAG here carries that the fork's own repository does not reach
+      (`upstream_tag_versions`) - walked, and not written down, because a tag belongs to no
+      remote;
     - what this clone has WRITTEN DOWN of upstream's, from every earlier run
       (`remember_upstream_configs`) - because a version that is gone from every ref is not
       a version upstream never had, and nothing read out of the repository can say so. A
@@ -3789,25 +4036,36 @@ def upstream_config_digests(ctx: Ctx) -> Tuple[set, str]:
       this fork's own trunk would otherwise put the fork's own bytes into the memory for
       good, and no later edit of the config could take them out again.
 
-    The two walks are two `rev-list`s over sets that mostly overlap; the walk itself is the
-    cheap half (30ms of the 1.0s measured in `config_versions_in`), and the expensive half -
-    one `cat-file` per distinct version - is paid once per version in each, so the cost of
-    the split is a second walk and not a second read of the repository's configs."""
+    The walks are `rev-list`s over sets that mostly overlap; the walk itself is the cheap
+    half (30ms of the 1.0s measured in `config_versions_in`), and the expensive half - one
+    `cat-file` per distinct version - is paid once per version in each. One walk per foreign
+    remote rather than one for all of them is what carries the grouping, and a fork has one
+    such remote: the ordinary cost is what it was."""
     blind = history_unprovable(ctx) or config_memory_unprovable(ctx)
     if blind:
         return (set(), blind)
-    theirs = foreign_remote_refs(ctx)
-    seen, why = config_versions_in(ctx, theirs)
+    groups = foreign_remote_groups(ctx)
+    theirs = set()
+    by_repo: dict = {}
+    for _name, rid, refs in groups:
+        found, why = config_versions_in(ctx, refs)
+        if why:
+            return (set(), why)
+        theirs |= found
+        if rid:                      # a ref no remote answers to has no repository to be
+            by_repo.setdefault(rid, set()).update(found)   # written down under
+    known, why = remember_upstream_configs(ctx, by_repo)
     if why:
         return (set(), why)
-    known, why = remember_upstream_configs(ctx, seen)
-    if why:
-        return (set(), why)
-    named = [ref for ref in upstream_scope_refs(ctx) if ref not in set(theirs)]
+    walked = {ref for _name, _rid, refs in groups for ref in refs}
+    named = [ref for ref in upstream_scope_refs(ctx) if ref not in walked]
     wider, why = config_versions_in(ctx, named)
     if why:
         return (set(), why)
-    return (known | wider, "")
+    tagged, why = upstream_tag_versions(ctx)
+    if why:
+        return (set(), why)
+    return (known | theirs | wider | tagged, "")
 
 
 def config_is_upstreams(ctx: Ctx, text: Optional[str],
@@ -4032,10 +4290,16 @@ def fork_merge_refusal(ctx: Ctx) -> str:
 
     - this clone cannot be asked the question at all (`unprovable`), which is about the
       clone and not about any file, so the message is the condition and the way round it;
-    - the config on the trunk is upstream's own file, byte for byte (a sync took it whole);
+    - the config on the trunk is one the original project has, byte for byte;
     - the checked-out branch carries one, which is read nowhere until it is on the trunk;
-    - the untracked config in the working tree is upstream's own file;
+    - the untracked config in the working tree is one the original project has;
     - or there simply is no `merge = "self"` this fork wrote.
+
+    The upstream-bytes states used to add "A sync brought it in and it was taken whole",
+    which this cannot know: a teammate's fork of this fork, added as a remote, carries this
+    fork's own config and reads exactly the same way. What it CAN say is where the bytes
+    were found, and `config_match_note` says that instead - with, where the answer is a
+    remote that is not the original project's, the way back removing it gives.
 
     The upstream-bytes states used to print the last one's wording, and a user looking at
     a file that plainly reads `merge = "self"` read that as a bug in the tool. Each state
@@ -4045,13 +4309,12 @@ def fork_merge_refusal(ctx: Ctx) -> str:
     upstream's bytes to the trunk changes nothing about whose word `merge` is."""
     trunk_name = f"{ctx.origin}/{ctx.trunk}"
     ship = rerun_cmd("ship", argparse.Namespace(mr=True))
-    theirs = (f"is the original project's own `{CONFIG_FILE}`, byte for byte, so what it "
-              f"says about `merge` is upstream's word and not this fork's - whatever you "
-              f"read in it")
+    theirs = (f"is a `{CONFIG_FILE}` the original project has, byte for byte, so what it "
+              f"says about `merge` is not this fork's word - whatever you read in it")
     yours = (f"Make it this fork's: edit it - with `merge = \"self\"` set by you - ")
     generic = (f"{fork_merge_source(ctx)}; a `{CONFIG_FILE}` the checked-out branch carries "
                f"is not read for it. This fork's merge requests are merged by hand.")
-    state, _, blind = fork_config_state(ctx)
+    state, text, blind = fork_config_state(ctx)
     if state == "unprovable":
         # nothing about the file: this clone cannot be asked what upstream's configs are,
         # so no answer about whose the file is would mean anything. The way forward is the
@@ -4066,8 +4329,8 @@ def fork_merge_refusal(ctx: Ctx) -> str:
     if state == "trunk_own":
         return generic                  # this fork's own file; it just does not say "self"
     if state == "trunk_upstreams":
-        return (f"the `{CONFIG_FILE}` committed on `{trunk_name}` {theirs}. A sync brought "
-                f"it in and it was taken whole. {yours}on a branch off `{trunk_name}`, "
+        return (f"the `{CONFIG_FILE}` committed on `{trunk_name}` {theirs}."
+                f"{config_match_note(ctx, text)} {yours}on a branch off `{trunk_name}`, "
                 f"commit it there and `{ship}` it; once that merge request is merged, "
                 f"`--merge` works here.")
     if state == "branch_upstreams":
@@ -4075,9 +4338,10 @@ def fork_merge_refusal(ctx: Ctx) -> str:
         # on the trunk, where `merge` is still upstream's word and this refusal returns
         return (f"the `{CONFIG_FILE}` this branch carries {theirs}, and a config the "
                 f"checked-out branch carries is not read for `merge` in any case - only "
-                f"the one on `{trunk_name}`, and only while it is this fork's own. Edit "
-                f"the file in your fork, with `merge = \"self\"` set by you, and get "
-                f"that onto `{trunk_name}` the way everything else gets there.")
+                f"the one on `{trunk_name}`, and only while it is this fork's own."
+                f"{config_match_note(ctx, text)} Edit the file in your fork, with "
+                f"`merge = \"self\"` set by you, and get that onto `{trunk_name}` the way "
+                f"everything else gets there.")
     if state == "branch_own":
         return (f"{fork_merge_source(ctx)}; the `{CONFIG_FILE}` this branch carries is not "
                 f"read for it - committed on a branch it is neither untracked nor on "
@@ -4085,9 +4349,9 @@ def fork_merge_refusal(ctx: Ctx) -> str:
                 f"request merged, then: {land_cmd()}. A `merge = \"self\"` it carries "
                 f"counts from then on.")
     if state == "untracked_upstreams":
-        return (f"the untracked `{CONFIG_FILE}` in the working tree {theirs}. A sync brought "
-                f"it in and it was untracked by hand. {yours}and run this again; nothing has "
-                f"to be committed, an untracked config is read while none is on "
+        return (f"the untracked `{CONFIG_FILE}` in the working tree {theirs}."
+                f"{config_match_note(ctx, text)} {yours}and run this again; nothing has to "
+                f"be committed, an untracked config is read while none is on "
                 f"`{trunk_name}`.")
     # `untracked_own` that does not say "self", and `none`: no declaration to point at
     return generic
@@ -7706,18 +7970,19 @@ def run_tests() -> None:
             publishes 500 versions of one small file, and costs this one an opt-in flag
             rather than any work."""
             ctx = ctx_for(make_fork(self.tmp))
+            rid = repo_id(ctx.upstream_url, ctx.root)
             digests = ["%064x" % n for n in range(UPSTREAM_CONFIG_KEEP + 10)]
-            known, why = remember_upstream_configs(ctx, set(digests[:5]))
+            known, why = remember_upstream_configs(ctx, {rid: set(digests[:5])})
             self.assertEqual((known, why), (set(digests[:5]), ""))
             for start in range(5, UPSTREAM_CONFIG_KEEP, 25):
                 chunk = digests[start:min(start + 25, UPSTREAM_CONFIG_KEEP)]
-                self.assertEqual(remember_upstream_configs(ctx, set(chunk))[1], "")
+                self.assertEqual(remember_upstream_configs(ctx, {rid: set(chunk)})[1], "")
             kept = remembered_upstream_configs(ctx)
             self.assertEqual(len(kept), UPSTREAM_CONFIG_KEEP)
             self.assertEqual(sorted(kept), sorted(digests[:UPSTREAM_CONFIG_KEEP]))
             self.assertEqual(config_memory_unprovable(ctx), "")       # full, and still fine
 
-            known, why = remember_upstream_configs(ctx, {digests[-1]})   # one too many
+            known, why = remember_upstream_configs(ctx, {rid: {digests[-1]}})  # one too many
             self.assertEqual(known, set())
             self.assertIn(str(UPSTREAM_CONFIG_KEEP), why)
             self.assertIn("will not drop one to make room", why)
@@ -7737,7 +8002,8 @@ def run_tests() -> None:
             """A dry run must answer what the real run would, and write nothing doing it."""
             ctx = ctx_for(make_fork(self.tmp), dry_run=True)
             digests = {"%064x" % n for n in range(UPSTREAM_CONFIG_KEEP + 1)}
-            known, why = remember_upstream_configs(ctx, digests)
+            known, why = remember_upstream_configs(ctx, {repo_id(ctx.upstream_url,
+                                                                ctx.root): digests})
             self.assertEqual(known, set())
             self.assertIn("will not drop one to make room", why)
             self.assertFalse(os.path.exists(state_path(ctx, shared=True)))
@@ -7749,12 +8015,14 @@ def run_tests() -> None:
             and this run refuses too. Here the reader is made to answer as it would have
             before that other run wrote, which is the window itself."""
             ctx = ctx_for(make_fork(self.tmp))
+            rid = repo_id(ctx.upstream_url, ctx.root)
             digests = ["%064x" % n for n in range(UPSTREAM_CONFIG_KEEP + 5)]
             full = digests[:UPSTREAM_CONFIG_KEEP]
-            change_state(ctx, True, lambda data: data.update({"upstream_configs": full}))
-            with mock.patch.object(sys.modules[__name__], "remembered_upstream_configs",
-                                   lambda c: []):
-                known, why = remember_upstream_configs(ctx, set(digests[-3:]))
+            change_state(ctx, True,
+                         lambda data: data.update({"upstream_configs": {rid: full}}))
+            with mock.patch.object(sys.modules[__name__], "remembered_config_record",
+                                   lambda c: {}):
+                known, why = remember_upstream_configs(ctx, {rid: set(digests[-3:])})
             self.assertEqual(known, set())
             self.assertIn("will not drop one to make room", why)
             self.assertEqual(remembered_upstream_configs(ctx), full)      # nothing dropped
@@ -7765,20 +8033,22 @@ def run_tests() -> None:
             had, so a memory that cannot be written answers with the reason and leaves the
             way out that needs no state file at all - have the request merged by hand."""
             ctx = ctx_for(make_fork(self.tmp))
+            one = {repo_id(ctx.upstream_url, ctx.root): {"a" * 64}}
             os.mkdir(state_path(ctx, shared=True))          # nothing can be written there
-            known, why = remember_upstream_configs(ctx, {"a" * 64})
+            known, why = remember_upstream_configs(ctx, one)
             self.assertEqual(known, set())
             self.assertIn("cannot write down which", why)
             self.assertIn(CONFIG_FILE, why)
             self.assertIn("merged by hand", why)
             os.rmdir(state_path(ctx, shared=True))
-            self.assertEqual(remember_upstream_configs(ctx, {"a" * 64}), ({"a" * 64}, ""))
+            self.assertEqual(remember_upstream_configs(ctx, one), ({"a" * 64}, ""))
 
         def test_a_dry_run_writes_down_no_upstream_config(self):
             """The no-write contract: a dry run answers with the memory plus what it walked
             and leaves no file behind."""
             ctx = ctx_for(make_fork(self.tmp), dry_run=True)
-            self.assertEqual(remember_upstream_configs(ctx, {"a" * 64}), ({"a" * 64}, ""))
+            one = {repo_id(ctx.upstream_url, ctx.root): {"a" * 64}}
+            self.assertEqual(remember_upstream_configs(ctx, one), ({"a" * 64}, ""))
             self.assertFalse(os.path.exists(state_path(ctx, shared=True)))
 
         def test_a_state_file_that_cannot_be_read_refuses_merge_and_is_kept(self):
@@ -7795,7 +8065,8 @@ def run_tests() -> None:
             fork = make_fork(self.tmp)
             ctx = ctx_for(fork)
             shared = state_path(ctx, shared=True)
-            remember_upstream_configs(ctx, {"a" * 64})
+            one = {repo_id(ctx.upstream_url, ctx.root): {"a" * 64}}
+            remember_upstream_configs(ctx, one)
             with open(shared) as fh:
                 whole = fh.read()
             for damage in (whole[:len(whole) // 2], "", "[1, 2]", "not json at all"):
@@ -7821,15 +8092,19 @@ def run_tests() -> None:
                 self.assertEqual(run("-C", fork, "status")[0], 0)
             os.unlink(shared)                       # the user's choice, and the way back
             self.assertEqual(config_memory_unprovable(ctx), "")
-            self.assertEqual(remember_upstream_configs(ctx, {"a" * 64}), ({"a" * 64}, ""))
+            self.assertEqual(remember_upstream_configs(ctx, one), ({"a" * 64}, ""))
 
-        def test_a_memory_that_is_not_a_list_of_digests_is_a_refusal_too(self):
-            """The hand-edited shape of the same fact."""
+        def test_a_memory_that_is_not_a_record_of_digests_is_a_refusal_too(self):
+            """The hand-edited shape of the same fact - in either shape the record is read
+            in, the flat list an earlier run of this branch wrote and the
+            {repository: [digest]} one written now."""
             ctx = ctx_for(make_fork(self.tmp))
-            for record in ({"a": 1}, "a" * 64, [1, 2], ["ok" * 32, 7]):
+            for record in ({"a": 1}, "a" * 64, [1, 2], ["ok" * 32, 7],
+                           {"repo": "a" * 64}, {"repo": ["ok" * 32, 7]},
+                           {"repo": {"a" * 64: 1}}):
                 change_state(ctx, True, lambda d: d.update({"upstream_configs": record}))
                 why = config_memory_unprovable(ctx)
-                self.assertIn("not a list of digests", why, repr(record))
+                self.assertIn("not a record of digests", why, repr(record))
                 self.assertEqual(fork_config_state(ctx)[0], "unprovable")
                 self.assertEqual(fork_merge_mode(ctx), "manual")
 
@@ -15247,6 +15522,153 @@ def run_tests() -> None:
             sh("git", "fetch", "-q", "origin", cwd=fork)
             self.assertEqual(self.mode(fork), "self")       # nothing was written down about it
 
+        def test_a_second_remote_for_this_forks_own_repository_is_not_the_project(self):
+            """"Not `origin`" was standing in for "the original project", and the two are
+            not one question. A second remote for the FORK ITSELF - the same repository over
+            ssh rather than https, a backup mirror, the fork on a second host - made this
+            fork's own reviewed `merge = "self"` read as the original project's, byte for
+            byte, and refused `--merge` with nobody else involved at all; the digest went
+            into the memory, so removing the remote again changed nothing (`q2/A4.sh`,
+            `q1/mem2.py n03`).
+
+            What a remote is a remote OF is `repo_id`, off `origin`'s own URL - local git
+            config, which upstream cannot write - so this is not a narrowing a
+            `.forkflow.toml` can reach."""
+            fork = make_fork(self.tmp)
+            mine = 'upstream = "upstream"\nmerge = "self"\ngate = ["make test"]\n'
+            write(fork, CONFIG_FILE, mine)                  # where `setup` leaves it
+            self.assertEqual(self.mode(fork), "self")
+            origin_git = os.path.join(self.tmp, "origin.git")
+            sh("git", "remote", "add", "fork", "file://" + origin_git, cwd=fork)
+            sh("git", "fetch", "-q", "fork", cwd=fork)
+            ctx = ctx_for(fork)
+            self.assertEqual(same_repo_remotes(ctx), ["fork"])
+            self.assertEqual([r for r in foreign_remote_refs(ctx)
+                              if r.startswith("refs/remotes/fork/")], [])
+            self.assertEqual(fork_config_state(ctx)[0], "untracked_own")
+            self.assertEqual(self.mode(fork), "self")
+            # and nothing of the fork's own was written down on the way
+            self.assertEqual(remembered_config_record(ctx), {})
+
+        def test_another_forks_remote_refuses_and_removing_it_gives_merge_back(self):
+            """A teammate's fork of this fork, added as a remote to review a branch, carries
+            the same team `.forkflow.toml`. It IS another repository, so it stays in the walk
+            - the scope has to be a superset the config cannot narrow, and the refusal is the
+            safe direction. What must not happen is the refusal being PERMANENT: the digest
+            used to go into the memory unqualified, and `git remote remove` plus a prune left
+            `--merge` refused for good, with the only way back nobody names - deleting the
+            state file (`q2/A2.sh`, `q1/colleague.py`).
+
+            So the record carries the repository each digest came from, the refusal NAMES the
+            remote whose history matched, and the way back it prints is run here exactly as
+            printed. Nothing is dropped: re-adding the remote refuses again."""
+            fork = make_fork(self.tmp)
+            team = 'upstream = "upstream"\nmerge = "self"\ngate = ["make test"]\n'
+            write(fork, CONFIG_FILE, team)
+            self.assertEqual(self.mode(fork), "self")
+
+            mate = os.path.join(self.tmp, "mate.git")
+            work = os.path.join(self.tmp, "matework")
+            sh("git", "init", "-q", "--bare", "-b", "develop", mate)
+            sh("git", "clone", "-q", os.path.join(self.tmp, "origin.git"), work)
+            identity(work)
+            sh("git", "checkout", "-q", "-B", "develop", "origin/develop", cwd=work)
+            write(work, CONFIG_FILE, team)          # the same team config, on their trunk
+            sh("git", "add", "-f", CONFIG_FILE, cwd=work)
+            sh("git", "commit", "-q", "-m", "mate: the team config", cwd=work)
+            sh("git", "push", "-q", mate, "develop", cwd=work)
+            sh("git", "remote", "add", "mate", mate, cwd=fork)
+            sh("git", "fetch", "-q", "mate", cwd=fork)
+
+            ctx = ctx_for(fork)
+            self.assertEqual(fork_config_state(ctx)[0], "untracked_upstreams")
+            self.assertEqual(self.mode(fork), "manual")
+            why = fork_merge_refusal(ctx)
+            self.assertIn("the remote `mate`", why)         # WHICH history matched
+            self.assertNotIn("A sync brought it in", why)   # a cause it cannot know
+            record = remembered_config_record(ctx)
+            self.assertEqual(sorted(sum(record.values(), [])), [config_digest(team)])
+            self.assertNotIn("", record)                    # under the repository, not loose
+
+            # the way back, run exactly as printed
+            cmd = printed_cmd(why, "git remote remove")
+            self.assertEqual(cmd, "git remote remove mate")
+            self.assertEqual(subprocess.run(["sh", "-c", cmd], cwd=fork,
+                                            capture_output=True).returncode, 0)
+            self.assertEqual(self.mode(fork), "self")
+            # nothing was dropped to do it: the record still holds what it held
+            self.assertEqual(remembered_config_record(ctx_for(fork)), record)
+            sh("git", "remote", "add", "mate", mate, cwd=fork)
+            sh("git", "fetch", "-q", "mate", cwd=fork)
+            self.assertEqual(self.mode(fork), "manual")     # and answers the same again
+
+        def test_a_version_only_a_fetched_tag_still_carries_is_still_the_projects(self):
+            """`refs/tags/*` was in no scope at all. A tag is a ref like any other: this
+            clone can hold the original project's config version under a tag it fetched
+            while every branch that carried it has moved on, and nothing walked it
+            (`q1/withdraw.py` case B). Here the fork takes the file straight off
+            `upstream/main` without a sync - so the mirror never carried it - and the project
+            then force-pushes that commit away. The tag is all that is left, and it is
+            enough."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch theirs"]\n'
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            seed = os.path.join(self.tmp, "seed")
+            sh("git", "tag", "v9", cwd=seed)
+            sh("git", "push", "-q", "origin", "v9", cwd=seed)
+            sh("git", "fetch", "-q", "--tags", "upstream", cwd=fork)
+            sh("git", "checkout", "-q", "upstream/main", "--", CONFIG_FILE, cwd=fork)
+            sh("git", "rm", "-q", "--cached", CONFIG_FILE, cwd=fork)   # untracked by hand
+
+            sh("git", "reset", "-q", "--hard", "HEAD~1", cwd=seed)     # withdrawn upstream
+            sh("git", "push", "-q", "--force", "origin", "main", cwd=seed)
+            sh("git", "fetch", "-q", "--prune", "upstream", cwd=fork)
+            self.assertEqual(sh("git", "show", "upstream/main:" + CONFIG_FILE, cwd=fork,
+                                check=False), "")           # no branch here carries it
+            self.assertTrue(sh("git", "rev-parse", "-q", "--verify", "refs/tags/v9",
+                               cwd=fork, check=False))
+            ctx = ctx_for(fork)
+            self.assertIn(config_digest(theirs), upstream_tag_versions(ctx)[0])
+            self.assertEqual(fork_config_state(ctx)[0], "untracked_upstreams")
+            self.assertEqual(self.mode(fork), "manual")
+
+        def test_this_forks_own_tags_are_not_the_original_projects(self):
+            """Tags are one flat namespace: the project's fetched tags and the fork's own
+            release tags sit side by side under it with nothing to tell them apart by name.
+            A plain `refs/tags/*` would read a fork's own release tag as the original
+            project's and refuse `--merge` to every fork that tags a release with its own
+            config committed - a false refusal, which on this branch is as serious as a false
+            pass. What the fork's own repository reaches is taken out of that walk: its
+            `origin` refs, and its branches for a tag that has not been pushed yet."""
+            fork = make_fork(self.tmp, config='merge = "self"\n')
+            self.assertEqual(self.mode(fork), "self")
+            sh("git", "tag", "v1", cwd=fork)                # a release, tagged and pushed
+            sh("git", "push", "-q", "origin", "v1", cwd=fork)
+            sh("git", "fetch", "-q", "--tags", "origin", cwd=fork)
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "trunk_own")
+            self.assertEqual(self.mode(fork), "self")
+
+        def test_a_tag_on_a_commit_only_a_branch_here_has_is_still_this_forks_own(self):
+            """The other half of the same narrowing, and the one the `origin` refs do not
+            cover: a tag on a commit this clone has not pushed yet - tagged on a feature
+            branch before the ship - carries the fork's OWN config, and reading it as the
+            original project's would refuse `--merge` on the fork's own bytes. `--branches`
+            is what takes those out."""
+            fork = make_fork(self.tmp)
+            mine = 'merge = "self"\ngate = ["make test"]\n'
+            write(fork, CONFIG_FILE, mine)                  # where `setup` leaves it
+            self.assertEqual(self.mode(fork), "self")
+            sh("git", "switch", "-q", "-c", "feat/x", cwd=fork)
+            sh("git", "add", "-f", CONFIG_FILE, cwd=fork)
+            sh("git", "commit", "-q", "-m", "ours: our config, on a branch here", cwd=fork)
+            sh("git", "tag", "v2", cwd=fork)          # tagged here, pushed nowhere
+            sh("git", "switch", "-q", "develop", cwd=fork)
+            write(fork, CONFIG_FILE, mine)            # untracked again, as `setup` leaves it
+            ctx = ctx_for(fork)
+            self.assertNotIn(config_digest(mine), upstream_tag_versions(ctx)[0])
+            self.assertEqual(fork_config_state(ctx)[0], "untracked_own")
+            self.assertEqual(self.mode(fork), "self")
+
         def blank_upstream_branch(self, name: str = "blank") -> None:
             """A branch of the original project's own that never carried a config - the ref
             upstream points the walk at when it gets to choose the walk's scope."""
@@ -16280,6 +16702,11 @@ def run_tests() -> None:
             self.assertEqual(code, 2, err + out)
             self.assertIn("the original project's own file", err)
             self.assertIn("`--merge` stays refused", err)
+            # and it says WHERE those bytes were found rather than asserting a cause it
+            # cannot know: "brought in by a sync and untracked since" reads exactly the same
+            # for a teammate's fork of this fork, added as a remote (`config_match_note`)
+            self.assertIn("the history of `upstream`", err)
+            self.assertNotIn("brought in by a sync", err)
             write(fork, CONFIG_FILE, theirs + "# ours\n")          # this fork's own, now
             code, out, err = run("-C", fork, "sync")
             self.assertEqual(code, 2, err + out)
@@ -16816,24 +17243,56 @@ def run_tests() -> None:
             self.assertEqual(self.owners("config_memory_unprovable("),
                              {"config_memory_unprovable", "upstream_config_digests"})
             self.assertEqual(self.owners("config_versions_in("),
-                             {"config_versions_in", "upstream_config_digests"})
+                             {"config_versions_in", "upstream_config_digests",
+                              "config_match_note"})
+            # every walk's blobs are turned into digests in one place, so the fail-closed
+            # reading cannot be written a second time and left out of one scope
+            self.assertEqual(self.owners("config_versions_walked("),
+                             {"config_versions_walked", "config_versions_in",
+                              "upstream_tag_versions"})
+            self.assertEqual(self.owners("upstream_tag_versions("),
+                             {"upstream_tag_versions", "upstream_config_digests"})
             self.assertEqual(self.owners("remember_upstream_configs("),
                              {"remember_upstream_configs", "upstream_config_digests"})
+            self.assertEqual(self.owners("remembered_config_record("),
+                             {"remembered_config_record", "remembered_upstream_configs",
+                              "remember_upstream_configs"})
+            self.assertEqual(self.owners("config_record_ok("),
+                             {"config_record_ok", "config_memory_unprovable"})
+            # WHAT COUNTS AS THE FORK'S OWN REPOSITORY IS ONE RULE. "Not `origin`" stood in
+            # for "the original project" and they are not the same question: a second remote
+            # for the fork itself made the fork's own config read as the project's
+            self.assertEqual(self.owners("same_repo_remotes("),
+                             {"same_repo_remotes", "foreign_remote_groups",
+                              "upstream_tag_versions"})
             self.assertEqual(self.owners("foreign_remote_refs("),
                              {"foreign_remote_refs", "upstream_scope_refs",
-                              "history_unprovable", "upstream_config_digests"})
+                              "history_unprovable"})
+            # the frame with the repository each ref came from still attached: what the
+            # memory is written down under, read back by, and what the refusal names
+            self.assertEqual(self.owners("foreign_remote_groups("),
+                             {"foreign_remote_groups", "foreign_remote_refs",
+                              "remembered_upstream_configs", "config_match_note",
+                              "upstream_config_digests"})
             # what is written down comes from the refs upstream cannot choose, and from
             # nowhere else: `upstream_scope_refs` widens the answer for the run that reads
-            # it and never reaches the memory
+            # it and never reaches the memory, and neither does a tag, which belongs to no
+            # remote and so to no repository the record could be read back by
             self.assertEqual(calls_in("upstream_config_digests"),
                              {"history_unprovable",
-                              "config_memory_unprovable", "foreign_remote_refs", "set",
+                              "config_memory_unprovable", "foreign_remote_groups", "set",
                               "config_versions_in", "remember_upstream_configs",
-                              "upstream_scope_refs"})
+                              "upstream_scope_refs", "upstream_tag_versions"})
             # and the bytes are turned into what is compared and written down in one place
             self.assertEqual(self.owners("config_digest("),
                              {"config_digest", "config_versions_in", "config_is_upstreams",
-                              "remember_rendered_config", "config_rendered_before"})
+                              "remember_rendered_config", "config_rendered_before",
+                              "config_versions_walked", "config_match_note"})
+            # a refusal that names bytes as the original project's says WHERE it found them,
+            # in one place, and asserts no cause it cannot know
+            self.assertEqual(self.owners("config_match_note("),
+                             {"config_match_note", "fork_merge_refusal",
+                              "in_the_way_advice"})
             self.assertEqual(calls_in("upstream_scope_refs"),
                              {"foreign_remote_refs", "has_ref", "set",
                               "merge_in_progress", "add"})

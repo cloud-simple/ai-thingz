@@ -589,6 +589,52 @@ The source invariants pin `json.load` to `load_state`, `state_unreadable` to
 `config_memory_unprovable`, and `config_memory_unprovable` to `upstream_config_digests`, so a
 second parser or a second reader cannot answer this its own way.
 
+⚠️ review fix (phase 4): "NOT `origin`" WAS STANDING IN FOR "THE ORIGINAL PROJECT", and they are not
+the same question. Any second remote of the fork's OWN repository - the same repository over ssh
+rather than https, a backup mirror, the fork on a second host - made this fork's own reviewed
+`merge = "self"` read as the original project's, byte for byte, and refused `--merge` with nobody
+else involved at all (scratchpad `q2/A4.sh`, `q1/mem2.py n03`). `same_repo_remotes` takes those out
+of the walk, by `repo_id` off `origin`'s own URL - the fold `setup` and the generated hook already
+use, and local git config, which upstream cannot write, so this narrowing is not one a
+`.forkflow.toml` can reach.
+
+A remote of some OTHER repository carrying the same bytes - a teammate's fork of this fork - stays
+in the walk: the scope still has to be a superset the config cannot narrow, and a refusal is the
+safe direction. What is fixed is that the refusal is no longer PERMANENT. `foreign_remote_refs`
+becomes a flattening of `foreign_remote_groups`, which keeps the repository each ref came from;
+`upstream_configs` in the state file becomes `{repo_id: [digest]}`; and `remembered_upstream_configs`
+counts a digest only while some remote of this clone still names that repository, so
+`git remote remove <name>` gives `--merge` back (`q2/A2.sh`, `q1/colleague.py`). NOTHING IS DROPPED
+to do it - the record keeps every digest, so re-adding the remote answers as before - and nothing is
+given away where the memory matters: the remote a WITHDRAWN version came from is the upstream
+remote, which upstream cannot take away. A flat list an earlier run wrote is read under the key `""`
+and always counted, so no clone forgets across the change. The refusals stop asserting "A sync
+brought it in and it was taken whole", which they could not know - a teammate's remote reads exactly
+like a sync - and print `config_match_note` instead: which history the bytes were found in and,
+where that is a remote other than the upstream one, the `git remote remove` that undoes it.
+`in_the_way_advice` carried the same mis-identification and carries the same note now.
+
+⚠️ same round: `refs/tags/*` was in no scope at all, so the original project's config version could
+sit under a tag this clone fetched while every branch that carried it had moved on
+(`q1/withdraw.py` case B). `upstream_tag_versions` walks the tags with what the fork's OWN
+repository reaches taken out - `--not` over `origin` (and every other name for it) and over this
+clone's branches - because tags are one flat namespace and a plain `refs/tags/*` would read a fork's
+own release tag, or a tag on a branch not pushed yet, as the original project's and refuse `--merge`
+to an ordinary fork. Walked and never written down: a tag belongs to no remote, so there is no
+repository to write it down under and nothing that undoing could take out again. The walk's blobs
+are turned into digests in one place now (`config_versions_walked`), so the fail-closed reading
+covers every scope that walks. And `remember_upstream_configs`'s docstring no longer claims a
+withdrawal "changes nothing at all": that holds for a version a `--merge` run SAW, and what covers
+the rest is the ff-only mirror and now the tags - a config taken straight off `upstream/<branch>`
+with no sync, held under no tag, withdrawn before any `--merge` run, is the honest remaining gap
+(`q1/withdraw.py` case A).
+
+The invariants gain `owners("same_repo_remotes(")`, `owners("foreign_remote_groups(")`,
+`owners("config_versions_walked(")`, `owners("upstream_tag_versions(")`,
+`owners("config_match_note(")`, `owners("remembered_config_record(")` and
+`owners("config_record_ok(")`; `owners("foreign_remote_refs(")`, `owners("config_versions_in(")`,
+`owners("config_digest(")` and `calls_in("upstream_config_digests")` are restated.
+
 ⚠️ review fix (phase 3, external, iteration 3, second half): the ninth route - the comparison's
 two sides were not the same KIND of thing. One is the file as the working tree renders it (a plain
 read of the path), the other the blob as git stores it, and the repository - which upstream writes
