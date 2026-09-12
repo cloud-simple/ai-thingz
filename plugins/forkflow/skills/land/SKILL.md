@@ -33,16 +33,17 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    lists the rest, kept, as `pending` lines. Preflight: a pending record ("nothing pending"
    otherwise, or "nothing pending for `<branch>`" naming what is), no rebase in progress, a clean
    tree, and the trunk not checked out in another worktree (the message names it and the command
-   to run there: `forkflow land <branch>`) - all exit 2, before the fetch.
-   Then: fetch origin; decide whether the recorded commit is on `origin/<trunk>` - by ancestry
-   (a fast-forward or a merge commit keeps the SHA), and for a ship also by patch, so a "squash
-   and merge" or a "rebase and merge" that gave the commit a new SHA is recognised too; create
-   the local trunk from `origin/<trunk>` if this clone has none; `git checkout <trunk>`;
-   `git merge --ff-only origin/<trunk>`; delete the landed branch (`-d`, or `-D` when the landing
-   was a rewritten copy - the patch is verifiably on the trunk) only while its tip is still the
-   commit that was pushed, and otherwise keep it and say so (its later commits did not land);
-   forget the record; print the `landed:` line. HEAD is on the trunk when it finishes, whichever branch it started from.
-   With several records, the trunk is fast-forwarded once and each landed branch follows.
+   to run there: `forkflow land <branch>`, or plain `forkflow land` when several records are
+   pending) - all exit 2, before the fetch. Then: fetch origin; decide whether the recorded
+   commit is on `origin/<trunk>` - by ancestry (a fast-forward or a merge commit keeps the SHA),
+   and for a ship also by patch, so a "squash and merge" or a "rebase and merge" that gave the
+   commit a new SHA is recognised too; create the local trunk from `origin/<trunk>` if this clone
+   has none; `git checkout <trunk>`; `git merge --ff-only origin/<trunk>`; delete the landed
+   branch (`-d`, or `-D` when the landing was a rewritten copy - the patch is verifiably on the
+   trunk) only while its tip is still the commit that was pushed, and otherwise keep it and say
+   so (its later commits did not land); forget the record; print the `landed:` line. HEAD is on
+   the trunk when it finishes, whichever branch it started from. With several records, the trunk
+   is fast-forwarded once and each landed branch follows.
 
 2. **"Not on origin/<trunk> yet" is exit 2 and not an error.** The merge request named in the
    message has not been merged: say so, and run `forkflow land` again once it is. Nothing moved -

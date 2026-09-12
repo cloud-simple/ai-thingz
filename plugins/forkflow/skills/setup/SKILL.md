@@ -100,11 +100,13 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before running it.
    hand, never on the trunk or the mirror - `merge = "self"` only if whoever opens this fork's
    merge requests also merges them (it is what lets `--merge` merge; the default `"manual"`
    refuses it; it is read from the untracked file until one is committed on the trunk, and from
-   the trunk's after that). Reading it needs Python 3.11+ (`tomllib`); a config that is present but unreadable
-   is exit 2 for every subcommand - it carries the safety-critical branch names. Committing it
-   also matters when the upstream project uses forkflow itself: git refuses a merge that would
-   write over an untracked file, so a `sync` bringing upstream's `.forkflow.toml` in stops (exit
-   2, nothing pushed) until the template is committed - never removed: it is this fork's config.
+   the trunk's after that, in both cases only while those bytes are not a `.forkflow.toml` the
+   original project has). Reading it needs Python 3.11+ (`tomllib`); a config that is present but
+   unreadable is exit 2 for every subcommand - it carries the safety-critical branch names.
+   Committing it also matters when the upstream project uses forkflow itself: git refuses a merge
+   that would write over an untracked file, so a `sync` bringing upstream's `.forkflow.toml` in
+   stops (exit 2, nothing pushed) until the template is committed - never removed: it is this
+   fork's config.
 
 7. **Report** what changed in the clone (push URL, hook, config keys, any branch created), what
    was only reported (the platform findings and their fix commands), and what is left for the
