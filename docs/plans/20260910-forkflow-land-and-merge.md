@@ -596,6 +596,24 @@ came from and is still refused; and a `diff` driver's `textconv` produces diff O
 touches a checkout, measured with a `textconv` that rewrites the file. If either reason ever stops
 holding, the attribute goes back in the tuple and those two tests are what say so.
 
+⚠️ review fix (phase 3, external, iteration 4): A REMEDY MUST NEVER PRODUCE CONFIG BYTES, and both
+of the remedies above did. The symlink one ended `cp -p -- <the copy> .forkflow.toml`, so the link
+TARGET's contents became a real config; the attribute one turned the attribute off for future reads
+and left the already-converted file exactly where it was. Run exactly as printed, each one took the
+gate from `unprovable` to `untracked_own` / `self` with the original project's `merge = "self"` and
+the original project's `gate` in it (scratchpad `f10/repro23.py`) - because the bytes that land at
+the config's path in either case are bytes no `.forkflow.toml` blob has ever held, so they match
+nothing in `upstream_config_digests` and read as this fork's own. Both remedies have one shape now:
+take the obstacle away (the link, the attribute AND the file the attribute rewrote), copy what was
+there aside into the git directory and NAME the copy, and stop - the config that comes back is the
+user's to write. The copy-aside command has one owner, `keep_aside`, whose destination is inside
+the git directory by construction; `test_every_copy_a_remedy_prints_is_built_here` pins that, pins
+that nothing else in the script spells a `cp` for a user, and pins that the copy is a destination
+and never a source (the exact shape the symlink remedy had). `cmd_ship`'s local `keep` - a branch
+of somebody else's commits - is `saved` now so that invariant can be asked by name. Both remedies
+are RUN exactly as printed in a test, from the state they are printed in, which is what
+`run_every_printed` is for.
+
 ### `land`
 
 `cmd_land(args)` -> `resolve_ctx(need_upstream=True, need_trunk=True, strict_mirror=False)`, header,

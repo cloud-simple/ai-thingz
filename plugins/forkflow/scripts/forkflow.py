@@ -397,13 +397,36 @@ def no_commit_here(root: str, trunk: str) -> str:
     return ""
 
 
+def keep_aside(root: str, name: str) -> Tuple[str, str]:
+    """(a printable command that copies the working file `name` aside, the path it copies
+    it to) - the one place in this script that builds a copy for a user to run.
+
+    Every remedy that overwrites, moves or deletes a working file begins with this, because
+    a printed command is followed to the letter and the file may hold an edit of the user's
+    that nothing else has. `test ! -e` makes a second run of the same line stop before it
+    could copy a restored file over the saved one, and the timestamp keeps two runs in one
+    second apart from... nothing, which is what `test ! -e` is there for.
+
+    The destination is ALWAYS inside the git directory, and that is the point of having one
+    owner: a remedy must never produce `.forkflow.toml` bytes. Twice now a remedy has ended
+    by copying something back INTO the config's path - the contents a symlink read as, and
+    a file git's own conversion had rewritten - and each time the bytes that landed there
+    were bytes no `.forkflow.toml` blob ever held, so they read as this fork's own and
+    opened `--merge` on the original project's settings. What a remedy may do is take the
+    obstacle away and name where the old file went. What comes back is the user's to write.
+    `test_every_copy_a_remedy_prints_is_built_here` pins both halves."""
+    keep = git_path(root, f"forkflow-config-{utc_stamp('%Y%m%d-%H%M%S')}.toml")
+    return (f"test ! -e {sh_arg(keep)} && cp -p -- {sh_arg(name)} {sh_arg(keep)}", keep)
+
+
 def variant_remedy(root: str, found: str) -> str:
     """The way from `found`, a case variant of the config, to `.forkflow.toml` that loses
     nothing - the second half of `load_config`'s refusal. Every printed command is followed
     to the letter, so each one obeys three rules:
 
-    - it copies the working file aside FIRST, to a new path in the git directory it names,
-      whenever it overwrites, moves or deletes the file. On a case-insensitive filesystem
+    - it copies the working file aside FIRST (`keep_aside`), to a new path in the git
+      directory it names, whenever it overwrites, moves or deletes the file. On a
+      case-insensitive filesystem
       the variant and `.forkflow.toml` are ONE file on disk, and the user may have edited it
       - the outer messages used to invite that. `test ! -e` makes a second run of the same
       line stop before it could copy the restored file over the saved one;
@@ -426,8 +449,7 @@ def variant_remedy(root: str, found: str) -> str:
     variants = [p for p in tracked if p != CONFIG_FILE]
     rc, out, _ = git_rc("ls-tree", "-z", "--name-only", "HEAD", cwd=root)
     in_head = config_name_in(out.split("\0")) if rc == 0 else None
-    keep = git_path(root, f"forkflow-config-{utc_stamp('%Y%m%d-%H%M%S')}.toml")
-    save = f"test ! -e {sh_arg(keep)} && cp -p -- {sh_arg(found)} {sh_arg(keep)}"
+    save, keep = keep_aside(root, found)
     kept = f"; the file as it is now is copied to `{keep}` first"
     merging = merge_in_progress(root)               # its file may be upstream's
     if not tracked and in_head is None and not merging:
@@ -3260,6 +3282,21 @@ def config_render_unprovable(ctx: Ctx) -> str:
     are ones an ordinary fork never meets, both are ones a user can end, and the refusal
     names the link or the attribute so they can.
 
+    NEITHER REMEDY PRODUCES CONFIG BYTES, and that is the correction of what both of them
+    did when they were first written. The symlink one ended `cp <the copy> .forkflow.toml`,
+    so the link target's contents became a real config; the attribute one turned the
+    attribute off for future reads and left the already-converted file exactly where it
+    was. Run as printed, each one turned the original project's `merge = "self"` - with the
+    original project's `gate` behind it - into this fork's own declaration, because the
+    bytes that landed at the config's path were bytes no `.forkflow.toml` blob has ever
+    held and so matched nothing in `upstream_config_digests` (reproduced in scratchpad
+    `f10/repro23.py`: `unprovable` before the remedy, `untracked_own` and `self` after it).
+    So both remedies now have the same shape - take the obstacle away, copy what was there
+    aside into the git directory (`keep_aside`) and name the copy, and leave the user to
+    WRITE THEIR OWN config. `test_the_symlink_remedy_leaves_no_config_behind` and
+    `test_the_attribute_remedy_leaves_no_config_behind` run each one exactly as printed and
+    say what the fork looks like afterwards.
+
     Asked of every path that case-folds to the config's name - the one on disk, any case
     variant beside it, and every variant git tracks - because a case-insensitive filesystem
     makes them one file, and an attribute set on `.ForkFlow.toml` would otherwise reach the
@@ -3281,16 +3318,20 @@ def config_render_unprovable(ctx: Ctx) -> str:
             target = os.readlink(full)
         except OSError:
             target = "?"
-        keep = git_path(root, f"forkflow-config-{utc_stamp('%Y%m%d-%H%M%S')}.toml")
-        save = f"test ! -e {sh_arg(keep)} && cp -p -- {sh_arg(name)} {sh_arg(keep)}"
+        save, keep = keep_aside(root, name)
         return (f"`{name}` is a symbolic link (to `{target}`), so what git stores under that "
                 f"name is the link's target and what reading the path gives is another "
                 f"file's contents - two different things, and comparing them reads the "
-                f"original project's own config as one it never had. Put a real file there: "
-                f"`{save} && rm -- {sh_arg(name)} && cp -p -- {sh_arg(keep)} {sh_arg(name)}` "
-                f"copies what the link reads as now into `{keep}` first and then replaces the "
-                f"link with a file holding exactly that - nothing of yours is lost, and the "
-                f"file the link pointed at is left alone")
+                f"original project's own config as one it never had. Take the link away: "
+                f"`{save} && rm -- {sh_arg(name)}` copies what the link reads as now into "
+                f"`{keep}` first and then removes the link - nothing of yours is lost, and "
+                f"the file the link pointed at is left alone. Then WRITE YOUR OWN "
+                f"`{CONFIG_FILE}` there. Nothing puts one back for you, and that is "
+                f"deliberate: the bytes on the other end of that link are whatever the file "
+                f"it points at holds, no `{CONFIG_FILE}` git stores has ever been those "
+                f"bytes, and a config made out of them would read as this fork's own "
+                f"declaration while being the original project's settings. `{keep}` is there "
+                f"to read, not to copy back")
     rc, out, err = git_rc("check-attr", "-z", *CONFIG_RENDER_ATTRS, "--", *names, cwd=root)
     if rc != 0:
         why = tail_lines(err, 1)
@@ -3305,17 +3346,33 @@ def config_render_unprovable(ctx: Ctx) -> str:
             continue                              # not set, or set OFF: nothing is rendered
         attrs = git_path(root, os.path.join("info", "attributes"))
         off = f"{where} " + " ".join("-" + a for a in CONFIG_RENDER_ATTRS)
-        return (f"`{attr}` is set on `{where}` (to `{value}`), by a `.gitattributes` this "
-                f"fork does not have to own, and git renders a file with that attribute "
-                f"differently from the bytes it stores it as - so the config read here and "
-                f"every stored `{CONFIG_FILE}` are two different kinds of thing, and the "
-                f"original project's own config can compare as bytes it never stored. "
-                f"`git check-attr -a -- {sh_arg(where)}` shows every attribute on it. To end "
-                f"it in this clone alone, turn them off for that one path in a file only this "
-                f"clone has: `printf '%s\\n' {sh_arg(off)} >> {sh_arg(attrs)}` - git reads "
-                f"`info/attributes` in the git directory before any `.gitattributes` in the "
-                f"tree, nothing of yours is overwritten, and a file git holds takes the change "
-                f"the next time it is checked out")
+        turn_off = f"printf '%s\\n' {sh_arg(off)} >> {sh_arg(attrs)}"
+        why = (f"`{attr}` is set on `{where}` (to `{value}`), by a `.gitattributes` this "
+               f"fork does not have to own, and git renders a file with that attribute "
+               f"differently from the bytes it stores it as - so the config read here and "
+               f"every stored `{CONFIG_FILE}` are two different kinds of thing, and the "
+               f"original project's own config can compare as bytes it never stored. "
+               f"`git check-attr -a -- {sh_arg(where)}` shows every attribute on it. Two "
+               f"things end it, and neither of them writes a `{CONFIG_FILE}`. First, turn "
+               f"the attribute off for that one path in a file only this clone has: "
+               f"`{turn_off}` - git reads `info/attributes` in the git directory before any "
+               f"`.gitattributes` in the tree, and nothing of yours is overwritten.")
+        if CONFIG_FILE not in listed:
+            return why + (f" Second, there is nothing to undo on disk - no `{CONFIG_FILE}` "
+                          f"is there - so write your own, and `--merge` reads that")
+        save, keep = keep_aside(root, CONFIG_FILE)
+        tracked = (f" Git tracks a `{CONFIG_FILE}` here, so the removal shows as a deletion "
+                   f"until your own file is in its place: commit that on a branch off "
+                   f"`origin/{remote_trunk(root)}` and ship it, never on the trunk itself."
+                   if tracked_config_names(root) else "")
+        return why + (f" Second, take the file that attribute already rewrote OFF disk: "
+                      f"`{save} && rm -- {CONFIG_FILE}` copies what is there now into "
+                      f"`{keep}` first. Turning the attribute off fixes what git does NEXT "
+                      f"time; the file sitting there was written by git's conversion and "
+                      f"not by this fork, and while it stays it reads as this fork's own "
+                      f"with the original project's settings in it. Nothing puts one back "
+                      f"for you: WRITE YOUR OWN `{CONFIG_FILE}`, and `--merge` reads that. "
+                      f"`{keep}` is there to read, not to copy back.") + tracked
     return ""
 
 def upstream_config_digests(ctx: Ctx) -> Tuple[set, str]:
@@ -4166,16 +4223,16 @@ def cmd_ship(args: argparse.Namespace) -> int:
                          cwd=ctx.root, check=False)
             for line in theirs.splitlines():
                 print(f"    {line}")
-            keep = f"{ctx.backup_prefix}{utc_stamp('%Y%m%d-%H%M%S')}-theirs"
+            saved = f"{ctx.backup_prefix}{utc_stamp('%Y%m%d-%H%M%S')}-theirs"
             raise Fail(
                 f"`{ctx.origin}/{branch}` carries commits that `{branch}` does not and that "
                 f"this clone has no record of publishing: shipping would force-push them "
                 f"away. If they are somebody else's, take them in first "
                 f"(`git pull --rebase {sh_arg(ctx.origin)} {sh_arg(branch)}`). If they are "
-                f"yours from elsewhere, keep them first (`git branch {sh_arg(keep)} "
+                f"yours from elsewhere, keep them first (`git branch {sh_arg(saved)} "
                 f"{sh_arg(ctx.origin + '/' + branch)} && git push {sh_arg(ctx.origin)} "
-                f"{sh_arg('refs/heads/' + keep)}:{sh_arg('refs/heads/' + keep)}`), then ship "
-                f"again")
+                f"{sh_arg('refs/heads/' + saved)}:{sh_arg('refs/heads/' + saved)}`), then "
+                f"ship again")
 
     backup_ref = backup(ctx, "pre-ship", "HEAD")
     resume_unrecorded(ctx, "ship", write_state(ctx, "ship", {"branch": branch,
@@ -6227,6 +6284,30 @@ def run_tests() -> None:
     def run_printed(text: str, start: str, fork: str):
         """Run the printed `forkflow ...` command that begins with `start`, in `fork`."""
         return run("-C", fork, *shlex.split(printed_cmd(text, start))[1:])
+
+    SHELL_VERBS = ("test ", "cp ", "mv ", "rm ", "printf ", "git ")
+
+    def run_every_printed(text: str, fork: str) -> list:
+        """Run EVERY shell command `text` prints, in order, exactly as printed, in `fork`;
+        answer what each one exited with.
+
+        A refusal is read by a person who pastes what it shows them, and twice on this
+        branch a remedy that read well did something else when it was actually run. So the
+        tests that cover a printed remedy run the whole of it, from the state it was printed
+        in, and then look at the fork."""
+        ran = []
+        for cmd in re.findall(r"`([^`]+)`", text):
+            if not cmd.startswith(SHELL_VERBS):
+                continue
+            ran.append((cmd, subprocess.run(["sh", "-c", cmd], cwd=fork,
+                                            capture_output=True).returncode))
+        return ran
+
+    def kept_configs(fork: str) -> list:
+        """The copies a remedy made, newest name last - `keep_aside`'s destinations."""
+        gitdir = os.path.dirname(git_path(fork, "x"))
+        return sorted(os.path.join(gitdir, n) for n in os.listdir(gitdir)
+                      if n.startswith("forkflow-config-"))
 
     def ctx_for(fork: str, need_upstream: bool = True, need_trunk: bool = True,
                 strict_mirror: bool = True, **ns) -> Ctx:
@@ -13928,10 +14009,117 @@ def run_tests() -> None:
             self.assertIn("cp -p --", why)                     # copied aside before anything
             self.assertIn(git_path(fork, "forkflow-config-"), why)   # and the copy is named
             self.assertIn(why, fork_merge_refusal(ctx))
-            # a real file holding exactly what the link read as is this fork's own again
+            # a file of this fork's own, written here, is this fork's own again
             os.unlink(os.path.join(fork, CONFIG_FILE))
             write(fork, CONFIG_FILE, theirs + "# ours\n")
             self.assertEqual(self.mode(fork), "self")
+
+        def theirs_as_a_link(self, fork: str, theirs: str) -> None:
+            """The original project keeps its settings in `theirs-real.toml` and a LINK at
+            `.forkflow.toml`. A sync brings both in and they are left on disk untracked -
+            the state the symlink refusal is printed in."""
+            commit_upstream(self.tmp, "theirs-real.toml", theirs, "theirs: settings")
+            seed = os.path.join(self.tmp, "seed")
+            os.symlink("theirs-real.toml", os.path.join(seed, CONFIG_FILE))
+            sh("git", "add", "-A", cwd=seed)
+            sh("git", "commit", "-m", "theirs: the config is a link", cwd=seed)
+            sh("git", "push", "origin", "main", cwd=seed)
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            sh("git", "checkout", "-q", "upstream/main", "--", "theirs-real.toml",
+               CONFIG_FILE, cwd=fork)
+            sh("git", "rm", "-q", "--cached", "--", "theirs-real.toml", CONFIG_FILE, cwd=fork)
+
+        def test_the_symlink_remedy_leaves_no_config_behind(self):
+            """A REMEDY MUST NEVER PRODUCE CONFIG BYTES, and this one did. It ended
+            `cp -p -- <the copy> .forkflow.toml`, so following it put the LINK TARGET's
+            contents at the config's path - bytes no `.forkflow.toml` git stores has ever
+            held, matching nothing in `upstream_config_digests`, reading as this fork's own.
+            Run exactly as printed it turned the original project's `merge = "self"`, with
+            the original project's `gate` behind it, into this fork's declaration
+            (`f10/repro23.py`).
+
+            What it prints now takes the link away, names where what it read went, and stops
+            there. This test runs every command it prints, in the state it is printed in."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch pwned"]\n'
+            self.theirs_as_a_link(fork, theirs)
+            ctx = ctx_for(fork)
+            self.assertEqual(fork_config_state(ctx)[0], "unprovable")
+            why = fork_config_state(ctx)[2]
+
+            ran = run_every_printed(why, fork)
+            self.assertTrue(ran)
+            self.assertEqual([rc for _, rc in ran], [0] * len(ran), ran)
+
+            # nothing the tool produced is at the config's path - there is no file there
+            self.assertFalse(os.path.lexists(os.path.join(fork, CONFIG_FILE)))
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "none")
+            self.assertEqual(self.mode(fork), "manual")
+            # and what was there is kept, at the one path the refusal named
+            kept = kept_configs(fork)
+            self.assertEqual(len(kept), 1)
+            self.assertIn(kept[0], why)
+            with open(kept[0]) as fh:
+                self.assertEqual(fh.read(), theirs)
+            self.assertTrue(os.path.exists(os.path.join(fork, "theirs-real.toml")))
+            # the way forward is the user's own file, and it works
+            write(fork, CONFIG_FILE, 'merge = "self"\n# ours\n')
+            self.assertEqual(self.mode(fork), "self")
+
+        def test_the_attribute_remedy_leaves_no_config_behind(self):
+            """The other half of the same defect. Turning the attribute off in
+            `info/attributes` fixes what git does NEXT time and leaves the already-converted
+            file exactly where it is - and that file is the dangerous one: `ident` expanded
+            `$Id$` into it, so its bytes are in no upstream digest set and it reads as this
+            fork's own. Run as printed, the remedy opened `--merge` on the original
+            project's settings (`f10/repro23.py`).
+
+            It now ends by taking that file off disk, with what was there copied aside and
+            named first, and says to write your own."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch pwned"]\n# $Id$\n'
+            rendered = self.theirs_through_an_attribute(fork, "ident", theirs)
+            self.assertIn(b"$Id: ", rendered)       # git really expanded it
+            ctx = ctx_for(fork)
+            self.assertEqual(fork_config_state(ctx)[0], "unprovable")
+            why = fork_config_state(ctx)[2]
+
+            ran = run_every_printed(why, fork)
+            self.assertTrue(ran)
+            self.assertEqual([rc for _, rc in ran], [0] * len(ran), ran)
+
+            self.assertFalse(os.path.lexists(os.path.join(fork, CONFIG_FILE)))
+            state = fork_config_state(ctx_for(fork))
+            self.assertEqual(state[2], "")          # the attribute is off, nothing refused
+            self.assertEqual(state[0], "none")      # and no config was produced
+            self.assertEqual(self.mode(fork), "manual")
+            kept = kept_configs(fork)
+            self.assertEqual(len(kept), 1)
+            self.assertIn(kept[0], why)
+            with open(kept[0], "rb") as fh:
+                self.assertEqual(fh.read(), rendered)
+            write(fork, CONFIG_FILE, 'merge = "self"\n# ours\n')
+            self.assertEqual(self.mode(fork), "self")
+
+        def test_the_attribute_remedy_with_no_file_on_disk_removes_nothing(self):
+            """The attribute can be set on a path with no file at it - a tracked variant on
+            a case-sensitive filesystem. There is then nothing converted to take away, and
+            the remedy says so rather than printing an `rm` of a file that is not there."""
+            fork = make_fork(self.tmp, config='merge = "self"\n')
+            sh("git", "config", "core.ignorecase", "false", cwd=fork)
+            write(fork, ".gitattributes", ".ForkFlow.toml ident\n")
+            blob = sh("git", "hash-object", "-w", write(self.tmp, "v.txt", "theirs\n"),
+                      cwd=fork)
+            sh("git", "update-index", "--add", "--cacheinfo",
+               "100644,%s,.ForkFlow.toml" % blob, cwd=fork)
+            os.unlink(os.path.join(fork, CONFIG_FILE))
+            ctx = ctx_for(fork)
+            why = fork_config_state(ctx)[2]
+            self.assertIn("nothing to undo on disk", why)
+            for cmd in re.findall(r"`([^`]+)`", why):
+                self.assertFalse(cmd.startswith(("cp ", "mv ", "rm ", "test ")), cmd)
+            self.assertEqual([rc for _, rc in run_every_printed(why, fork)], [0, 0])
+            self.assertEqual(fork_config_state(ctx_for(fork))[2], "")
 
         def test_an_attribute_that_renders_the_config_is_not_judged_at_all(self):
             """`ident` expands `$Id$` into the blob's own hash on checkout, so the file in
@@ -13954,11 +14142,15 @@ def run_tests() -> None:
                 self.assertIn(CONFIG_FILE, why)
                 self.assertIn(git_path(fork, os.path.join("info", "attributes")), why)
                 self.assertIn(why, fork_merge_refusal(ctx))
-            # turned off for that one path in this clone's own attributes file: the way out
-            # the message prints, and it is additive - nothing of anybody's is overwritten
-            with open(git_path(fork, os.path.join("info", "attributes")), "a") as fh:
-                fh.write(CONFIG_FILE + " " + " ".join("-" + a for a in CONFIG_RENDER_ATTRS)
-                         + "\n")
+            # the way out the message prints, run as printed: the attribute is turned off
+            # for that one path in this clone's own attributes file (additive, nothing of
+            # anybody's overwritten) AND the converted file is taken off disk. It does not
+            # put a config back - `test_the_attribute_remedy_leaves_no_config_behind` is
+            # about why not - so what is left is no config at all
+            self.assertEqual([rc for _, rc in run_every_printed(why, fork)], [0, 0, 0])
+            self.assertFalse(os.path.lexists(os.path.join(fork, CONFIG_FILE)))
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "none")
+            write(fork, CONFIG_FILE, 'merge = "self"\n# ours\n')
             self.assertEqual(fork_config_state(ctx_for(fork))[0], "untracked_own")
             self.assertEqual(self.mode(fork), "self")
 
@@ -15760,6 +15952,42 @@ def run_tests() -> None:
             # and the state both `--merge` readers switch on is decided in that one place
             self.assertEqual(self.owners("fork_config_state("),
                              {"fork_config_state", "fork_merge_mode", "fork_merge_refusal"})
+
+        def test_every_copy_a_remedy_prints_is_built_here(self):
+            """A REMEDY MUST NEVER PRODUCE CONFIG BYTES. Two rounds running, a remedy has
+            ended by putting something back at `.forkflow.toml` - the contents a symlink
+            read as, and a file git's own conversion had rewritten - and each time the bytes
+            that landed there had never been any `.forkflow.toml` blob, so they matched
+            nothing in `upstream_config_digests`, read as this fork's own declaration, and
+            opened `--merge` on the original project's settings. Both were found by an
+            external reviewer, in the fixes for the round before.
+
+            So the shape is pinned in two places rather than trusted to review.
+
+            One: every copy this script prints for a user to run is built by `keep_aside`,
+            whose destination is inside the git directory by construction. Nothing else in
+            the script may spell a `cp` for a user at all.
+
+            Two: the copy `keep_aside` names is a DESTINATION and never a source. That is
+            exactly the shape the symlink remedy had - `cp -p -- <the copy> <the config>` -
+            and the one thing that turns a copy-aside into a way of producing config bytes.
+            `{sh_arg(keep)}` therefore appears in a printed command only at its end, and the
+            name `keep` is reserved for that destination - `cmd_ship`'s branch of somebody
+            else's commits is `saved` so this can be asked by name."""
+            self.assertEqual(self.owners("cp -p --"), {"keep_aside"})
+            self.assertEqual(self.owners("sh_arg(keep)"), {"keep_aside"})
+            self.assertEqual(self.owners("keep_aside("),
+                             {"keep_aside", "variant_remedy", "config_render_unprovable"})
+            # the same rule again on the printed text itself, so a copy spelled some other
+            # way is caught too. Adjacent f-string pieces are glued back together first:
+            # every remedy here is written across several lines
+            glued = re.sub(r'"\s*\n\s*f?"', "", "\n".join(self.lines[:self.limit]))
+            for cmd in re.findall(r"`([^`\n]+)`", glued):
+                words = cmd.split()
+                for i, word in enumerate(words):
+                    if "keep" in word and i != len(words) - 1:
+                        self.fail("a printed command reads back the copy it made, which is "
+                                  "how a remedy comes to produce config bytes: " + cmd)
 
         def test_no_printed_command_needs_a_git_newer_than_the_floor(self):
             """The README states the floor: Python 3.9+ and git 2.20+. Every command this
