@@ -444,6 +444,28 @@ exit 2; `--force` with several and none named is exit 2. An entry is cleared onl
 has the branch and commit that landed, read again right before the write (`forget_pending`).
 `status` prints one `pending` line per entry; the worktree refusal names `forkflow land <branch>`.
 
+⚠️ review fix (phase 3, external, iteration 1): the map made each record its own key and left the
+read-modify-write unlocked, which is the same loss one turn later. `os.replace` makes each write
+whole for a READER and says nothing about the window between a caller's read and its own write:
+eight worktrees recording their own ship at the same moment left ONE record, in 12 trials out of 12
+(scratchpad `f7/F2.sh`), and `forget_pending` writing its map back could drop a record another run
+had written since its read. Every write now goes through one `change_state(ctx, shared, change)`,
+which takes the state file's lock (an `O_CREAT|O_EXCL` file beside it - no dependency, and a lock
+older than `STATE_LOCK_STALE` belonged to a run that died, so nothing holds it for ever), reads,
+lets the caller edit and writes back, and answers "" or why it could not.
+`TestSourceInvariants.test_the_state_file_is_written_in_one_place_and_under_its_lock` pins
+`save_state`, `take_state_lock` and `drop_state_lock` to `change_state` alone, so a writer added
+later cannot go around it. The same round: `save_state` swallowed every write failure, so a run
+whose push and merge request had both succeeded printed "after the MR is merged, next: forkflow
+land" about a record that does not exist, and `land` then answered "nothing pending" about a pushed
+branch with an open request. `save_state` now answers the reason; `report_pending` READS THE RECORD
+BACK where the user is left to finish the landing (instead of the `next:` line, and on the way out
+of a `--merge` that did not land) and, when it is not there, names the branch, the commit and the
+request and prints the by-hand finish - a fetch, `git switch <trunk>`, `git merge --ff-only
+origin/<trunk>`, `git branch -d <branch>`. Nothing commits, nothing is forced, and the run still
+exits 0: the push and the merge request happened. `resume_unrecorded` says the same about a resume
+record, and `land` says when a landed record could not be cleared.
+
 ### `land`
 
 `cmd_land(args)` -> `resolve_ctx(need_upstream=True, need_trunk=True, strict_mirror=False)`, header,
