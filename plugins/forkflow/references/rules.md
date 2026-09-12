@@ -88,7 +88,9 @@ the command on exactly as printed. When the origin URL names no project at all, 
 command and says which URL it could not address: open that merge request in the web UI.
 
 `--merge` (on `sync` and `ship`, only on a fork whose `.forkflow.toml` says `merge = "self"`, and
-only while those bytes are not a `.forkflow.toml` the original project has) merges with the
+only while those bytes are not a `.forkflow.toml` the original project has - asked of every
+remote-tracking ref that is not `origin`'s, and refused outright in a clone that cannot answer it:
+shallow, partial, `refs/replace/*` or grafts, nothing of upstream's fetched) merges with the
 method the project is configured for on GitLab - which `setup`'s report insists is `ff` - and
 with the method rule 5 requires per call on GitHub (`--merge` for a sync, `--rebase` for a ship),
 always with a head-commit guard (`--sha` / `--match-head-commit`) so only the exact commit the

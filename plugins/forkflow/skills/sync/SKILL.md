@@ -107,7 +107,11 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    has to be the fork's own: it is read only from the `.forkflow.toml` committed on
    `origin/<trunk>` (or, while none is, an untracked one), and only while those bytes are not a
    `.forkflow.toml` the original project has - never from the sync branch, whose tree holds
-   upstream's file. Refused on `--continue`, resume with the command it prints (`sync --continue
+   upstream's file. "Not one the original project has" is asked of every remote-tracking ref that
+   is not `origin`'s, and it fails CLOSED: in a clone that cannot answer it - shallow, partial,
+   `refs/replace/*` or grafts, nothing of upstream's fetched, an object that cannot be read -
+   `--merge` alone is exit 2 and the message names the condition and the command that ends it.
+   Refused on `--continue`, resume with the command it prints (`sync --continue
    --mr`: the MR is opened, not merged) and have the MR merged by hand. It is asked again right
    before the merge; a fork that stopped saying `"self"` meanwhile is exit 6. Never work around
    that gate - a reviewed fork is meant to stop here. The merge is the one rule 5 requires, with

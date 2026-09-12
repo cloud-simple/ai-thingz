@@ -89,7 +89,11 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    `--repo` (`rules.md`). `merge` is read only from the `.forkflow.toml` committed on
    `origin/<trunk>` (or, while none is, an untracked one), and only while those bytes are not a
    `.forkflow.toml` the original project has - not from the branch being shipped, so the ship
-   that first commits the config is a plain `--mr`, merged by hand. Never work around that gate -
+   that first commits the config is a plain `--mr`, merged by hand. "Not one the original project
+   has" is asked of every remote-tracking ref that is not `origin`'s, and it fails CLOSED: in a
+   clone that cannot answer it - shallow, partial, `refs/replace/*` or grafts, nothing of
+   upstream's fetched, an object that cannot be read - `--merge` alone is exit 2 and the message
+   names the condition and the command that ends it. Never work around that gate -
    a reviewed fork is meant to stop here. The merge is the method rule 5 requires with a
    head-commit guard, so only the exact commit this run pushed can be merged: GitLab `glab mr
    merge <branch> --repo <fork> --sha <head> --auto-merge=false --remove-source-branch --yes`

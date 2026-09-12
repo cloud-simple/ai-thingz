@@ -2857,13 +2857,122 @@ def config_fingerprint(text: str) -> str:
     return "\n".join(line.rstrip() for line in body.splitlines()).strip("\n")
 
 
-def upstream_config_texts(ctx: Ctx) -> set:
-    """Every `.forkflow.toml` the original project has EVER had, fingerprinted.
+def foreign_remote_refs(ctx: Ctx) -> list:
+    """Every remote-tracking ref that is not `origin`'s.
 
-    SCOPE - histories, not tips. The refs a fork holds upstream's work in:
-    `<upstream>/<branch>`, the mirror both on origin and here (rule 6 keeps it a pristine
-    copy of upstream), and `MERGE_HEAD` while a sync merge is being resolved - and, for
-    each, EVERY version of the file its history has carried, not only the one at the tip.
+    The one frame in this clone the original project cannot write, and so the basis of
+    every provenance answer. Remotes are local git config: upstream cannot add one here,
+    cannot move a ref under one, and cannot make this clone forget one. `origin` is the
+    fork itself and stays out - its branches carry the fork's OWN configs, which is what
+    upstream's are compared against.
+
+    A broken symref (`<remote>/HEAD` after its target is deleted) is not listed by
+    `for-each-ref` at all, so nothing here has to filter one out."""
+    ours = f"refs/remotes/{ctx.origin}/"
+    listing = git("for-each-ref", "--format=%(refname)", "refs/remotes/",
+                  cwd=ctx.root, check=False)
+    return [ref for ref in listing.splitlines() if ref and not ref.startswith(ours)]
+
+
+def upstream_scope_refs(ctx: Ctx) -> list:
+    """The refs `upstream_config_texts` walks - chosen without asking the `.forkflow.toml`
+    whose provenance is the whole question.
+
+    The scope used to be the refs the CONFIG names: `<upstream>/<branch>` and the mirror,
+    both read off the working tree's `.forkflow.toml`. That let the file being judged
+    choose the evidence against it - upstream's own config naming an `upstream_branch` of
+    upstream's that never carried a config, and a `mirror` naming the fork's trunk, left
+    the comparison set empty, so upstream's bytes matched nothing and read as the fork's
+    own. That was the seventh route into the `--merge` gate, and the lesson of all seven:
+    what the gate depends on has to come from somewhere upstream cannot write.
+
+    So the baseline is the frame upstream cannot write - `foreign_remote_refs`. On top of
+    it, three additions that can only WIDEN the set: the mirror on origin and here (rule 6
+    keeps it a pristine copy of upstream; its name is the config's, which is why it is an
+    addition and never a subtraction), the same for the upstream branch's name, and
+    `MERGE_HEAD` while a sync merge is being resolved.
+
+    A SUPERSET is the safe direction. An extra ref can only make MORE bytes count as
+    upstream's, never fewer: the cost is a refusal, and every refusal here prints the same
+    way back - one character of the fork's own in the file makes the file the fork's."""
+    refs = foreign_remote_refs(ctx)
+    seen = set(refs)
+
+    def add(ref: str) -> None:
+        if ref not in seen and has_ref(ctx.root, ref):
+            seen.add(ref)
+            refs.append(ref)
+
+    for name in (ctx.mirror, ctx.upstream_branch):
+        add(f"refs/remotes/{ctx.origin}/{name}")
+        add(f"refs/heads/{name}")
+    if merge_in_progress(ctx.root):
+        refs.append("MERGE_HEAD")
+    return refs
+
+
+def history_unprovable(ctx: Ctx) -> str:
+    """"" when this clone can be read for what `.forkflow.toml`s the original project has
+    had, otherwise why it cannot - and then `--merge` is REFUSED.
+
+    A version the walk cannot see is not a version upstream never had, and the difference
+    decides whether upstream's own file reads as this fork's. Each of these hides history:
+
+    - a SHALLOW clone simply does not have the commits before its cut;
+    - a PARTIAL clone has the commits and not the blobs, fetched on demand - and the fetch
+      that would get one needs a server this run may not be able to reach;
+    - `refs/replace/*` and a grafts file make git answer with a history that is not the one
+      the original project published;
+    - and a clone with no remote-tracking ref outside `origin` (`foreign_remote_refs`) holds
+      no history of the original project's at all, so the only refs left to walk would be
+      the ones the config names - which is the hole `upstream_scope_refs` exists to close.
+
+    Every one of them turns "upstream never had these bytes" into a lie, and that lie opens
+    the gate on upstream's `merge` and so on upstream's `gate`, which this tool runs as
+    shell. So each is a refusal with the condition named and a way out of it: the clone can
+    be completed, or the merge request can be merged by a person, which is what a fork
+    without `merge = "self"` does anyway."""
+    if not foreign_remote_refs(ctx):
+        return (f"this clone holds no remote-tracking ref outside `{ctx.origin}` - nothing "
+                f"of the original project's is fetched here, so there is nothing to compare "
+                f"a `{CONFIG_FILE}` against: `git fetch {sh_arg(ctx.upstream)}`, then run "
+                f"this again")
+    if git("rev-parse", "--is-shallow-repository", cwd=ctx.root, check=False) == "true":
+        return (f"this clone is shallow, so the `{CONFIG_FILE}` versions before its cut are "
+                f"not in it to compare against - `git fetch --unshallow "
+                f"{sh_arg(ctx.upstream)}`, then run this again")
+    replaced = [r for r in git("for-each-ref", "--format=%(refname)", "refs/replace/",
+                               cwd=ctx.root, check=False).splitlines() if r]
+    if replaced:
+        return (f"{len(replaced)} `refs/replace/*` entry/entries rewrite what this clone's "
+                f"history shows (`git replace -l` lists them), so what a walk of it reads "
+                f"is not what the original project published")
+    grafts = git_path(ctx.root, os.path.join("info", "grafts"))
+    if grafts and os.path.exists(grafts):
+        return (f"`{grafts}` grafts this clone's history, so what a walk of it reads is not "
+                f"what the original project published")
+    partial = git("config", "--get", "extensions.partialclone", cwd=ctx.root, check=False)
+    promisors = [ln.split()[0] for ln in
+                 git("config", "--get-regexp", r"^remote\..*\.promisor$",
+                     cwd=ctx.root, check=False).splitlines()
+                 if ln.split()[-1:] == ["true"]]
+    which = (f"extensions.partialclone={partial}" if partial
+             else ", ".join(f"{key}=true" for key in promisors))
+    if partial or promisors:
+        return (f"this clone is partial ({which}): objects are fetched on demand, so a "
+                f"`{CONFIG_FILE}` the original project had can be absent here and read as "
+                f"one it never had - re-clone without `--filter`, or `git fetch --refetch "
+                f"{sh_arg(ctx.upstream)}`, so that every object is here")
+    return ""
+
+
+def upstream_config_texts(ctx: Ctx) -> Tuple[set, str]:
+    """(every `.forkflow.toml` the original project has EVER had, fingerprinted; "" - or
+    why this clone cannot be asked that at all, which is a refusal, see `fork_config_state`).
+
+    SCOPE - histories, not tips, over `upstream_scope_refs` (which is where the refs are
+    chosen, and why they are not the config's). For each of them EVERY version of the file
+    its history has carried, not only the one at the tip.
 
     Sampling the tips was the first shape of this and it left the gate open on a delay.
     Upstream's file, brought in by a sync and left on disk untracked, was refused while
@@ -2873,33 +2982,53 @@ def upstream_config_texts(ctx: Ctx) -> set:
     still upstream's, however long ago it retired it, so the question is asked of the whole
     history.
 
-    Two git calls plus one per DISTINCT version ever committed: `rev-list --objects
-    --full-history <refs> -- :(icase)<name>` lists the commits that changed the path and,
-    beside each, the blob it holds there, so the versions are read once each however many
-    commits carry them; `--full-history` follows every parent of a merge, so a version that
-    exists only on a side branch or only in a merge's own resolution is listed too. The
-    pathspec keeps the walk's output to the file and the file alone (50,000 commits: 90ms).
+    Two git calls per REF read, plus one per DISTINCT version ever committed: `rev-list
+    --objects --full-history <refs> -- :(icase)<name>` lists the commits that changed the
+    path and, beside each, the blob it holds there, so the versions are read once each
+    however many commits carry them; `--full-history` follows every parent of a merge, so a
+    version that exists only on a side branch or only in a merge's own resolution is listed
+    too. The pathspec keeps the walk's output to the file and the file alone, so the width
+    of the scope costs far less than it looks: 100,000 commits over 17 refs and four
+    remotes, 200 distinct versions of the file, is 1.0s, of which the walk itself is 30ms
+    and the rest is one `cat-file` per version. `--merge` runs reach this and nothing else
+    does, twice each (the gate, then `merge_mr` after the fetch).
 
-    The tips are read separately, through the case-folding `config_text`: `:(icase)` matches
-    ASCII case only, so a tip spelling the name with a character that merely case-FOLDS to
-    one of these (the Kelvin sign) is caught there. In a history such a spelling is not -
-    `load_config` refuses to read any such file in the working tree, so it cannot be the
-    file whose provenance is in question."""
+    The tips are read separately, and by name rather than through `config_text`: `:(icase)`
+    matches ASCII case only, so a tip spelling the name with a character that merely
+    case-FOLDS to one of these (the Kelvin sign) is caught here. In a history such a
+    spelling is not - `load_config` refuses to read any such file in the working tree, so
+    it cannot be the file whose provenance is in question.
+
+    FAIL CLOSED, everywhere the reading can fail. A blob that cannot be read, a tree that
+    cannot be listed, a walk git refuses - none of them is evidence that upstream never had
+    those bytes, and treated as absence each one is an open gate. So each answers with the
+    reason instead of a short set, on top of the whole-repository conditions
+    `history_unprovable` names."""
+    blind = history_unprovable(ctx)
+    if blind:
+        return (set(), blind)
+    refs = upstream_scope_refs(ctx)
     fold = CONFIG_FILE.casefold()
-    tips = [ref for ref in (f"refs/remotes/{ctx.up()}",
-                            f"refs/remotes/{ctx.origin}/{ctx.mirror}",
-                            f"refs/heads/{ctx.mirror}") if has_ref(ctx.root, ref)]
-    if merge_in_progress(ctx.root):
-        tips.append("MERGE_HEAD")
     texts = set()
-    for revision in tips:
-        text = config_text(ctx, revision)     # None: no such revision, or no file in its tree
-        if text is not None:
-            texts.add(config_fingerprint(text))
-    if not tips:
-        return texts
-    listing = git("rev-list", "--objects", "--full-history", *tips, "--",
-                  f":(icase){CONFIG_FILE}", cwd=ctx.root, check=False)
+    for revision in refs:
+        name = config_name_at(ctx, revision)  # None: no file in its tree; the exact name
+        if name is None:                      # when the tree cannot be listed, so `show` says
+            continue
+        rc, text, err = git_rc("show", f"{revision}:{name}", cwd=ctx.root)
+        if rc != 0:
+            why = tail_lines(err, 1)
+            return (set(), f"`{revision}:{name}` is in this clone's refs and cannot be read "
+                           f"({why[0] if why else 'git gave no reason'}) - a version the "
+                           f"original project has may be missing here; complete the clone, "
+                           f"or have the merge request merged by hand")
+        texts.add(config_fingerprint(text))
+    rc, listing, err = git_rc("rev-list", "--objects", "--full-history", *refs, "--",
+                              f":(icase){CONFIG_FILE}", cwd=ctx.root)
+    if rc != 0:
+        why = tail_lines(err, 1)
+        return (set(), f"this clone's history cannot be walked for `{CONFIG_FILE}` "
+                       f"({why[0] if why else 'git gave no reason'}) - complete the clone, "
+                       f"or have the merge request merged by hand")
     blobs = set()
     for line in listing.splitlines():
         sha, _, name = line.partition(" ")
@@ -2907,9 +3036,14 @@ def upstream_config_texts(ctx: Ctx) -> set:
             blobs.add(sha)
     for sha in sorted(blobs):
         rc, text, _ = git_rc("cat-file", "blob", sha, cwd=ctx.root)
-        if rc == 0:
-            texts.add(config_fingerprint(text))
-    return texts
+        if rc != 0:
+            return (set(), f"the `{CONFIG_FILE}` this clone's history lists at {short(sha)} "
+                           f"cannot be read - the object is not here (a filtered or damaged "
+                           f"clone), and a version the original project had would be read "
+                           f"as one it never had; complete the clone, or have the merge "
+                           f"request merged by hand")
+        texts.add(config_fingerprint(text))
+    return (texts, "")
 
 
 def config_is_upstreams(ctx: Ctx, text: Optional[str],
@@ -2941,7 +3075,7 @@ def config_is_upstreams(ctx: Ctx, text: Optional[str],
     if text is None:
         return False
     if upstreams is None:
-        upstreams = upstream_config_texts(ctx)
+        upstreams, _ = upstream_config_texts(ctx)   # the refusal is `fork_config_state`'s
     return config_fingerprint(text) in upstreams
 
 
@@ -2997,8 +3131,9 @@ def own_untracked_config(ctx: Ctx, upstreams: Optional[set] = None) -> bool:
     return not config_is_upstreams(ctx, text, upstreams)
 
 
-def fork_config_state(ctx: Ctx) -> Tuple[str, Optional[str]]:
-    """Which `.forkflow.toml` speaks for this fork's `merge`, and the bytes of it.
+def fork_config_state(ctx: Ctx) -> Tuple[str, Optional[str], str]:
+    """Which `.forkflow.toml` speaks for this fork's `merge`, the bytes of it, and - when
+    the question cannot be answered at all - why not.
 
     `fork_merge_mode` reads the mode out of the two states that carry a declaration of
     this fork's own - `trunk_own` and `untracked_own` - and `fork_merge_refusal` names the
@@ -3020,13 +3155,23 @@ def fork_config_state(ctx: Ctx) -> Tuple[str, Optional[str]]:
       in, which is byte for byte the state `setup` leaves the fork's own template in;
     - `none` - no readable file anywhere it would be read from.
 
-    The text is whatever the state was read from, None when there is none.
+    Before any of them, `unprovable`: `upstream_config_texts` could not be asked what the
+    original project's configs are (a shallow, partial, grafted or replaced clone, an
+    object that is not here, a walk git refused). Every state below it is a statement about
+    a set that would then be short, and a short set reads upstream's own file as this
+    fork's - so the answer is the reason, and `--merge` is refused with it. It is decided
+    first because it is a fact about the clone, true whichever file is being judged.
+
+    The text is whatever the state was read from, None when there is none; the third field
+    is that reason, "" in every other state.
 
     What upstream's configs are is read ONCE here and handed to each question this one
     decision asks - the states below ask it of up to two files, and the walk behind it
     (`upstream_config_texts`) would otherwise be repeated for one answer. Nothing keeps it
     beyond this call: `fork_merge_mode` runs twice per `--merge` run on purpose."""
-    upstreams = upstream_config_texts(ctx)
+    upstreams, blind = upstream_config_texts(ctx)
+    if blind:
+        return ("unprovable", working_config_text(ctx), blind)
     trunk_name = f"{ctx.origin}/{ctx.trunk}"
     if has_ref(ctx.root, f"refs/remotes/{trunk_name}") and config_name_at(ctx, trunk_name):
         # one read, two questions: whose the file is and what it says have to be asked of
@@ -3034,16 +3179,16 @@ def fork_config_state(ctx: Ctx) -> Tuple[str, Optional[str]]:
         # the second, in `merge_mr`, is after this run's fetch moved the ref
         text = config_text(ctx, trunk_name)
         return ("trunk_upstreams" if written_by_upstream(ctx, text, upstreams)
-                else "trunk_own", text)
+                else "trunk_own", text, "")
     here = working_config_text(ctx)
     if tracked_config_names(ctx.root):
         return ("branch_upstreams" if config_is_upstreams(ctx, here, upstreams)
-                else "branch_own", here)
+                else "branch_own", here, "")
     if own_untracked_config(ctx, upstreams):
-        return ("untracked_own", here)
+        return ("untracked_own", here, "")
     if config_is_upstreams(ctx, here, upstreams):
-        return ("untracked_upstreams", here)
-    return ("none", here)
+        return ("untracked_upstreams", here, "")
+    return ("none", here, "")
 
 
 def fork_merge_mode(ctx: Ctx) -> str:
@@ -3063,8 +3208,9 @@ def fork_merge_mode(ctx: Ctx) -> str:
     working tree let upstream's `merge = "self"` merge a reviewed fork's sync four ways -
     on `--continue`, under a case variant of the name, and from a sync branch left checked
     out. Every other state - no file, a file that cannot be read, one only the branch or
-    only upstream carries - is "manual"."""
-    state, text = fork_config_state(ctx)
+    only upstream carries, and a clone that cannot be asked whose a file is at all
+    (`unprovable`) - is "manual"."""
+    state, text, _ = fork_config_state(ctx)
     if state == "trunk_own":
         where = f"{ctx.origin}/{ctx.trunk}:{CONFIG_FILE}"
         return merge_mode_in(text, where) or MERGE_MANUAL
@@ -3087,6 +3233,8 @@ def fork_merge_refusal(ctx: Ctx) -> str:
     - this used to re-derive it, so a state added there reached a message written for
     another one. The user can see which state they are in, so the message names it:
 
+    - this clone cannot be asked the question at all (`unprovable`), which is about the
+      clone and not about any file, so the message is the condition and the way round it;
     - the config on the trunk is upstream's own file, byte for byte (a sync took it whole);
     - the checked-out branch carries one, which is read nowhere until it is on the trunk;
     - the untracked config in the working tree is upstream's own file;
@@ -3106,7 +3254,18 @@ def fork_merge_refusal(ctx: Ctx) -> str:
     yours = (f"Make it this fork's: edit it - with `merge = \"self\"` set by you - ")
     generic = (f"{fork_merge_source(ctx)}; a `{CONFIG_FILE}` the checked-out branch carries "
                f"is not read for it. This fork's merge requests are merged by hand.")
-    state, _ = fork_config_state(ctx)
+    state, _, blind = fork_config_state(ctx)
+    if state == "unprovable":
+        # nothing about the file: this clone cannot be asked what upstream's configs are,
+        # so no answer about whose the file is would mean anything. The way forward is the
+        # one every fork without `merge = "self"` uses, and it needs no clone at all
+        return (f"and whether any `{CONFIG_FILE}` here is this fork's own cannot be decided "
+                f"in this clone: {blind}. Until it can, `--merge` is refused whatever the "
+                f"file says - a version the original project had that this clone cannot see "
+                f"reads as one it never had, which is upstream's `merge` (and upstream's "
+                f"`gate`, which this tool runs as shell) taken for this fork's word. "
+                f"Nothing else is refused: run the same command without `--merge` and have "
+                f"the merge request merged by hand.")
     if state == "trunk_own":
         return generic                  # this fork's own file; it just does not say "self"
     if state == "trunk_upstreams":
@@ -13271,6 +13430,72 @@ def run_tests() -> None:
             write(fork, CONFIG_FILE, theirs + "# ours\n")
             self.assertEqual(self.mode(fork), "self")
 
+        def blank_upstream_branch(self, name: str = "blank") -> None:
+            """A branch of the original project's own that never carried a config - the ref
+            upstream points the walk at when it gets to choose the walk's scope."""
+            seed = os.path.join(self.tmp, "seed")
+            sh("git", "checkout", "-q", "--orphan", name, cwd=seed)
+            sh("git", "rm", "-q", "-rf", ".", cwd=seed)
+            write(seed, "BLANK.md", "nothing here\n")
+            sh("git", "add", "-A", cwd=seed)
+            sh("git", "commit", "-q", "-m", "theirs: a branch with no config in it", cwd=seed)
+            sh("git", "push", "-q", "origin", name, cwd=seed)
+            sh("git", "checkout", "-q", "main", cwd=seed)
+
+        def test_upstream_does_not_choose_the_refs_the_walk_reads(self):
+            """The seventh route into the gate: the provenance walk's own SCOPE was read
+            off the `.forkflow.toml` whose provenance it decides. Upstream's file names an
+            `upstream_branch` of upstream's that never carried a config and swaps `trunk`
+            and `mirror`, so every ref the old walk read - `<upstream>/<branch>` and the
+            mirror - held no config at all. The set came back empty, upstream's own bytes
+            matched nothing, and the config sitting on `origin/main` (the MIRROR, a pristine
+            copy of upstream) was read as this fork's reviewed declaration: `merge = "self"`,
+            gate open, upstream's `gate` run here as shell.
+
+            `upstream_scope_refs` takes the scope from every remote-tracking ref that is not
+            `origin`'s instead - remotes are local git config, which upstream cannot write -
+            so `upstream/main` is walked however the config is spelled."""
+            fork = make_fork(self.tmp)
+            self.blank_upstream_branch()
+            theirs = ('merge = "self"\ngate = ["touch theirs"]\n'
+                      'upstream_branch = "blank"\ntrunk = "main"\nmirror = "develop"\n')
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            self.advance_mirror(fork)
+            write(fork, CONFIG_FILE, theirs)     # a sync brought it in; untracked by hand
+            ctx = ctx_for(fork)
+            self.assertEqual((ctx.upstream_branch, ctx.trunk, ctx.mirror),
+                             ("blank", "main", "develop"))      # the config got its way here
+            self.assertIn("refs/remotes/upstream/main", upstream_scope_refs(ctx))
+            # the file read for `merge` is the one the renamed "trunk" carries - which is
+            # the MIRROR, upstream's own pristine copy, and the walk says so
+            self.assertEqual(fork_config_state(ctx)[0], "trunk_upstreams")
+            self.assertEqual(self.mode(fork), "manual")
+
+        def test_the_walk_reads_a_remote_the_config_never_names(self):
+            """The scope is EVERY non-origin remote-tracking ref, not the one the config
+            calls `upstream`: a second remote for the same project - a mirror of it, a
+            colleague's fork of it - carries upstream's configs too, and a config pointing
+            `upstream` at a remote with nothing fetched under it must not make them this
+            fork's. `upstream/main` is deleted here and the mirror with it, so only the
+            other remote's refs can answer - and they do."""
+            fork = make_fork(self.tmp)
+            theirs = ('merge = "self"\nupstream = "upstream"\n'
+                      '# theirs, fetched under another remote\n')
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            sh("git", "remote", "add", "elsewhere", os.path.join(self.tmp, "upstream.git"),
+               cwd=fork)
+            sh("git", "fetch", "-q", "elsewhere", cwd=fork)
+            sh("git", "update-ref", "-d", "refs/remotes/upstream/main", cwd=fork)
+            sh("git", "branch", "-q", "-D", "main", cwd=fork)    # the mirror is not advanced
+            write(fork, CONFIG_FILE, theirs)
+            ctx = ctx_for(fork)
+            self.assertEqual(ctx.upstream, "upstream")           # the config named that one
+            self.assertEqual([r for r in foreign_remote_refs(ctx) if r.endswith("/main")],
+                             ["refs/remotes/elsewhere/main"])
+            self.assertNotIn("theirs", sh("git", "show", "origin/main:" + CONFIG_FILE,
+                                          cwd=fork, check=False))
+            self.assertEqual(self.mode(fork), "manual")
+
         def test_a_version_upstream_only_ever_had_on_a_side_branch_is_upstreams(self):
             """`--full-history`, not the walk's default. A config upstream carried on a
             branch it merged keeping its own side (`-s ours`) is TREESAME to the first
@@ -13434,6 +13659,137 @@ def run_tests() -> None:
             self.assertIn("?? " + CONFIG_FILE, sh("git", "status", "--porcelain", cwd=fork))
             self.both_refused(fork)
             self.assertIn("?? " + CONFIG_FILE, sh("git", "status", "--porcelain", cwd=fork))
+
+        SELF = 'merge = "self"\n'
+
+        def self_fork(self) -> str:
+            """A fork whose own reviewed config says `merge = "self"`: everything but the
+            condition under test would let `--merge` through."""
+            fork = make_fork(self.tmp, config=self.SELF)
+            self.assertEqual(fork_merge_mode(ctx_for(fork)), MERGE_SELF)
+            self.feature(fork)            # `ship` refuses the trunk before the gate is read
+            return fork
+
+        @needs_tomllib
+        def test_refused_on_a_shallow_clone(self):
+            """Fail CLOSED: a version the walk cannot see is not a version upstream never
+            had. A shallow clone simply does not hold the commits before its cut, so
+            upstream's older `.forkflow.toml`s are missing from the comparison set and
+            upstream's own file reads as this fork's. The refusal names the condition and
+            the command that ends it."""
+            fork = self.self_fork()
+            sh("git", "fetch", "-q", "--depth=1", "upstream", "main", cwd=fork)
+            self.assertEqual(sh("git", "rev-parse", "--is-shallow-repository", cwd=fork),
+                             "true")
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn("shallow", err)
+            self.assertIn("git fetch --unshallow upstream", err)
+            self.assertIn("merged by hand", err)
+
+        @needs_tomllib
+        def test_refused_when_history_is_rewritten_by_a_replace_ref(self):
+            """`refs/replace/*` makes git answer with a history that is not the one the
+            original project published - which is the one the set has to be taken from."""
+            fork = self.self_fork()
+            head = rev(fork, "refs/remotes/upstream/main")
+            sh("git", "replace", "--graft", head, cwd=fork)       # the tip, with no parent
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn("refs/replace/", err)
+            self.assertIn("git replace -l", err)
+
+        @needs_tomllib
+        def test_refused_on_a_partial_clone(self):
+            """A promisor remote means the blobs are fetched on demand: a `.forkflow.toml`
+            upstream had can be absent here, and absence is what reads as "never had it"."""
+            fork = self.self_fork()
+            sh("git", "config", "remote.upstream.promisor", "true", cwd=fork)
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn("partial", err)
+            # the setting itself, so the user can see what the tool saw and unset it
+            self.assertIn("remote.upstream.promisor=true", err)
+
+        def upstream_ref_with_two_config_versions(self, fork: str) -> tuple:
+            """A ref of the original project's carrying two versions of the config, one
+            behind the other: (the tip, the older commit, the older blob). Built as real
+            objects in this clone so that removing one of them is git's own answer about a
+            missing object and not a mocked one."""
+            sh("git", "checkout", "-q", "-b", "tmp/theirs", cwd=fork)
+            write(fork, CONFIG_FILE, 'merge = "self"\n# the version they retired\n')
+            sh("git", "add", CONFIG_FILE, cwd=fork)
+            sh("git", "commit", "-q", "-m", "a version upstream had", cwd=fork)
+            older = rev(fork, "HEAD")
+            blob = sh("git", "rev-parse", older + ":" + CONFIG_FILE, cwd=fork)
+            write(fork, CONFIG_FILE, 'merge = "self"\n# the version they have now\n')
+            sh("git", "add", CONFIG_FILE, cwd=fork)
+            sh("git", "commit", "-q", "-m", "and the one after it", cwd=fork)
+            tip = rev(fork, "HEAD")
+            sh("git", "update-ref", "refs/remotes/upstream/theirs", tip, cwd=fork)
+            sh("git", "checkout", "-q", "feat/x", cwd=fork)
+            sh("git", "branch", "-q", "-D", "tmp/theirs", cwd=fork)
+            return (tip, older, blob)
+
+        def remove_object(self, fork: str, sha: str) -> None:
+            loose = os.path.join(fork, ".git", "objects", sha[:2], sha[2:])
+            self.assertTrue(os.path.exists(loose), loose)
+            os.remove(loose)
+
+        @needs_tomllib
+        def test_refused_when_a_config_at_a_tip_cannot_be_read(self):
+            """The object is gone from this clone, and a ref names the tree that holds it:
+            reading that as "upstream never had these bytes" is the open gate."""
+            fork = self.self_fork()
+            tip, _, _ = self.upstream_ref_with_two_config_versions(fork)
+            self.remove_object(fork, sh("git", "rev-parse", tip + ":" + CONFIG_FILE,
+                                        cwd=fork))
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn("cannot be read", err)
+            self.assertIn("merged by hand", err)
+
+        @needs_tomllib
+        @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                         "root reads a mode-000 file anyway")
+        def test_refused_when_a_config_the_history_lists_cannot_be_read(self):
+            """Not the tip - a version upstream has since replaced, which only the walk
+            lists. The tips all read fine, `rev-list` names the blob from the tree that
+            holds it without opening it, and `cat-file` then cannot produce it: the set
+            would silently be one version short, and that version is exactly the one a fork
+            ends up holding after a sync it never landed. Unreadable rather than gone,
+            because a missing object is what `rev-list` itself refuses - this is the half
+            of it that gets past the walk."""
+            fork = self.self_fork()
+            _, _, blob = self.upstream_ref_with_two_config_versions(fork)
+            loose = os.path.join(fork, ".git", "objects", blob[:2], blob[2:])
+            self.assertTrue(os.path.exists(loose), loose)
+            os.chmod(loose, 0o000)
+            self.addCleanup(os.chmod, loose, 0o444)
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn(short(blob), err)
+            self.assertIn("cannot be read", err)
+
+        @needs_tomllib
+        def test_refused_when_the_history_cannot_be_walked_at_all(self):
+            """A commit missing from the middle: the tips still read, and `rev-list` fails.
+            An empty answer from a walk that failed is not "no config was ever here"."""
+            fork = self.self_fork()
+            tip, older, _ = self.upstream_ref_with_two_config_versions(fork)
+            self.remove_object(fork, older)
+            self.assertTrue(sh("git", "show", tip + ":" + CONFIG_FILE, cwd=fork))
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn("cannot be walked", err)
+            self.assertIn("merged by hand", err)
+
+        @needs_tomllib
+        def test_refused_when_this_clone_holds_nothing_of_upstreams(self):
+            """Nothing outside `origin` is fetched here, so there is no history of the
+            original project's to compare a config against - and an empty set says every
+            file is this fork's own."""
+            fork = self.self_fork()
+            sh("git", "branch", "-q", "-D", "main", cwd=fork)
+            sh("git", "update-ref", "-d", "refs/remotes/upstream/main", cwd=fork)
+            self.assertEqual(foreign_remote_refs(ctx_for(fork)), [])   # HEAD is broken now
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn("no remote-tracking ref outside `origin`", err)
+            self.assertIn("git fetch upstream", err)
 
         def test_refused_with_no_config_at_all(self):
             """No file means "manual": the default is the safe side."""
@@ -14575,6 +14931,18 @@ def run_tests() -> None:
             self.assertEqual(self.owners("upstream_config_texts("),
                              {"upstream_config_texts", "config_is_upstreams",
                               "fork_config_state"})
+            # and the two halves of it that decide what may be read and whether the answer
+            # can be trusted at all are its own, so neither can be re-derived elsewhere
+            self.assertEqual(self.owners("upstream_scope_refs("),
+                             {"upstream_scope_refs", "upstream_config_texts"})
+            self.assertEqual(self.owners("history_unprovable("),
+                             {"history_unprovable", "upstream_config_texts"})
+            self.assertEqual(self.owners("foreign_remote_refs("),
+                             {"foreign_remote_refs", "upstream_scope_refs",
+                              "history_unprovable"})
+            self.assertEqual(calls_in("upstream_scope_refs"),
+                             {"foreign_remote_refs", "has_ref", "set",
+                              "merge_in_progress", "add"})
             self.assertEqual(self.owners("config_is_upstreams("),
                              {"config_is_upstreams", "written_by_upstream",
                               "own_untracked_config", "fork_config_state",

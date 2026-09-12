@@ -291,8 +291,14 @@ The checked-out branch's own copy is never read for it: a sync branch carries up
 upstream's `merge = "self"` can never switch the gate off, and a config upstream wrote onto the
 trunk (a trunk bootstrapped from an upstream that tracks the file) counts as no declaration at all.
 Whose file it is is decided by its bytes, against every `.forkflow.toml` the original project has
-ever had - the whole history of `upstream/<branch>` and of the mirror, not just their tips, so a
-version upstream has since retired is still upstream's. Any edit of your own makes it yours.
+ever had - the whole history of every remote-tracking ref that is not `origin`'s, plus the mirror,
+not just their tips, so a version upstream has since retired is still upstream's. Any edit of your
+own makes it yours. The refs walked are deliberately not the ones the config names: a config
+choosing the evidence against itself is no check at all. And the walk fails CLOSED - a clone that
+cannot prove what the original project has had gets exit 2 for `--merge` alone, with the condition
+named: shallow (`git fetch --unshallow <upstream>` ends it), partial (`--filter`), history rewritten
+by `refs/replace/*` or `info/grafts`, nothing of upstream's fetched, or an object that cannot be
+read. Everything else still works; the way past it is the ordinary one, `--mr` and a person merging.
 It is asked again right before the merge command runs; a fork that no longer says `"self"` by then
 (a teammate's commit the run's fetch brought in) gets exit 6 with the MR open. So the ship that
 first commits the config is `--mr`, merged by hand: once committed on a branch it is neither

@@ -271,6 +271,35 @@ purpose, and `TestMergeModeAskedAgainBeforeTheMerge.test_the_fetch_can_make_the_
 fails if the set survives the run's own fetch. The invariant's `owners("upstream_config_texts(")`
 gains `fork_config_state` for that one read.
 
+⚠️ deviation (review phase 3, external, iteration 2): the SCOPE of that walk was read off the
+`.forkflow.toml` whose provenance it decides - `ctx.upstream_branch` and `ctx.mirror` both come from
+the config - so the file being judged chose the evidence against it. That is the seventh route into
+the gate, and it was reproduced: upstream's file naming an `upstream_branch` of upstream's that
+never carried a config and swapping `trunk` and `mirror` left every walked ref configless, the
+comparison set came back empty, and the config sitting on `origin/main` - the MIRROR, upstream's own
+pristine copy - read as `trunk_own` with `merge = "self"`. The scope is now `upstream_scope_refs`:
+`foreign_remote_refs` (every remote-tracking ref that is not `origin`'s - remotes are local git
+config, which upstream cannot write, and `origin` is the fork, whose own branches must stay out)
+plus, as additions that can only widen it, the mirror and upstream-branch names on origin and here,
+plus `MERGE_HEAD`. A superset is the safe direction: an extra ref can only make MORE bytes count as
+upstream's, and the refusal already prints the way back. Cost, measured on a 100,000-commit history
+over 17 refs and four remotes with 200 distinct versions of the file: 1.0s, of which the walk itself
+is 30ms and the rest is one `cat-file` per version; only `--merge` runs reach it.
+
+⚠️ deviation (same round): the walk now FAILS CLOSED. A blob it cannot read is not evidence that
+upstream never had those bytes, and silently skipping one turns a hidden version into an open gate.
+`history_unprovable` refuses `--merge` outright when the clone cannot answer the question - shallow
+(`git rev-parse --is-shallow-repository`), partial (`extensions.partialclone`, a promisor remote),
+rewritten by `refs/replace/*` or an `info/grafts` file, or holding no remote-tracking ref outside
+`origin` at all - and `upstream_config_texts` refuses when a tip's config cannot be read, when
+`rev-list` fails, or when a listed blob cannot be `cat-file`d. The state is `unprovable`, decided
+before every other state in `fork_config_state` (which now returns `(state, text, why)`), and
+`fork_merge_refusal` prints the condition, what ends it (`git fetch --unshallow <upstream>`, a clone
+without `--filter`) and the way forward that needs none of it: run the same command without
+`--merge` and have the merge request merged by hand. Nothing else is refused - only `--merge`.
+The invariant gains `owners("upstream_scope_refs(")`, `owners("history_unprovable(")` and
+`owners("foreign_remote_refs(")`.
+
 ### Flags and dispatch
 
 - `sync` and `ship` gain `--merge` ("open the merge request and merge it; needs merge = \"self\" in
