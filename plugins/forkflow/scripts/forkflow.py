@@ -2711,6 +2711,47 @@ def own_untracked_config(ctx: Ctx) -> bool:
     return not config_is_upstreams(ctx, text)
 
 
+def fork_config_state(ctx: Ctx) -> Tuple[str, Optional[str]]:
+    """Which `.forkflow.toml` speaks for this fork's `merge`, and the bytes of it.
+
+    `fork_merge_mode` reads the mode out of the two states that carry a declaration of
+    this fork's own - `trunk_own` and `untracked_own` - and `fork_merge_refusal` names the
+    state the user is in. The two asked these questions separately, in the same order,
+    with nothing tying them together: a state added to one fell silently into the other's
+    "generic". The states, in the order they are decided:
+
+    - `trunk_own` / `trunk_upstreams` - a config is committed on `origin/<trunk>`, and
+      whose bytes those are (`written_by_upstream`) decides whether it is this fork's
+      reviewed declaration or upstream's, adopted whole by a trunk bootstrapped from a
+      project that tracks the file;
+    - `branch_own` / `branch_upstreams` - none is committed on the trunk and one is in the
+      index: a config the CHECKED-OUT BRANCH carries is read for `merge` nowhere, on a
+      branch it is neither untracked nor on the trunk, and a sync branch carries
+      upstream's file;
+    - `untracked_own` - the fork's own untracked `.forkflow.toml`, where `setup` leaves
+      it: own by its bytes, not by where git holds it (`own_untracked_config`);
+    - `untracked_upstreams` - upstream's file, untracked by hand after a sync brought it
+      in, which is byte for byte the state `setup` leaves the fork's own template in;
+    - `none` - no readable file anywhere it would be read from.
+
+    The text is whatever the state was read from, None when there is none."""
+    trunk_name = f"{ctx.origin}/{ctx.trunk}"
+    if has_ref(ctx.root, f"refs/remotes/{trunk_name}") and config_name_at(ctx, trunk_name):
+        # one read, two questions: whose the file is and what it says have to be asked of
+        # the same bytes. The two calls a `--merge` run makes stay two reads on purpose -
+        # the second, in `merge_mr`, is after this run's fetch moved the ref
+        text = config_text(ctx, trunk_name)
+        return ("trunk_upstreams" if written_by_upstream(ctx, text) else "trunk_own", text)
+    here = working_config_text(ctx)
+    if tracked_config_names(ctx.root):
+        return ("branch_upstreams" if config_is_upstreams(ctx, here) else "branch_own", here)
+    if own_untracked_config(ctx):
+        return ("untracked_own", here)
+    if config_is_upstreams(ctx, here):
+        return ("untracked_upstreams", here)
+    return ("none", here)
+
+
 def fork_merge_mode(ctx: Ctx) -> str:
     """This fork's `merge`, "self" or "manual" - the one reader every `--merge` decision goes
     through: `merge_gate` before anything is pushed, and `merge_mr` again right before the
@@ -2718,27 +2759,22 @@ def fork_merge_mode(ctx: Ctx) -> str:
 
     Read only from where the original project cannot write it:
 
-    - the config committed on `origin/<trunk>` (any case of the name, `config_text`) -
-      this fork's reviewed state - unless its bytes are a `.forkflow.toml` upstream has,
-      which makes it upstream's declaration adopted whole (`written_by_upstream`);
+    - the config committed on `origin/<trunk>` - this fork's reviewed state - unless its
+      bytes are a `.forkflow.toml` upstream has (`fork_config_state`: `trunk_own`);
     - while none is committed there, the fork's own untracked `.forkflow.toml`, where
-      `setup` leaves it (`own_untracked_config`).
+      `setup` leaves it (`untracked_own`).
 
     Never from the checked-out branch's committed tree, nor from a tree a sync merge has
     touched: a sync branch carries upstream's `.forkflow.toml`, and reading `merge` from the
     working tree let upstream's `merge = "self"` merge a reviewed fork's sync four ways -
     on `--continue`, under a case variant of the name, and from a sync branch left checked
-    out. Anything else - no file, a file that cannot be read - is "manual"."""
-    trunk_name = f"{ctx.origin}/{ctx.trunk}"
-    if has_ref(ctx.root, f"refs/remotes/{trunk_name}") and config_name_at(ctx, trunk_name):
-        # one read, two questions: whose the file is and what it says have to be asked of
-        # the same bytes. The two calls a `--merge` run makes stay two reads on purpose -
-        # the second, in `merge_mr`, is after this run's fetch moved the ref
-        text = config_text(ctx, trunk_name)
-        if written_by_upstream(ctx, text):
-            return MERGE_MANUAL
-        return merge_mode_in(text, f"{trunk_name}:{CONFIG_FILE}") or MERGE_MANUAL
-    if own_untracked_config(ctx):
+    out. Every other state - no file, a file that cannot be read, one only the branch or
+    only upstream carries - is "manual"."""
+    state, text = fork_config_state(ctx)
+    if state == "trunk_own":
+        where = f"{ctx.origin}/{ctx.trunk}:{CONFIG_FILE}"
+        return merge_mode_in(text, where) or MERGE_MANUAL
+    if state == "untracked_own":
         return load_config(ctx.root).get("merge") or MERGE_MANUAL
     return MERGE_MANUAL
 
@@ -2753,7 +2789,9 @@ def fork_merge_refusal(ctx: Ctx) -> str:
     """Why `--merge` is refused here and the way back - the rest of `merge_gate`'s message
     after "--merge needs `merge = "self"` in this fork's own config - ".
 
-    Four states, and the user can see which one they are in, so the message names it:
+    The state is `fork_config_state`'s, the same answer `fork_merge_mode` just decided on
+    - this used to re-derive it, so a state added there reached a message written for
+    another one. The user can see which state they are in, so the message names it:
 
     - the config on the trunk is upstream's own file, byte for byte (a sync took it whole);
     - the checked-out branch carries one, which is read nowhere until it is on the trunk;
@@ -2774,33 +2812,34 @@ def fork_merge_refusal(ctx: Ctx) -> str:
     yours = (f"Make it this fork's: edit it - with `merge = \"self\"` set by you - ")
     generic = (f"{fork_merge_source(ctx)}; a `{CONFIG_FILE}` the checked-out branch carries "
                f"is not read for it. This fork's merge requests are merged by hand.")
-    here = working_config_text(ctx)
-    if has_ref(ctx.root, f"refs/remotes/{trunk_name}") and config_name_at(ctx, trunk_name):
-        if not written_by_upstream(ctx, config_text(ctx, trunk_name)):
-            return generic              # this fork's own file; it just does not say "self"
+    state, _ = fork_config_state(ctx)
+    if state == "trunk_own":
+        return generic                  # this fork's own file; it just does not say "self"
+    if state == "trunk_upstreams":
         return (f"the `{CONFIG_FILE}` committed on `{trunk_name}` {theirs}. A sync brought "
                 f"it in and it was taken whole. {yours}on a branch off `{trunk_name}`, "
                 f"commit it there and `{ship}` it; once that merge request is merged, "
                 f"`--merge` works here.")
-    if tracked_config_names(ctx.root):
-        if config_is_upstreams(ctx, here):
-            # upstream's file, on the branch: no command - shipping it puts upstream's bytes
-            # on the trunk, where `merge` is still upstream's word and this refusal returns
-            return (f"the `{CONFIG_FILE}` this branch carries {theirs}, and a config the "
-                    f"checked-out branch carries is not read for `merge` in any case - only "
-                    f"the one on `{trunk_name}`, and only while it is this fork's own. Edit "
-                    f"the file in your fork, with `merge = \"self\"` set by you, and get "
-                    f"that onto `{trunk_name}` the way everything else gets there.")
+    if state == "branch_upstreams":
+        # upstream's file, on the branch: no command - shipping it puts upstream's bytes
+        # on the trunk, where `merge` is still upstream's word and this refusal returns
+        return (f"the `{CONFIG_FILE}` this branch carries {theirs}, and a config the "
+                f"checked-out branch carries is not read for `merge` in any case - only "
+                f"the one on `{trunk_name}`, and only while it is this fork's own. Edit "
+                f"the file in your fork, with `merge = \"self\"` set by you, and get "
+                f"that onto `{trunk_name}` the way everything else gets there.")
+    if state == "branch_own":
         return (f"{fork_merge_source(ctx)}; the `{CONFIG_FILE}` this branch carries is not "
                 f"read for it - committed on a branch it is neither untracked nor on "
                 f"`{trunk_name}`. Get it onto the trunk first: `{ship}`, have that merge "
                 f"request merged, then: {land_cmd()}. A `merge = \"self\"` it carries "
                 f"counts from then on.")
-    if config_is_upstreams(ctx, here):
+    if state == "untracked_upstreams":
         return (f"the untracked `{CONFIG_FILE}` in the working tree {theirs}. A sync brought "
                 f"it in and it was untracked by hand. {yours}and run this again; nothing has "
                 f"to be committed, an untracked config is read while none is on "
                 f"`{trunk_name}`.")
+    # `untracked_own` that does not say "self", and `none`: no declaration to point at
     return generic
 
 
@@ -2876,17 +2915,18 @@ def cmd_sync_continue(ctx: Ctx, args: argparse.Namespace) -> int:
                        resumable(ctx, "sync", name).get("backup", ""), merge_sha)
 
 
-def merge_gate(ctx: Ctx, args: argparse.Namespace, resume_sync: bool = False,
-               branch: str = "") -> None:
+def merge_gate(ctx: Ctx, args: argparse.Namespace, resume_sync: bool = False) -> None:
     """`--merge` refused, or nothing - before the fetch, the backup and any push.
 
     Config AND flag: the fork declares once, in `.forkflow.toml`, that its merge requests are
     merged by whoever opened them (`merge = "self"`), and the flag asks for it per run. Either
     alone does nothing, so a reviewed fork can never be merged by accident. The declaration
     is the fork's own - `fork_merge_mode`, never the checked-out tree, which on a sync branch
-    or a resumed sync holds upstream's file. The last check is knowable now too: a merge
+    or a resumed sync holds upstream's file. The second check is knowable now too: a merge
     command addresses the fork by URL (`mr_target`), and an origin that names no project
-    would otherwise be a push followed by a failure."""
+    would otherwise be a push followed by a failure. A branch name both tools would read as
+    a merge request number is `ship_preflight`'s, with the other names `ship` will not
+    take: it is a fact about the branch, not about this fork's config."""
     if not getattr(args, "merge", False):
         return
     if fork_merge_mode(ctx) != MERGE_SELF:
@@ -2900,13 +2940,6 @@ def merge_gate(ctx: Ctx, args: argparse.Namespace, resume_sync: bool = False,
     if not target:
         raise Fail(f"--merge: `{ctx.origin_url or '-'}` names no project to merge on "
                    f"({reason})")
-    if re.fullmatch(r"#?[0-9]+", branch):
-        # the merge command addresses the merge request by its branch, and both tools read
-        # `123` (or `#123`) as a merge request *number* - some other request entirely
-        raise Fail(f"--merge: `{branch}` reads as a merge request number to glab and gh, "
-                   f"which is how the merge is addressed - rename the branch "
-                   f"(`git branch -m {sh_arg(branch)} <name>`) and ship again")
-
 
 def cmd_sync(args: argparse.Namespace) -> int:
     ctx = resolve_ctx(args.dir, args, need_upstream=True, need_trunk=True, strict_mirror=True)
@@ -3042,6 +3075,14 @@ def ship_preflight(ctx: Ctx, args: Optional[argparse.Namespace] = None) -> str:
         raise Fail(f"`{branch}` is a name forkflow will not push: git's refspec grammar does "
                    f"not read it as one branch (a leading `+` means force, a leading `-` an "
                    f"option) - rename it with `git branch -m <name>`")
+    if getattr(args, "merge", False) and re.fullmatch(r"#?[0-9]+", branch):
+        # `--merge` addresses the merge request by its source branch, and both tools read
+        # `123` (or `#123`) as a merge request *number* - some other request entirely.
+        # Here, with the other names this branch cannot be shipped under, and not in
+        # `merge_gate`, which answers for the fork's config and not for the branch
+        raise Fail(f"--merge: `{branch}` reads as a merge request number to glab and gh, "
+                   f"which is how the merge is addressed - rename the branch "
+                   f"(`git branch -m {sh_arg(branch)} <name>`) and ship again")
     if not clean_tree(ctx):
         raise Fail("the working tree has uncommitted changes: commit or stash them first")
     return branch
@@ -3296,7 +3337,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
     ctx = resolve_ctx(args.dir, args, need_upstream=True, need_trunk=True, strict_mirror=True)
     header(ctx, "ship")
     branch = ship_preflight(ctx, args)
-    merge_gate(ctx, args, branch=branch)   # before `--continue`, the fetch, the backup, the push
+    merge_gate(ctx, args)      # before `--continue`, the fetch, the backup and the push
     trunk_name = f"{ctx.origin}/{ctx.trunk}"
 
     if getattr(args, "cont", False):
@@ -3606,52 +3647,27 @@ def pending_to_land(ctx: Ctx, entry: Optional[dict], branch: str, force: bool) -
     return [entries[b] for b in sorted(entries)]
 
 
-def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False,
-                 entry: Optional[dict] = None, branch: str = "") -> None:
-    """The closing step of a ship or a sync, from the `pending` records: fetch, recognise
-    the landing, fast-forward the local trunk, delete the landed branch, forget the record.
+def judge_landings(ctx: Ctx, chosen: Sequence[dict], force: bool, after_merge: bool,
+                   implicit: bool) -> list:
+    """Which of `chosen` are on `origin/<trunk>`: [(entry, the sha it landed as, how)].
 
-    Works after a human merged the merge request, in any later session, and after a
-    "squash and merge" or a "rebase and merge" of a ship (see `landed`). A merge request
-    that is not on the trunk yet is exit 2 and not an error - "not merged yet" - unless
-    `force`, which fast-forwards to whatever origin has, deletes no branch (nothing was
-    verified) and clears the record: the escape hatch for a landing the tool cannot see,
-    for a request that was closed instead of merged, and for a record whose commit is no
-    longer in this clone. Right after `--merge` (`after_merge`) "not on the trunk" is the
-    tool's success that did not land - a merge train, auto-merge - and that is exit 6, not
-    "merge it". Rule 5 is reported, not enforced: a ship that landed as a merge commit is
-    said out loud. A dry run fetches, decides, and prints every mutating step as `would:`;
-    the records stay.
+    One verdict per record (`landed`), printed as it is reached, and the refusals that
+    belong to the verdict rather than to the catch-up that follows it:
 
-    Which records: see `pending_to_land`. With several, each verified one lands - one
-    fast-forward of the trunk, then each branch - and the rest are reported and kept; none
-    verified is the same exit 2 as for one. Whatever is still pending afterwards is listed
-    as `status` lists it. The record of the branch HEAD is on, picked because nothing was
-    named, answers for itself only: when it has not landed, the exit 2 names every other
-    record that has, each as the `forkflow land <branch>` that lands it.
+    - one record that has not landed is exit 2, "not merged yet" - or exit 6 right after
+      `--merge`, where the tool reported the request merged and nothing reached the trunk
+      (a merge train, auto-merge, a required pipeline);
+    - one record whose commit is not in this clone raises out of `landed`, unless `force`,
+      which judges nothing and lands it with a sha of None: the trunk is caught up and the
+      branch is kept;
+    - with several, an unjudged record is listed and kept instead, and none of them landed
+      is the same exit 2, naming each with its merge request.
 
-    Order: a plain `land` refuses what it cannot do here (a stopped rebase, a dirty tree, the
-    trunk checked out in another worktree) before it fetches. After `--merge` the verdict
-    comes first: whether the request reached the trunk is the one thing that run has to
-    say, and a queued merge is exit 6 wherever the trunk is checked out - refused as "the
-    trunk is elsewhere" it read as merged, and `land` there then said "merge it" of a request
-    that was already queued."""
-    chosen = pending_to_land(ctx, entry, branch, force)
-    several = len(chosen) > 1
-    implicit = (entry is None and not branch and not several
-                and chosen[0]["branch"] == current_branch(ctx))
-    resume = land_cmd("" if several else chosen[0]["branch"], force)
-    if not after_merge:
-        land_preflight(ctx, resume)
-
+    Rule 5 is reported here, not enforced: a shipped commit reachable only through a merge
+    commit's second parent is a WARNING beside its verdict."""
     trunk_name = f"{ctx.origin}/{ctx.trunk}"
     trunk_ref = f"refs/remotes/{trunk_name}"
-    rc, cmd, result, err = fetch(ctx, (ctx.origin,), [trunk_name])
-    if rc != 0:
-        step("fetch", cmd, "FAILED")
-        raise Fail(f"fetch failed: {err.strip()}")
-    step("fetch", cmd, result)
-
+    several = len(chosen) > 1
     landings = []                          # (entry, landed sha or None under --force, how)
     waiting = []                           # (entry, why) - only with several
     for e in chosen:
@@ -3719,6 +3735,79 @@ def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False,
         raise Fail(f"nothing pending is on {trunk_name} yet - merge, then run `{land_cmd()}` "
                    f"again:{lines}")
 
+    return landings
+
+
+def report_landing(ctx: Ctx, landings: Sequence[tuple], leftovers: Sequence[str],
+                   several: bool, old: str, new: str) -> None:
+    """What the run did, in the three things it has to say: where the trunk went and that
+    HEAD is on it; a branch origin may still have (GitHub deletes none itself, and only a
+    verified landing gets the hint); and whatever is still pending, in the one format
+    `status` prints it in (`pending_line`)."""
+    moved = f"{short(old)}..{short(new)}" if old != new else f"at {short(new)}"
+    verified = [e["branch"] for e, sha, _ in landings if sha is not None]
+    said = "landed" if verified else "caught up, landing NOT verified"
+    if several:
+        said += " " + ", ".join(f"`{b}`" for b in verified)
+    print(f"  {DRY_PREFIX if ctx.dry_run else ''}{said}: {ctx.trunk} {moved} - you are on "
+          f"{ctx.trunk}")
+    if ctx.platform == "github":
+        for name in leftovers:
+            print(f"  {ctx.origin}/{name} may still exist: git push {sh_arg(ctx.origin)} "
+                  f"--delete {sh_arg(name)}")
+    done = {e["branch"] for e, _, _ in landings}
+    rest = {b: e for b, e in pending_entries(ctx).items() if b not in done}
+    for b in sorted(rest):
+        print(pending_line(ctx, b, rest[b]))
+
+
+def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False,
+                 entry: Optional[dict] = None, branch: str = "") -> None:
+    """The closing step of a ship or a sync, from the `pending` records: fetch, recognise
+    the landing, fast-forward the local trunk, delete the landed branch, forget the record.
+
+    Works after a human merged the merge request, in any later session, and after a
+    "squash and merge" or a "rebase and merge" of a ship (see `landed`). A merge request
+    that is not on the trunk yet is exit 2 and not an error - "not merged yet" - unless
+    `force`, which fast-forwards to whatever origin has, deletes no branch (nothing was
+    verified) and clears the record: the escape hatch for a landing the tool cannot see,
+    for a request that was closed instead of merged, and for a record whose commit is no
+    longer in this clone. Right after `--merge` (`after_merge`) "not on the trunk" is the
+    tool's success that did not land - a merge train, auto-merge - and that is exit 6, not
+    "merge it". Rule 5 is reported, not enforced: a ship that landed as a merge commit is
+    said out loud. A dry run fetches, decides, and prints every mutating step as `would:`;
+    the records stay.
+
+    Which records: see `pending_to_land`. With several, each verified one lands - one
+    fast-forward of the trunk, then each branch - and the rest are reported and kept; none
+    verified is the same exit 2 as for one. Whatever is still pending afterwards is listed
+    as `status` lists it. The record of the branch HEAD is on, picked because nothing was
+    named, answers for itself only: when it has not landed, the exit 2 names every other
+    record that has, each as the `forkflow land <branch>` that lands it.
+
+    Order: a plain `land` refuses what it cannot do here (a stopped rebase, a dirty tree, the
+    trunk checked out in another worktree) before it fetches. After `--merge` the verdict
+    comes first: whether the request reached the trunk is the one thing that run has to
+    say, and a queued merge is exit 6 wherever the trunk is checked out - refused as "the
+    trunk is elsewhere" it read as merged, and `land` there then said "merge it" of a request
+    that was already queued."""
+    chosen = pending_to_land(ctx, entry, branch, force)
+    several = len(chosen) > 1
+    implicit = (entry is None and not branch and not several
+                and chosen[0]["branch"] == current_branch(ctx))
+    resume = land_cmd("" if several else chosen[0]["branch"], force)
+    if not after_merge:
+        land_preflight(ctx, resume)
+
+    trunk_name = f"{ctx.origin}/{ctx.trunk}"
+    rc, cmd, result, err = fetch(ctx, (ctx.origin,), [trunk_name])
+    if rc != 0:
+        step("fetch", cmd, "FAILED")
+        raise Fail(f"fetch failed: {err.strip()}")
+    step("fetch", cmd, result)
+
+    landings = judge_landings(ctx, chosen, force, after_merge, implicit)
+
     if after_merge:                        # landed: now what this worktree cannot do
         land_preflight(ctx, resume)
     old, new = land_trunk(ctx)
@@ -3740,21 +3829,7 @@ def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False,
             step("pending", "-", f"kept: the record for `{name}` changed while this ran (a new "
                                  f"ship of it?) - it is not the one that landed")
 
-    moved = f"{short(old)}..{short(new)}" if old != new else f"at {short(new)}"
-    verified = [e["branch"] for e, sha, _ in landings if sha is not None]
-    said = "landed" if verified else "caught up, landing NOT verified"
-    if several:
-        said += " " + ", ".join(f"`{b}`" for b in verified)
-    print(f"  {DRY_PREFIX if ctx.dry_run else ''}{said}: {ctx.trunk} {moved} - you are on "
-          f"{ctx.trunk}")
-    if ctx.platform == "github":
-        for name in leftovers:
-            print(f"  {ctx.origin}/{name} may still exist: git push {sh_arg(ctx.origin)} "
-                  f"--delete {sh_arg(name)}")
-    done = {e["branch"] for e, _, _ in landings}
-    rest = {b: e for b, e in pending_entries(ctx).items() if b not in done}
-    for b in sorted(rest):
-        print(pending_line(ctx, b, rest[b]))
+    report_landing(ctx, landings, leftovers, several, old, new)
 
 
 def land_branch(ctx: Ctx, entry: dict, sha: str, how: str) -> None:
@@ -13857,9 +13932,10 @@ def run_tests() -> None:
             (`config_is_upstreams`). There is one question now, asked of the content, and a
             fourth check added later cannot answer it its own way: what upstream's configs
             are is computed in one place, every provenance answer is a call to
-            `config_is_upstreams`, and the two answers `fork_merge_mode` reads ask nothing
-            else at all - no `git log`, no index. The message builders may ask the question;
-            they may not invent an answer."""
+            `config_is_upstreams`, and the two answers `fork_config_state` reads ask nothing
+            else at all - no `git log`, no index. `fork_merge_mode` and `fork_merge_refusal`
+            both switch on the state it returns rather than deriving one of their own, so a
+            state added there cannot reach a message written for another."""
             import ast
             funcs = {n.name: n for n in ast.walk(self.tree)
                      if isinstance(n, ast.FunctionDef) and n.lineno < self.limit}
@@ -13872,7 +13948,7 @@ def run_tests() -> None:
                              {"upstream_config_texts", "config_is_upstreams"})
             self.assertEqual(self.owners("config_is_upstreams("),
                              {"config_is_upstreams", "written_by_upstream",
-                              "own_untracked_config", "fork_merge_refusal",
+                              "own_untracked_config", "fork_config_state",
                               "in_the_way_advice"})
             self.assertEqual(calls_in("written_by_upstream"), {"config_is_upstreams"})
             self.assertEqual(calls_in("own_untracked_config"),
@@ -13880,9 +13956,12 @@ def run_tests() -> None:
                               "merge_in_progress", "config_name_at", "config_is_upstreams",
                               "any"})
             self.assertEqual(self.owners("written_by_upstream("),
-                             {"written_by_upstream", "fork_merge_mode", "fork_merge_refusal"})
+                             {"written_by_upstream", "fork_config_state"})
             self.assertEqual(self.owners("own_untracked_config("),
-                             {"own_untracked_config", "fork_merge_mode"})
+                             {"own_untracked_config", "fork_config_state"})
+            # and the state both `--merge` readers switch on is decided in that one place
+            self.assertEqual(self.owners("fork_config_state("),
+                             {"fork_config_state", "fork_merge_mode", "fork_merge_refusal"})
 
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()

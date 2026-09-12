@@ -703,3 +703,36 @@ and `setup-multiple-remotes-hint-ignores-config` remain open and are not affecte
   guaranteed by it; `land` reports the shape of what landed
 - Task 3's success-path tests are written to survive Task 4's chaining (no `pending` assertion after
   a successful `--merge`); the merging fake is defined once, precisely, in Task 3
+
+**Review phase 2 (code smells), fixed after the plan's tasks closed** - a cleanup pass, no
+behaviour change: the documentation the code had outgrown, two dead helpers, seven duplications
+(`publish`, `land_cmd`, `pending_line`, `merge_in_progress`, `tracked_config_names`,
+`own_branch`, `fork_merge_mode`'s triple read), five naming conventions and six test smells, and
+three structural splits (`judge_landings`/`report_landing` out of `land_pending`, the branch-name
+refusal into `ship_preflight`, `fork_config_state` shared by the two `--merge` readers). Where the
+fix deviated from what the finding suggested:
+
+- ⚠️ the third shape of the `pending` line - `land_pending`'s "nothing landed" message - was left
+  alone. It is a different message (its own `why` per record, inside a `Fail`), and folding it into
+  `pending_line` would change printed text. The two byte-identical ones are `pending_line` now
+- ⚠️ moving the numeric-branch-name refusal from `merge_gate` into `ship_preflight` moves it BEFORE
+  the two config refusals, because `cmd_ship` runs the preflight first. Every refusal the suite
+  covers is byte-identical before and after (checked by running `TestMergeGate` on both and diffing
+  the 18 messages). The one combination that changes is untested and has two right answers: a
+  numeric branch name on a fork whose config does not say `merge = "self"` now hears about the
+  branch rather than about the config. Exit 2, nothing pushed, either way
+- ⚠️ `EXIT_NOT_MERGED` was the only named exit code of 2-6, so the other four are named now rather
+  than six going back to a literal: `exc.code == EXIT_UNSAFE` says what the comparison is for, and
+  the codes are part of the published contract (the docstring's table). The tests keep the literal
+  numbers - they assert that contract from outside
+- ⚠️ `trunk_ref`/`shown_ref` was settled across the whole file, not only the new `land` section:
+  `trunk_ref` is the full `refs/remotes/<origin>/<trunk>` everywhere and `trunk_name` the short
+  `<origin>/<trunk>`, so the split the branch had tripled is gone rather than halved
+- ⚠️ the review's "`as_gitlab` is defined twice, both `return on_platform("gitlab")`" was true of
+  one of the two only: the report's mocks `forge_path`, not `mr_target`. It is `as_gitlab_host`
+  now, and `as_gitlab`/`as_github` are module-level helpers beside `on_platform`
+- the invariant regex was widened to `forkflow\s+(sync|ship|land)\b` as the review asked, which
+  makes `land_cmd` the one owner `spelled` allows; every other `forkflow land` in the code, prose
+  included, goes through it
+- `cmd_land`'s `need_upstream=True` and `variant_remedy`'s `mv` on the trunk were recorded by the
+  review as behaviour concerns, not smells, and are untouched
