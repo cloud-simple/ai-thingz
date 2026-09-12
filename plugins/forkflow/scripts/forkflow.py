@@ -12859,6 +12859,28 @@ def run_tests() -> None:
             self.assertEqual(origin_sha(fork, "123"), "")
 
         @needs_tomllib
+        def test_the_ship_that_first_commits_the_config_is_told_which_flag_to_use(self):
+            """`setup` leaves `.forkflow.toml` untracked and `--merge` reads it there. The
+            one ship that first COMMITS it is refused - on a branch the file is neither
+            untracked nor on `origin/<trunk>`, so nothing says "self" until a person has
+            merged it - and that refusal named no command at all: no `forkflow ship --mr`,
+            no `then:` line, and the user had to work the flag out alone. The `in_the_way`
+            path names it; this one does too, and what it names, run as printed, works."""
+            fork = make_fork(self.tmp)
+            write(fork, CONFIG_FILE, 'merge = "self"\n')
+            sh("git", "checkout", "-q", "-b", "cfg", "develop", cwd=fork)
+            sh("git", "add", CONFIG_FILE, cwd=fork)
+            sh("git", "commit", "-q", "-m", "ours: track our config", cwd=fork)
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn("`%s`" % rerun_cmd("ship", argparse.Namespace(mr=True)), err)
+            self.assertIn("then: forkflow land", err)
+            with on_platform("gitlab"):
+                code, out, err2 = run_printed(err, "forkflow ship", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.assertEqual(tool_argv(self.tmp, "glab", "create")[:2], ["mr", "create"])
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])   # merged by hand
+
+        @needs_tomllib
         def test_passes_on_a_self_fork_whose_origin_is_named(self):
             """Both conditions met: the run goes on (a dry run here, which pushes nothing
             and reaches the merge-request step)."""
