@@ -635,6 +635,33 @@ The invariants gain `owners("same_repo_remotes(")`, `owners("foreign_remote_grou
 `owners("config_record_ok(")`; `owners("foreign_remote_refs(")`, `owners("config_versions_in(")`,
 `owners("config_digest(")` and `calls_in("upstream_config_digests")` are restated.
 
+⚠️ review fix (phase 4): THE BOUND ON THE MEMORY IS GONE, AND WITH IT `UPSTREAM_CONFIG_KEEP`,
+`CONFIG_MEMORY_FULL` and `memory_full_refusal`. Iteration 4 replaced eviction with a permanent
+fail-closed flag, and that turned one attack into another: a reviewer published 501 versions of one
+small `.forkflow.toml` in 8.3 SECONDS of scripted commits, and every fork that fetched that upstream
+lost `--merge` for good - a cheap, permanent denial of service on every downstream fork at once. The
+way out the refusal printed did not work either: deleting the state file only let the next run
+re-walk the refs and re-arm the flag, three times over (`q1/mem.py m03`, `q1/mem2.py n04`). HOW MANY
+versions get published is the original project's choice, so no count this refuses on can be a count
+the project cannot reach - which is the same lesson as the eviction, one level up. Nothing is
+dropped, so nothing can be evicted; nothing is refused for being too much, so nothing can be filled.
+A digest is about 70 bytes, and refusing on size would be dishonest as well as exploitable, because
+the live walk still covers every version the refs carry today. The flag an earlier run of this
+branch wrote is no longer read, so a clone the old bound caught answers normally again. The three
+bound tests are replaced by three that pin the absence: a thousand digests written down with no
+refusal, a clone carrying the old flag answering normally, and a project publishing version after
+version while the fork's own untracked `merge = "self"` still answers for `merge`.
+
+⚠️ same round: `config_fingerprint`'s trailing-whitespace guard was a SURVIVING MUTANT - correct,
+load-bearing and covered by nothing. With `return text` in its place the whole suite passed, while
+the original project's config with a missing final newline, an extra one, a trailing space or a
+trailing tab stopped reading as the project's: an editor that trims on save was enough to reopen
+the gate. A test now asserts all four variants still read as the project's, and that a real edit
+still makes the file the fork's. The second survivor the reviewer named is an EQUIVALENT mutant,
+not a defect - `str.splitlines` already splits on `\r\n` and a lone `\r`, so the explicit
+`replace` ahead of it changes nothing that reaches the comparison - and the fix there is the
+docstring, which credited the wrong line; the code is unchanged.
+
 ⚠️ review fix (phase 3, external, iteration 3, second half): the ninth route - the comparison's
 two sides were not the same KIND of thing. One is the file as the working tree renders it (a plain
 read of the path), the other the blob as git stores it, and the repository - which upstream writes
