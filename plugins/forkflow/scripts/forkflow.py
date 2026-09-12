@@ -1176,7 +1176,12 @@ def report_pending(ctx: Ctx, entry: dict, url: str) -> bool:
     what is needed is the truth about them and a way to finish by hand. The commands are
     the ones `land` would have run - a fetch, a fast-forward of the LOCAL trunk onto what
     origin has, and the branch deleted only once `-d` can see it is merged. Nothing here
-    commits, force-pushes or touches the trunk on origin."""
+    commits, force-pushes or touches the trunk on origin.
+
+    `git checkout`, not the `switch` spelling: this project's floor is git 2.20 (README
+    *forkflow*), `switch` arrived in 2.23, and every command printed here is followed to
+    the letter - one that a supported git answers "unknown command" to is a dead end in the
+    middle of a recovery. `TestSourceInvariants` holds the whole script to that floor."""
     branch = entry["branch"]
     if ctx.dry_run or pending_entries(ctx).get(branch) == entry:
         return True
@@ -1189,7 +1194,7 @@ def report_pending(ctx: Ctx, entry: dict, url: str) -> bool:
     print(f"    Nothing is lost - the branch and the request are as this run left them. "
           f"Once the request is merged, finish it by hand:")
     print(f"      git fetch {sh_arg(ctx.origin)}")
-    print(f"      git switch {sh_arg(ctx.trunk)}")
+    print(f"      git checkout {sh_arg(ctx.trunk)}")
     print(f"      git merge --ff-only {sh_arg(ctx.origin + '/' + ctx.trunk)}")
     print(f"      git branch -d {sh_arg(branch)}   # refuses while it is not on the trunk")
     return False
@@ -3004,8 +3009,9 @@ def history_unprovable(ctx: Ctx) -> str:
     if partial or promisors:
         return (f"this clone is partial ({which}): objects are fetched on demand, so a "
                 f"`{CONFIG_FILE}` the original project had can be absent here and read as "
-                f"one it never had - re-clone without `--filter`, or `git fetch --refetch "
-                f"{sh_arg(ctx.upstream)}`, so that every object is here")
+                f"one it never had - clone it again without `--filter` (git 2.36 and "
+                f"newer can also refill one in place), or have the merge request merged "
+                f"by hand")
     return ""
 
 
@@ -11499,7 +11505,7 @@ def run_tests() -> None:
             self.assertIn(url, out)
             self.assertIn(state, out)
             self.assertNotIn("after the MR is merged, next:", out)
-            for cmd in ("git fetch origin", "git switch develop",
+            for cmd in ("git fetch origin", "git checkout develop",
                         "git merge --ff-only origin/develop", "git branch -d feat/x"):
                 self.assertIn(cmd, out)
             for forbidden in ("git commit", "--force", "push origin develop"):
@@ -15071,6 +15077,35 @@ def run_tests() -> None:
             # and the state both `--merge` readers switch on is decided in that one place
             self.assertEqual(self.owners("fork_config_state("),
                              {"fork_config_state", "fork_merge_mode", "fork_merge_refusal"})
+
+        def test_no_printed_command_needs_a_git_newer_than_the_floor(self):
+            """The README states the floor: Python 3.9+ and git 2.20+. Every command this
+            script prints is pasted by a user exactly as printed, so a spelling their git
+            does not have is a dead end in the middle of a recovery - and the spellings a
+            hand reaches for without thinking are all newer than the floor: `switch` and
+            `restore` are 2.23, `branch --show-current` is 2.22, `fetch --refetch` is 2.36,
+            `ls-remote --symref` is 2.8, `for-each-ref --exclude` is 2.38.
+
+            `merge-tree --write-tree` is the one thing here above the floor, and it is
+            never reached on an older git: every call to `merge_tree` is behind
+            `git_version() < MERGE_TREE_GIT`, and the README says the simulation wants
+            2.38+ and is skipped with a note. `%(worktreepath)` (2.23) has its own
+            fallback, tested in `test_without_worktreepath_only_this_worktree_is_seen`."""
+            import ast
+            body = "\n".join(self.lines[:self.limit])
+            for spelling in ("git switch", "git restore", "branch --show-current",
+                             "fetch --refetch", "ls-remote --symref",
+                             "for-each-ref --exclude", "rev-list --exclude-hidden"):
+                self.assertNotIn(spelling, body,
+                                 spelling + " is newer than the git floor the README states")
+            funcs = {n.name: n for n in ast.walk(self.tree)
+                     if isinstance(n, ast.FunctionDef) and n.lineno < self.limit}
+            callers = self.owners("merge_tree(") - {"merge_tree", "<module>"}
+            self.assertEqual(callers, {"simulate_merge", "still_carries"})
+            for name in callers:
+                where = funcs[name]
+                self.assertIn("MERGE_TREE_GIT",
+                              "\n".join(self.lines[where.lineno - 1:where.end_lineno]), name)
 
         def test_the_state_file_is_written_in_one_place_and_under_its_lock(self):
             """Every record in the state file is a read-modify-write, and `pending` lives in

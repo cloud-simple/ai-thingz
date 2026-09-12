@@ -69,6 +69,18 @@ decisions are recorded at the end.
   `EXIT_INTERRUPTED = 130` at 77.
 - Git floor: README says git 2.20+; nothing in the script calls `git switch` (2.23+) - only the
   printed advice at 2010/2374 does. `land` therefore uses `git checkout`.
+  ⚠️ review fix (phase 3, external, iteration 2): "only the printed advice" was the whole
+  defect - printed advice is what a user pastes. Those two lines are gone (the `next: forkflow land`
+  line replaced them), and the by-hand finish `report_pending` prints, which had picked the same
+  spelling up, is `git checkout` now.
+  `TestSourceInvariants.test_no_printed_command_needs_a_git_newer_than_the_floor` holds the whole
+  script to the floor: no `switch`, no `restore`, no `branch --show-current`, no `fetch --refetch`,
+  no `ls-remote --symref`, no `for-each-ref --exclude`. The floor itself is unchanged and correct:
+  `merge-tree --write-tree` (2.38) is the one thing above it and every call is behind
+  `git_version() < MERGE_TREE_GIT`, which the README already documents; `%(worktreepath)` (2.23) has
+  its own fallback; `--force-with-lease=<ref>:<sha>` is 1.8.5, `rev-list --objects` with a pathspec
+  and `:(icase)` are 1.9, `update-index --force-remove` and `ls-remote --heads` are older still, and
+  `rev-parse --is-shallow-repository` (new this round) is 2.15.
 - Docs: README `## forkflow` - the stance sentence, *The six hard rules*, *The four skills*, the
   usage block, *Configuration*, *Exit codes* (row 0 says "Also `--mr` when the tool is missing or
   fails - the branch is pushed and the command is printed"), *After the MR is merged*, *Tests* (states
@@ -490,7 +502,7 @@ land" about a record that does not exist, and `land` then answered "nothing pend
 branch with an open request. `save_state` now answers the reason; `report_pending` READS THE RECORD
 BACK where the user is left to finish the landing (instead of the `next:` line, and on the way out
 of a `--merge` that did not land) and, when it is not there, names the branch, the commit and the
-request and prints the by-hand finish - a fetch, `git switch <trunk>`, `git merge --ff-only
+request and prints the by-hand finish - a fetch, `git checkout <trunk>`, `git merge --ff-only
 origin/<trunk>`, `git branch -d <branch>`. Nothing commits, nothing is forced, and the run still
 exits 0: the push and the merge request happened. `resume_unrecorded` says the same about a resume
 record, and `land` says when a landed record could not be cleared.
