@@ -361,8 +361,10 @@ def variant_remedy(root: str, found: str) -> str:
                 f"case-insensitive filesystem it is the same file as `{CONFIG_FILE}`")
     if variants:
         return (f"`{save} && git mv -- {sh_arg(variants[0])} {CONFIG_FILE}` gives it the exact "
-                f"name, its content kept{kept} - {again}. If a sync brought it in, that sync "
-                f"still treats it as upstream's: its `gate` is shown rather than run")
+                f"name, its content kept{kept} - {again}. If a sync brought it in, renaming "
+                f"it does not make it yours: that sync still treats it as upstream's - its "
+                f"`gate` is shown rather than run - and `--merge` is refused while the file "
+                f"is upstream's byte for byte, until you edit it yourself")
     return ("No command is safe to name for what git holds of it here - a change staged by "
             "hand, or a merge in progress whose copy is out of the index; `git status` shows "
             "which")
@@ -2299,8 +2301,17 @@ def in_the_way_advice(ctx: Ctx, paths: Sequence[str], rerun: str,
     trunk = f"{ctx.origin}/{ctx.trunk}"
     if any(p.casefold() == CONFIG_FILE.casefold() for p in paths):
         ship = rerun_cmd("ship", argparse.Namespace(mr=bool(getattr(args, "mr", False))))
-        return (f"`{CONFIG_FILE}` is this fork's own config, untracked (as `forkflow setup` "
-                f"leaves it), and upstream tracks a `{CONFIG_FILE}` - under that name or "
+        mine = (f"`{CONFIG_FILE}` is this fork's own config, untracked (as `forkflow setup` "
+                f"leaves it)")
+        if config_is_upstreams(ctx, working_config_text(ctx)):
+            # not the fork's: upstream's own file, brought in by a sync and untracked since.
+            # Committed and shipped it puts upstream's bytes on the trunk, where `merge` is
+            # still upstream's word - so the sentence that names the ship says so too
+            mine = (f"the `{CONFIG_FILE}` here is the original project's own file, byte for "
+                    f"byte - brought in by a sync and untracked since, not one this fork "
+                    f"wrote, so `--merge` stays refused until you edit it yourself (any "
+                    f"edit of your own makes it this fork's)")
+        return (f"{mine}, and upstream tracks a `{CONFIG_FILE}` - under that name or "
                 f"another case of it, which a case-insensitive filesystem makes the same "
                 f"file. Do not delete or rename it: commit it on a branch off `{trunk}` and "
                 f"`{ship}` it, have that merged, so it is on `{trunk}`; then {rerun}")
@@ -2538,42 +2549,124 @@ def merge_mode_at(ctx: Ctx, revision: str) -> Optional[str]:
     return cfg.get("merge") or MERGE_MODES[0]
 
 
+def config_fingerprint(text: str) -> str:
+    """A `.forkflow.toml`'s bytes as provenance compares them.
+
+    Line endings and trailing whitespace are normalised away: a checkout that rewrote the
+    line endings, or an editor that dropped the last newline, is not this fork *writing*
+    the file, and reading it as one would open the `--merge` gate on upstream's settings.
+    Everything else is compared literally - one character of the fork's own is what makes
+    the file the fork's."""
+    body = text.replace("\r\n", "\n").replace("\r", "\n")
+    return "\n".join(line.rstrip() for line in body.splitlines()).strip("\n")
+
+
+def upstream_config_texts(ctx: Ctx) -> set:
+    """Every `.forkflow.toml` the original project has, fingerprinted.
+
+    SCOPE - tips, not histories. Four revisions, one `ls-tree` and one `show` each:
+
+    - `<upstream>/<branch>`, and the mirror both on origin and here (rule 6 keeps it a
+      pristine copy of upstream) - what a sync brings in;
+    - the merge base of `<upstream>/<branch>` and `origin/<trunk>` - the last upstream
+      commit this fork's trunk took, so a config the fork adopted at its last sync still
+      answers "upstream's" after upstream has edited its own since;
+    - `MERGE_HEAD` while a sync merge is being resolved - upstream's side, right now.
+
+    Walking upstream's whole history would be the complete answer and is not worth a
+    `git log --all -- <path>` on every `--merge`. What that misses is a config upstream
+    carried and has since changed, adopted by this fork at a sync *before* the last one
+    its trunk took, and still sitting there unedited - and any edit the fork makes to the
+    file makes the bytes its own, which is the way back every refusal here prints."""
+    revisions = [f"refs/remotes/{ctx.up()}",
+                 f"refs/remotes/{ctx.origin}/{ctx.mirror}",
+                 f"refs/heads/{ctx.mirror}"]
+    base = git("merge-base", f"refs/remotes/{ctx.up()}",
+               f"refs/remotes/{ctx.origin}/{ctx.trunk}", cwd=ctx.root, check=False)
+    if base:
+        revisions.append(base)
+    if merge_in_progress(ctx):
+        revisions.append("MERGE_HEAD")
+    texts = set()
+    for revision in revisions:
+        text = config_text(ctx, revision)     # None: no such revision, or no file in its tree
+        if text is not None:
+            texts.add(config_fingerprint(text))
+    return texts
+
+
+def config_is_upstreams(ctx: Ctx, text: Optional[str]) -> bool:
+    """Are these the bytes of a `.forkflow.toml` the original project has?
+
+    The one question every `--merge` provenance decision asks, and it is asked of the
+    CONTENT, because nothing else answers it:
+
+    - the path's HISTORY lies in both directions. `git log -1 <rev> -- <path>` names this
+      fork's commit when the file was re-added under another name - which is what the
+      case-variant `git mv` remedy this tool prints does to upstream's file - and names
+      upstream's commit when a sync merge kept upstream's side, because history
+      simplification follows the parent the content came from;
+    - INDEX MEMBERSHIP lies too: upstream's file, brought in by a sync and untracked by
+      hand (`git rm --cached`, committed on a sync branch), is absent from the index, from
+      HEAD and from MERGE_HEAD - exactly the state `setup` leaves this fork's template in.
+
+    The bytes lie in neither direction. A `.forkflow.toml` is this fork's own precisely
+    when it differs from every `.forkflow.toml` upstream has (`upstream_config_texts`),
+    so any edit the fork makes to the file makes it the fork's - the way back every
+    refusal prints. None (there is no file) is not upstream's: nothing came from there."""
+    if text is None:
+        return False
+    return config_fingerprint(text) in upstream_config_texts(ctx)
+
+
+def working_config_text(ctx: Ctx) -> Optional[str]:
+    """The working tree's `.forkflow.toml` as it stands, None when no file is listed under
+    exactly that name (a case variant is not it - `load_config` refuses those) or it cannot
+    be read. The bytes, not the settings: provenance is about the file."""
+    try:
+        if CONFIG_FILE not in os.listdir(ctx.root):
+            return None
+        with open(os.path.join(ctx.root, CONFIG_FILE), "r", encoding="utf-8") as fh:
+            return fh.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
 def written_by_upstream(ctx: Ctx, revision: str) -> bool:
-    """True when the `.forkflow.toml` `revision` holds was last written by a commit of the
-    original project - one reachable from `<upstream>/<branch>` or the mirror on origin -
-    or when that cannot be told.
+    """True when the `.forkflow.toml` `revision` holds is one the original project has -
+    by its bytes (`config_is_upstreams`) - or when it cannot be read at all.
 
     That is the trunk a fresh fork bootstraps: `origin/<trunk>` starts as a copy of
     upstream, and an upstream that tracks the file hands this fork its `merge` with nobody
     here having written or reviewed it - which stays so through every later ship that does
-    not touch the file. `git log -- <path>` follows the parent the file came from, so a
-    sync merge that took upstream's copy unchanged answers with upstream's commit too."""
-    name = config_name_at(ctx, revision) or CONFIG_FILE
-    rc, out, _ = git_rc("log", "-1", "--format=%H", revision, "--", name, cwd=ctx.root)
-    last = out.strip()
-    if rc != 0 or not last:
-        return True
-    for ref in (f"refs/remotes/{ctx.up()}", f"refs/remotes/{ctx.origin}/{ctx.mirror}"):
-        if has_ref(ctx.root, ref) and git_ok("merge-base", "--is-ancestor", last, ref,
-                                             cwd=ctx.root):
-            return True
-    return False
+    not touch the file, and through a sync merge resolved in upstream's favour. It asked
+    `git log -1 <revision> -- <path>` who last wrote the path until that answer was found
+    to be wrong in both directions; see `config_is_upstreams`."""
+    text = config_text(ctx, revision)
+    if text is None:
+        return True                 # there but unreadable: upstream's is the safe answer
+    return config_is_upstreams(ctx, text)
 
 
 def own_untracked_config(ctx: Ctx) -> bool:
     """True when the working tree's `.forkflow.toml` is this fork's own untracked file - the
-    one `setup` leaves: listed under exactly that name, and under no case of the name in
-    the index, in HEAD, or in the MERGE_HEAD of a merge in progress. A file any of those
-    holds may be one a commit of the original project put there."""
-    try:
-        if CONFIG_FILE not in os.listdir(ctx.root):
-            return False
-    except OSError:
+    one `setup` leaves: listed under exactly that name, held by git nowhere here (the index,
+    HEAD, the MERGE_HEAD of a merge in progress), and holding bytes no `.forkflow.toml` of
+    the original project's holds (`config_is_upstreams`).
+
+    The last condition is the one that matters. A fork that never chose `merge` can end up
+    with upstream's file sitting untracked on disk - a sync brings it in and the user
+    untracks it by hand - and that is byte for byte the state `setup` leaves its own
+    template in. Where git holds the file cannot tell the two apart; the bytes can."""
+    text = working_config_text(ctx)
+    if text is None:
         return False
     if tracked_config_names(ctx.root):
         return False
     revisions = ["HEAD"] + (["MERGE_HEAD"] if merge_in_progress(ctx) else [])
-    return all(config_name_at(ctx, rev) is None for rev in revisions)
+    if any(config_name_at(ctx, rev) is not None for rev in revisions):
+        return False
+    return not config_is_upstreams(ctx, text)
 
 
 def fork_merge_mode(ctx: Ctx) -> str:
@@ -2584,8 +2677,8 @@ def fork_merge_mode(ctx: Ctx) -> str:
     Read only from where the original project cannot write it:
 
     - the config committed on `origin/<trunk>` (any case of the name, `config_text`) -
-      this fork's reviewed state - unless upstream's commit is what wrote it there
-      (`written_by_upstream`);
+      this fork's reviewed state - unless its bytes are a `.forkflow.toml` upstream has,
+      which makes it upstream's declaration adopted whole (`written_by_upstream`);
     - while none is committed there, the fork's own untracked `.forkflow.toml`, where
       `setup` leaves it (`own_untracked_config`).
 
@@ -2608,6 +2701,61 @@ def fork_merge_source(ctx: Ctx) -> str:
     """Where `fork_merge_mode` reads it, for the messages that refuse `--merge`."""
     return (f"the `{CONFIG_FILE}` committed on `{ctx.origin}/{ctx.trunk}` - or, while none "
             f"is committed there, an untracked `{CONFIG_FILE}` in the working tree")
+
+
+def fork_merge_refusal(ctx: Ctx) -> str:
+    """Why `--merge` is refused here and the way back - the rest of `merge_gate`'s message
+    after "--merge needs `merge = "self"` in this fork's own config - ".
+
+    Four states, and the user can see which one they are in, so the message names it:
+
+    - the config on the trunk is upstream's own file, byte for byte (a sync took it whole);
+    - the checked-out branch carries one, which is read nowhere until it is on the trunk;
+    - the untracked config in the working tree is upstream's own file;
+    - or there simply is no `merge = "self"` this fork wrote.
+
+    The upstream-bytes states used to print the last one's wording, and a user looking at
+    a file that plainly reads `merge = "self"` read that as a bug in the tool. Each state
+    leaves a way forward, and where the file is upstream's it is the same one: an edit of
+    the fork's own makes the file the fork's. A `{ship}` is named only for a config that
+    already is this fork's - printed commands are followed to the letter, and shipping
+    upstream's bytes to the trunk changes nothing about whose word `merge` is."""
+    trunk_ref = f"{ctx.origin}/{ctx.trunk}"
+    ship = rerun_cmd("ship", argparse.Namespace(mr=True))
+    theirs = (f"is the original project's own `{CONFIG_FILE}`, byte for byte, so what it "
+              f"says about `merge` is upstream's word and not this fork's - whatever you "
+              f"read in it")
+    yours = (f"Make it this fork's: edit it - with `merge = \"self\"` set by you - ")
+    generic = (f"{fork_merge_source(ctx)}; a `{CONFIG_FILE}` the checked-out branch carries "
+               f"is not read for it. This fork's merge requests are merged by hand.")
+    here = working_config_text(ctx)
+    if has_ref(ctx.root, f"refs/remotes/{trunk_ref}") and config_name_at(ctx, trunk_ref):
+        if not written_by_upstream(ctx, trunk_ref):
+            return generic              # this fork's own file; it just does not say "self"
+        return (f"the `{CONFIG_FILE}` committed on `{trunk_ref}` {theirs}. A sync brought "
+                f"it in and it was taken whole. {yours}on a branch off `{trunk_ref}`, "
+                f"commit it there and `{ship}` it; once that merge request is merged, "
+                f"`--merge` works here.")
+    if tracked_config_names(ctx.root):
+        if config_is_upstreams(ctx, here):
+            # upstream's file, on the branch: no command - shipping it puts upstream's bytes
+            # on the trunk, where `merge` is still upstream's word and this refusal returns
+            return (f"the `{CONFIG_FILE}` this branch carries {theirs}, and a config the "
+                    f"checked-out branch carries is not read for `merge` in any case - only "
+                    f"the one on `{trunk_ref}`, and only while it is this fork's own. Edit "
+                    f"the file in your fork, with `merge = \"self\"` set by you, and get "
+                    f"that onto `{trunk_ref}` the way everything else gets there.")
+        return (f"{fork_merge_source(ctx)}; the `{CONFIG_FILE}` this branch carries is not "
+                f"read for it - committed on a branch it is neither untracked nor on "
+                f"`{trunk_ref}`. Get it onto the trunk first: `{ship}`, have that merge "
+                f"request merged, then: forkflow land. A `merge = \"self\"` it carries "
+                f"counts from then on.")
+    if config_is_upstreams(ctx, here):
+        return (f"the untracked `{CONFIG_FILE}` in the working tree {theirs}. A sync brought "
+                f"it in and it was untracked by hand. {yours}and run this again; nothing has "
+                f"to be committed, an untracked config is read while none is on "
+                f"`{trunk_ref}`.")
+    return generic
 
 
 def cmd_sync_continue(ctx: Ctx, args: argparse.Namespace) -> int:
@@ -2701,9 +2849,7 @@ def merge_gate(ctx: Ctx, args: argparse.Namespace, resume_sync: bool = False,
         by_hand = (f" Resume without it - `{continue_cmd('sync', argparse.Namespace(mr=True))}`"
                    f" - and have the merge request merged by hand." if resume_sync else "")
         raise Fail(f"--merge needs `merge = \"self\"` in this fork's own config - "
-                   f"{fork_merge_source(ctx)}; a `{CONFIG_FILE}` the checked-out branch "
-                   f"carries is not read for it. This fork's merge requests are merged by "
-                   f"hand.{by_hand}")
+                   f"{fork_merge_refusal(ctx)}{by_hand}")
     target, reason = mr_target(ctx)
     if not target:
         raise Fail(f"--merge: `{ctx.origin_url or '-'}` names no project to merge on "
@@ -12347,6 +12493,69 @@ def run_tests() -> None:
             sh("git", "fetch", "-q", "origin", cwd=fork)
             self.assertEqual(self.mode(fork), "self")
 
+        def test_upstreams_own_file_untracked_on_disk_is_not_this_forks(self):
+            """A fork that never chose `merge`: an ordinary sync brings upstream's
+            `.forkflow.toml` in and the user untracks it by hand (`git rm --cached`,
+            committed on a sync branch that is then abandoned). That leaves upstream's
+            bytes on disk in exactly the state `setup` leaves this fork's own template -
+            absent from the index, from HEAD and from MERGE_HEAD - and upstream's
+            `merge = "self"` opened the gate. Where git holds the file cannot tell the two
+            apart; the bytes can, and one character of this fork's own settles it."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch theirs"]\n'
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            write(fork, CONFIG_FILE, theirs)
+            self.assertIn("?? " + CONFIG_FILE, sh("git", "status", "--porcelain", cwd=fork))
+            self.assertEqual(self.mode(fork), "manual")
+            write(fork, CONFIG_FILE, theirs + "# ours\n")
+            self.assertEqual(self.mode(fork), "self")
+
+        def test_upstreams_bytes_are_upstreams_however_they_reached_the_trunk(self):
+            """`git log -1 <rev> -- <path>` named this fork's commit whenever the file was
+            re-added under another path - which is exactly what the case-variant `git mv`
+            remedy this tool prints does to upstream's file - so upstream's `merge` became
+            the fork's by a rename nobody read as a declaration. Built with plumbing, so it
+            holds on any filesystem: upstream tracks `.ForkFlow.toml`, and a commit of this
+            fork's adds `.forkflow.toml` holding upstream's bytes. The bytes did not
+            change, so provenance does not either."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch theirs"]\n'
+            commit_upstream(self.tmp, ".ForkFlow.toml", theirs, "theirs: variant")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            blob = sh("git", "hash-object", "-w", write(self.tmp, "blob.txt", theirs),
+                      cwd=fork)
+            sh("git", "update-index", "--add", "--cacheinfo",
+               "100644,%s,%s" % (blob, CONFIG_FILE), cwd=fork)
+            sh("git", "commit", "-q", "-m", "rename the config upstream brought in", cwd=fork)
+            sh("git", "push", "-q", "origin", "develop", cwd=fork)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertEqual(sh("git", "log", "-1", "--format=%s", "origin/develop", "--",
+                                CONFIG_FILE, cwd=fork),
+                             "rename the config upstream brought in")   # this fork's commit
+            self.assertEqual(self.mode(fork), "manual")
+            commit_fork(fork, CONFIG_FILE, theirs + "# ours\n", "ours: our own config")
+            sh("git", "push", "-q", "origin", "develop", cwd=fork)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertEqual(self.mode(fork), "self")
+
+        def test_a_config_upstream_no_longer_has_at_its_tip_is_still_upstreams(self):
+            """The scope `upstream_config_texts` reads is tips plus the merge base of
+            `<upstream>/<branch>` and `origin/<trunk>` - the last upstream commit this
+            fork's trunk took. So a config the fork adopted whole at its last sync stays
+            upstream's after upstream has edited its own since, with no history walked."""
+            fork = make_fork(self.tmp)
+            adopted = 'merge = "self"\n'
+            commit_upstream(self.tmp, CONFIG_FILE, adopted, "theirs: forkflow")
+            push_upstream_into_origin(self.tmp, "develop")          # the trunk takes it
+            commit_upstream(self.tmp, CONFIG_FILE, adopted + "# theirs, changed\n",
+                            "theirs: forkflow again")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertNotEqual(sh("git", "show", "upstream/main:" + CONFIG_FILE, cwd=fork),
+                                sh("git", "show", "origin/develop:" + CONFIG_FILE, cwd=fork))
+            self.assertEqual(self.mode(fork), "manual")
+
     class TestMergeModeAskedAgainBeforeTheMerge(MergeBase):
         """The gate reads `origin/<trunk>` before the run's own fetch; `merge_mr` asks
         `fork_merge_mode` again right before the merge command. A teammate's commit that
@@ -12555,6 +12764,63 @@ def run_tests() -> None:
             self.refused(fork, "sync", "--force", "--merge")
             self.assertEqual(origin_sha(fork, name + "-2"), "")
             self.assertEqual(origin_sha(fork, "develop"), trunk)
+
+        @needs_tomllib
+        def test_refused_when_upstreams_config_sits_untracked_in_the_working_tree(self):
+            """This fork chose no `merge`. A sync brought upstream's `.forkflow.toml` in and
+            the user untracked it by hand, leaving upstream's bytes on disk in the state
+            `setup` leaves this fork's template in: `ship --merge` merged and landed on
+            upstream's `merge = "self"`, and the ship's `check` ran upstream's `gate` on the
+            way, with no merge request merged by anyone. Refused on the bytes - and one
+            character of this fork's own makes the file, and the gate, this fork's."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = []\n'
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            write(fork, CONFIG_FILE, theirs)
+            self.assertIn("?? " + CONFIG_FILE, sh("git", "status", "--porcelain", cwd=fork))
+            name = self.feature(fork)
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn("byte for byte", err)
+            self.assertEqual(origin_sha(fork, name), "")
+            write(fork, CONFIG_FILE, theirs + "# ours\n")        # this fork's own, now
+            merging_tool(self.tmp, "glab")
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge")[:3], ["mr", "merge", name])
+
+        @needs_tomllib
+        def test_the_refusal_over_upstreams_config_says_whose_it_is_and_names_the_way_back(self):
+            """A sync whose `.forkflow.toml` conflict a person resolved by taking upstream's
+            text leaves upstream's bytes on the trunk. `--merge` is refused - they are not
+            this fork's word - but the message said only that this fork's own config does
+            not say `merge = "self"` about a file that plainly reads `merge = "self"`, and
+            named nothing to do about it. It now says whose file it is, and the way back it
+            prints - edit it in your fork and ship it - works."""
+            ours = 'merge = "self"\ngate = []\n'
+            theirs = 'merge = "self"\n# the project\'s own notes\n'
+            fork = make_fork(self.tmp, config=ours)
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            sh("git", "merge", "upstream/main", cwd=fork, check=False)   # conflicts on it
+            write(fork, CONFIG_FILE, theirs)                             # upstream's side
+            sh("git", "add", CONFIG_FILE, cwd=fork)
+            sh("git", "commit", "-q", "--no-edit", cwd=fork)
+            sh("git", "push", "-q", "origin", "develop", cwd=fork)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertEqual(sh("git", "show", "origin/develop:" + CONFIG_FILE, cwd=fork),
+                             theirs.strip())                     # what the user can read
+            self.feature(fork)
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn("byte for byte", err)
+            self.assertIn("`%s`" % rerun_cmd("ship", argparse.Namespace(mr=True)), err)
+            # the way back, followed: an edit of this fork's own, on a branch, merged
+            sh("git", "checkout", "-q", "-b", "cfg", "origin/develop", cwd=fork)
+            commit_fork(fork, CONFIG_FILE, theirs + "# ours\n", "ours: our own config")
+            sh("git", "push", "-q", "origin", "cfg:refs/heads/develop", cwd=fork)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertEqual(fork_merge_mode(ctx_for(fork)), "self")
 
         @needs_tomllib
         def test_refused_when_the_origin_names_no_project(self):
@@ -12847,6 +13113,22 @@ def run_tests() -> None:
             self.run_remedy(fork, "# mine\n")
             self.assert_ours_back(fork)
 
+        def test_the_rename_remedy_warns_that_a_config_a_sync_brought_stays_upstreams(self):
+            """`git mv` gives upstream's file the exact name and nothing more: the sync
+            still treats it as upstream's - its `gate` shown rather than run - and `--merge`
+            is refused while the bytes are upstream's, until this fork edits the file
+            itself. The clause naming `--merge` was dropped once, and the remedy then read
+            as "rename it and it is yours"."""
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "-q", "-b", "feat/cfg", cwd=fork)
+            write(fork, self.VARIANT, 'trunk = "develop"\n')
+            sh("git", "add", self.VARIANT, cwd=fork)
+            sh("git", "commit", "-q", "-m", "a config, spelled differently", cwd=fork)
+            err = self.refusal(fork)
+            self.assertIn("git mv", err)
+            self.assertIn("`gate` is shown rather than run", err)
+            self.assertIn("`--merge` is refused", err)
+
         @needs_tomllib
         def test_a_tracked_variant_alone_is_renamed_with_its_content(self):
             """No `.forkflow.toml` is tracked: the variant is the only config there is, and
@@ -12953,6 +13235,27 @@ def run_tests() -> None:
             self.assertNotIn(CONFIG_FILE, sh("git", "status", "--porcelain", cwd=fork))
             with mock.patch.object(os.path, "samefile", side_effect=one_file):
                 self.assertEqual(untracked_in_the_way(ctx, target), [CONFIG_FILE])
+
+        @needs_tomllib
+        def test_the_in_the_way_advice_says_when_the_untracked_config_is_upstreams(self):
+            """`setup`'s untracked template and upstream's own file, left untracked after a
+            sync, are the same shape on disk. The advice called both "this fork's own
+            config" and sent the user to commit and ship it - which for upstream's bytes
+            puts upstream's word on the trunk and leaves `--merge` refused there, with
+            nothing in the message saying so. The bytes decide what the sentence says."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = []\n'
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            write(fork, CONFIG_FILE, theirs)              # upstream's file, untracked here
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("the original project's own file", err)
+            self.assertIn("`--merge` stays refused", err)
+            write(fork, CONFIG_FILE, theirs + "# ours\n")          # this fork's own, now
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("is this fork's own config, untracked", err)
+            self.assertNotIn("the original project's own file", err)
 
         @needs_tomllib
         def test_an_ignored_untracked_config_is_in_the_way_before_the_backup(self):
@@ -13395,6 +13698,41 @@ def run_tests() -> None:
             self.assertLess(gate, min(calls("cmd_sync", "cmd_sync_continue")
                                       + calls("cmd_sync", "finish_sync")))
             self.assertLess(calls("cmd_ship", "merge_gate")[0], calls("cmd_ship", "finish_ship")[0])
+
+        def test_whose_config_it_is_is_decided_by_its_bytes_in_one_place(self):
+            """Provenance - is this `.forkflow.toml` this fork's own, or the original
+            project's? - was decided by the PATH's history in one reader and by INDEX
+            MEMBERSHIP in another, and each answer was wrong in both directions
+            (`config_is_upstreams`). There is one question now, asked of the content, and a
+            fourth check added later cannot answer it its own way: what upstream's configs
+            are is computed in one place, every provenance answer is a call to
+            `config_is_upstreams`, and the two answers `fork_merge_mode` reads ask nothing
+            else at all - no `git log`, no index. The message builders may ask the question;
+            they may not invent an answer."""
+            import ast
+            funcs = {n.name: n for n in ast.walk(self.tree)
+                     if isinstance(n, ast.FunctionDef) and n.lineno < self.limit}
+
+            def calls_in(func: str) -> set:
+                return {c.func.id for c in ast.walk(funcs[func]) if isinstance(c, ast.Call)
+                        and isinstance(c.func, ast.Name)}
+
+            self.assertEqual(self.owners("upstream_config_texts("),
+                             {"upstream_config_texts", "config_is_upstreams"})
+            self.assertEqual(self.owners("config_is_upstreams("),
+                             {"config_is_upstreams", "written_by_upstream",
+                              "own_untracked_config", "fork_merge_refusal",
+                              "in_the_way_advice"})
+            self.assertEqual(calls_in("written_by_upstream"),
+                             {"config_text", "config_is_upstreams"})
+            self.assertEqual(calls_in("own_untracked_config"),
+                             {"working_config_text", "tracked_config_names",
+                              "merge_in_progress", "config_name_at", "config_is_upstreams",
+                              "any"})
+            self.assertEqual(self.owners("written_by_upstream("),
+                             {"written_by_upstream", "fork_merge_mode", "fork_merge_refusal"})
+            self.assertEqual(self.owners("own_untracked_config("),
+                             {"own_untracked_config", "fork_merge_mode"})
 
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
