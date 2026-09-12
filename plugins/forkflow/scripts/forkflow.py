@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import errno
 import json
 import os
 import re
@@ -64,6 +65,18 @@ import time
 import urllib.parse
 from dataclasses import dataclass, field, replace
 from typing import Optional, Sequence, Tuple
+
+# The state file's lock is the operating system's (`lock_exclusive`). Neither module is on
+# every platform, and forkflow refuses to write the state file rather than write it
+# unserialised, so both are optional here and the absence of both is a refusal with a reason.
+try:
+    import fcntl                                  # POSIX
+except ImportError:                               # pragma: no cover - not POSIX
+    fcntl = None
+try:
+    import msvcrt                                 # Windows
+except ImportError:                               # pragma: no cover - not Windows
+    msvcrt = None
 
 CONFIG_FILE = ".forkflow.toml"
 STATE_FILE = "forkflow-state.json"   # in .git: ties a `--continue` run to the backup it belongs to
@@ -90,11 +103,11 @@ EXIT_NOT_MERGED = 6                  # --merge: the branch is pushed, the merge 
 PUBLISHED_KEEP = 100                 # remembered (branch, commit) pushes - see record_published
 STATE_LOCK_WAIT = 5.0                # seconds a run waits for another worktree's state write
 STATE_LOCK_POLL = 0.02               # between tries while it waits
-STATE_LOCK_STALE = 600.0             # a lock this old belonged to a run that died holding
-                                     # it. What it guards is one read-modify-write of a
-                                     # small JSON file - milliseconds - so ten minutes is a
-                                     # crash and never a run that was merely slow, or
-                                     # stopped, or waiting on a filesystem
+HELD_ELSEWHERE = frozenset(          # what the lock calls answer with while another run
+    code for code in (getattr(errno, name, None)          # holds it - as against a
+                      for name in ("EACCES", "EAGAIN", "EWOULDBLOCK",  # filesystem that
+                                   "EINTR", "EDEADLK", "EDEADLOCK"))   # cannot lock at all
+    if code is not None)
 
 # The port each scheme reaches without being told: `ssh://host:22/o/r` and `host:o/r` are one
 # repository, and rule 1 is about the repository. Kept in step with `ff_repo_id` in the hook.
@@ -884,95 +897,113 @@ def save_state(ctx: Ctx, data: dict, shared: bool = False) -> str:
 
 
 class StateLocked(OSError):
-    """The state file's lock was held by another run for longer than forkflow waits."""
+    """No lock on the state file: another run held it for longer than forkflow waits, or
+    this platform has no lock to take."""
 
 
 def state_lock_path(path: str) -> str:
     return path + ".lock"
 
 
-def steal_stale_lock(lock: str) -> None:
-    """Remove `lock` if it was left behind by a run that is gone - and only then.
+def lock_exclusive(fd: int) -> bool:
+    """Take the operating system's exclusive lock on `fd` without waiting for it: True when
+    this run holds it, False while another run does, StateLocked when none can be taken here.
 
-    Identity comes from the DESCRIPTOR, not from the path. `os.stat(lock)` and then
-    `os.unlink(lock)` are two statements about two different files the moment the holder
-    lets go between them: what this deletes is then the FRESH lock a third run has just
-    taken, and two writers of the state file run unserialised - the very thing the lock is
-    here to stop. So the file is opened once, judged by an `fstat` of that open descriptor,
-    and unlinked only while the path still names the very inode that was judged. That is
-    also what makes two runs stealing at the same moment safe: the first one's own new lock
-    is a different inode, and the second sees that and leaves it alone.
+    The KERNEL owns the lock, and that is the whole point of it. The lock belongs to the
+    open file description rather than to the pathname or to a record written in a file, so
+    it is released when this process exits or is KILLED. There is no staleness to judge, no
+    lock to steal, and no way for one run to release what another holds.
 
-    POSIX has no unlink-by-descriptor, so a window remains between the confirming `stat`
-    and the `unlink`. It is two system calls wide rather than a poll interval plus a
-    judgement, and `STATE_LOCK_STALE` is ten minutes for a critical section that is
-    milliseconds long, so the run whose lock could be inside it is one that crashed."""
-    try:
-        fd = os.open(lock, os.O_RDONLY)
-    except OSError:
-        return                                  # already gone: take it on the next turn
-    try:
-        held = os.fstat(fd)
-        if time.time() - held.st_mtime <= STATE_LOCK_STALE:
-            return                              # a live run, or a crash too recent to call
-        here = os.stat(lock)
-        if (here.st_dev, here.st_ino) != (held.st_dev, held.st_ino):
-            return                              # released and re-taken: not that lock
-        os.unlink(lock)                         # a run that died still holding it
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
+    What this replaced created the lock file exclusively, called one older than ten minutes
+    the leftover of a run that had died, and unlinked it. Two reviews in a row found races
+    in that judgement and the third named the reason there will always be one: a stat and
+    an unlink are two statements about two different files, so the unlink lands on whatever
+    the path names by the time it runs - which can be the lock a third run has just taken.
+    No extra check fixes that, because the check is the thing that cannot be made atomic.
+
+    `fcntl.flock` on POSIX and `msvcrt.locking` on Windows, both standard library, both
+    released by the operating system when the holder goes. A platform with neither gets a
+    refusal and a plain reason, never an unserialised write.
+
+    On a NETWORK filesystem - NFS, SMB, some container overlays - neither call is dependable:
+    it may be a silent no-op, it may fail outright, or it may serialise only the runs on one
+    mount. forkflow builds no fallback for that, because every fallback is another staleness
+    judgement: a lock that cannot be taken is a refusal that says so, and a clone on such a
+    mount wants one forkflow at a time."""
+    if fcntl is not None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError as exc:
+            if exc.errno in HELD_ELSEWHERE:
+                return False
+            raise StateLocked(unlockable(exc))
+    if msvcrt is not None:
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError as exc:
+            if exc.errno in HELD_ELSEWHERE:
+                return False
+            raise StateLocked(unlockable(exc))
+    raise StateLocked(f"this Python has neither `fcntl` nor `msvcrt`, so `{STATE_FILE}` "
+                      f"cannot be locked and two forkflow runs writing it at once would "
+                      f"lose each other's records; nothing was written. Run forkflow on a "
+                      f"Python that has one of them - every supported platform ships one")
 
 
-def take_state_lock(path: str) -> None:
-    """Create the lock for `path`, waiting for whoever holds it; raise StateLocked if the
-    wait runs out.
+def unlockable(exc: OSError) -> str:
+    """Why a lock the operating system was asked for could not be taken at all - a
+    filesystem that does not implement it (a network mount, an exotic overlay), never
+    another run holding it."""
+    return (f"this filesystem will not lock `{STATE_FILE}` ({exc.strerror or exc}), so two "
+            f"forkflow runs writing it at once cannot be kept apart; nothing was written. "
+            f"Run one forkflow at a time, or keep the clone where the operating system "
+            f"locks files")
 
-    An exclusive create is the whole mechanism: one system call, no dependency, and the
-    same answer on every filesystem git itself is willing to keep a repository on (git's
-    own `index.lock` is this). A lock left behind by a run that was killed is not kept
-    forever - `steal_stale_lock` takes one whose holder is gone, so the worst a crash costs
-    is that wait, once - and a run that cannot get the lock writes NOTHING (`change_state`
-    answers with this failure and never falls through to the write)."""
+
+def take_state_lock(path: str) -> int:
+    """Hold the lock for `path` until `drop_state_lock` closes what this returns, waiting
+    up to `STATE_LOCK_WAIT` for whoever holds it; raise StateLocked when the wait runs out.
+
+    The lock file is created when it is not there and is NEVER removed: what keeps two runs
+    apart is the kernel's lock on the open descriptor and not the file's existence, so all
+    a finished run leaves behind is an empty file in the git directory that nobody holds.
+    Removing it is what the design before this one did, and removing it is exactly how one
+    run came to release another's lock.
+
+    A run that cannot get the lock writes NOTHING - `change_state` answers with this
+    failure and never falls through to the write."""
     lock = state_lock_path(path)
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        raise StateLocked(f"{lock}: {exc.strerror or exc}")
     deadline = time.monotonic() + STATE_LOCK_WAIT
     while True:
         try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            pass
-        except OSError as exc:
-            raise StateLocked(f"{lock}: {exc.strerror or exc}")
-        else:
-            try:
-                os.write(fd, f"{os.getpid()}\n".encode())
-            except OSError:
-                pass
+            got = lock_exclusive(fd)
+        except StateLocked:
             os.close(fd)
-            return
-        steal_stale_lock(lock)
+            raise
+        if got:
+            return fd
         if time.monotonic() >= deadline:
-            raise StateLocked(f"{lock} is held by another forkflow run "
-                              f"(waited {STATE_LOCK_WAIT:g}s{lock_age(lock)}); let that run "
-                              f"finish and try again - or, if no forkflow run is going, "
-                              f"delete that one file (it is forkflow's own, in the git "
-                              f"directory, and nothing of yours is in it)")
+            os.close(fd)
+            raise StateLocked(f"{lock} is held by another forkflow run (waited "
+                              f"{STATE_LOCK_WAIT:g}s); let that run finish and try again. "
+                              f"The lock is the operating system's, on that open file, and "
+                              f"it is released the moment the run holding it ends - even if "
+                              f"that run is killed - so there is never one left over for you "
+                              f"to clear away")
         time.sleep(STATE_LOCK_POLL)
 
 
-def lock_age(lock: str) -> str:
-    """", <n>s old" for the refusal message, "" when it cannot be read - so that a user
-    looking at a lock nobody holds can see that for themselves before deleting it."""
+def drop_state_lock(fd: int) -> None:
+    """Let go of what `take_state_lock` returned: closing the descriptor is what releases
+    the kernel's lock. The file itself stays, and is meant to."""
     try:
-        return f", {max(0, int(time.time() - os.stat(lock).st_mtime))}s old"
-    except OSError:
-        return ""
-
-
-def drop_state_lock(path: str) -> None:
-    try:
-        os.unlink(state_lock_path(path))
+        os.close(fd)
     except OSError:
         pass
 
@@ -992,7 +1023,7 @@ def change_state(ctx: Ctx, shared: bool, change) -> str:
     if not path:
         return f"git could not say where `{STATE_FILE}` lives"
     try:
-        take_state_lock(path)
+        fd = take_state_lock(path)
     except OSError as exc:
         return str(exc)
     try:
@@ -1000,7 +1031,7 @@ def change_state(ctx: Ctx, shared: bool, change) -> str:
         change(data)
         return save_state(ctx, data, shared)
     finally:
-        drop_state_lock(path)
+        drop_state_lock(fd)
 
 
 def write_state(ctx: Ctx, reason: str, entry: Optional[dict]) -> str:
@@ -6730,7 +6761,9 @@ def run_tests() -> None:
             self.assertEqual(resumable(ctx, "ship", "feat/x")["backup"], "b")
             self.assertEqual(os.listdir(os.path.dirname(state_path(ctx))).count(STATE_FILE), 1)
             self.assertEqual([f for f in os.listdir(os.path.dirname(state_path(ctx)))
-                              if f.startswith(STATE_FILE + ".")], [])        # no temp left
+                              if f.startswith(STATE_FILE + ".")],
+                             [os.path.basename(state_lock_path(state_path(ctx)))])
+            # no temp left: the one file beside it is the lock, which is never removed
 
         def test_a_write_that_cannot_happen_is_answered_not_swallowed(self):
             """Every failure here was swallowed, so a state file that cannot be written -
@@ -6766,11 +6799,11 @@ def run_tests() -> None:
             holding = threading.Event()
 
             def other_run():
-                take_state_lock(path)
+                held = take_state_lock(path)
                 holding.set()
                 time.sleep(0.2)                    # long after this run has asked for it
                 save_state(ctx, {"pending": {"feat/a": theirs}}, shared=True)
-                drop_state_lock(path)
+                drop_state_lock(held)
 
             thread = threading.Thread(target=other_run)
             thread.start()
@@ -6778,75 +6811,97 @@ def run_tests() -> None:
             mine = record_pending(ctx, "ship", "feat/b", rev(fork, "origin/develop"))
             thread.join()
             self.assertEqual(pending_entries(ctx), {"feat/a": theirs, "feat/b": mine})
-            self.assertFalse(os.path.exists(state_lock_path(path)))       # given up after
+            # the lock file stays; what was given up is the kernel's lock on it, so the
+            # next run takes it without anything having to decide the file is stale
+            self.assertTrue(os.path.exists(state_lock_path(path)))
+            drop_state_lock(take_state_lock(path))
 
-        def test_a_lock_left_by_a_run_that_died_is_taken_rather_than_waited_on(self):
-            """No dependency, and nothing a crash can leave holding the file for good: a
-            lock older than `STATE_LOCK_STALE` belonged to a run that is gone."""
+        def test_the_lock_a_killed_run_held_is_released_by_the_operating_system(self):
+            """The whole reason the lock is the kernel's. A real other process takes it and
+            is KILLED holding it - no chance to clean up, the case the old design answered
+            by calling a ten-minute-old lock file "stale" and unlinking it. Here nothing is
+            judged and nothing is unlinked: the lock dies with the process that held it, so
+            the next run takes it at once, and the lock FILE is still there afterwards
+            because removing it is what let one run release another's."""
+            if fcntl is None:                             # pragma: no cover - not POSIX
+                self.skipTest("this platform's lock is not fcntl.flock")
             ctx = ctx_for(make_fork(self.tmp))
             path = state_path(ctx, shared=True)
-            take_state_lock(path)                             # and never given up
-            old = time.time() - STATE_LOCK_STALE - 1
-            os.utime(state_lock_path(path), (old, old))
+            lock = state_lock_path(path)
+            holder = subprocess.Popen(
+                [sys.executable, "-c",
+                 "import fcntl, os, sys, time\n"
+                 "fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)\n"
+                 "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+                 "sys.stdout.write('held\\n')\n"
+                 "sys.stdout.flush()\n"
+                 "time.sleep(300)\n", lock],
+                stdout=subprocess.PIPE, universal_newlines=True)
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "held")
+                with mock.patch.object(sys.modules[__name__], "STATE_LOCK_WAIT", 0.05):
+                    why = write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"})
+                self.assertIn("held by another forkflow run", why)   # while it lives
+                self.assertEqual(read_state(ctx), {})
+            finally:
+                holder.kill()
+                holder.wait()
+                holder.stdout.close()
             started = time.monotonic()
             self.assertEqual(write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"}), "")
             self.assertLess(time.monotonic() - started, STATE_LOCK_WAIT)
             self.assertEqual(resumable(ctx, "ship", "feat/x")["backup"], "b")
+            self.assertTrue(os.path.exists(lock))         # never removed, by anyone
 
-        def test_a_lock_a_third_run_took_in_the_meantime_is_not_stolen(self):
-            """The steal used to `os.stat` the path, judge, and then `os.unlink` the path -
-            two statements about two different files the moment the holder lets go between
-            them, and what it deleted was then the FRESH lock a third run had just taken.
-            Here the holder does exactly that, at the instant the steal is judging: the
-            fresh lock has to survive and this run has to give up, because a run that steals
-            a live lock is two writers of the state file with no serialisation at all.
-
-            The swap hangs on the `fstat` the judgement makes, which is where it is a race:
-            identity comes from the descriptor now, and the path is checked against it again
-            before anything is unlinked. Scratchpad `f8/repro3.py` runs the old body and this
-            one against the same race - the old one takes the lock, this one refuses."""
+        def test_a_platform_with_no_lock_refuses_rather_than_writing_unserialised(self):
+            """`fcntl` on POSIX, `msvcrt` on Windows; a Python with neither cannot keep two
+            runs apart, and the answer is a refusal that says which module is missing -
+            never a write that silently loses another run's records."""
             ctx = ctx_for(make_fork(self.tmp))
-            path = state_path(ctx, shared=True)
-            lock = state_lock_path(path)
-            take_state_lock(path)                       # the run that is about to let go
-            old = time.time() - STATE_LOCK_STALE - 1
-            os.utime(lock, (old, old))
-            swapped, real_fstat = {}, os.fstat
+            module = sys.modules[__name__]
+            with mock.patch.object(module, "fcntl", None), \
+                 mock.patch.object(module, "msvcrt", None):
+                why = write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"})
+            self.assertIn("neither `fcntl` nor `msvcrt`", why)
+            self.assertIn("nothing was written", why)
+            self.assertEqual(read_state(ctx), {})
+            self.assertEqual(write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"}), "")
 
-            def letting_go(fd):
-                held = real_fstat(fd)
-                if not swapped:
-                    os.unlink(lock)                     # the holder finishes and lets go
-                    os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
-                    swapped["ino"] = os.stat(lock).st_ino      # a third run takes a fresh one
-                return held
+        def test_a_filesystem_that_will_not_lock_refuses_and_names_the_reason(self):
+            """A network mount can answer the lock call with an error rather than with "held
+            by somebody else". That is not another run to wait for, so there is nothing to
+            wait for: it refuses at once, names what the operating system said, and writes
+            nothing. No fallback - every fallback here is another staleness judgement."""
+            if fcntl is None:                             # pragma: no cover - not POSIX
+                self.skipTest("this platform's lock is not fcntl.flock")
+            ctx = ctx_for(make_fork(self.tmp))
 
-            try:
-                with mock.patch.object(os, "fstat", letting_go), \
-                     mock.patch.object(sys.modules[__name__], "STATE_LOCK_WAIT", 0.05):
-                    why = write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"})
-                left = os.stat(lock).st_ino if os.path.exists(lock) else None
-            finally:
-                drop_state_lock(path)
-            self.assertTrue(swapped)                    # the race really happened
-            self.assertIn("held by another forkflow run", why)
-            self.assertEqual(left, swapped["ino"])      # the third run's lock, untouched
-            self.assertEqual(read_state(ctx), {})       # and nothing was written beside it
+            def unsupported(fd, flags):
+                raise OSError(errno.ENOLCK, "No locks available")
+
+            with mock.patch.object(fcntl, "flock", unsupported):
+                started = time.monotonic()
+                why = write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"})
+            self.assertLess(time.monotonic() - started, STATE_LOCK_WAIT)
+            self.assertIn("will not lock", why)
+            self.assertIn("No locks available", why)
+            self.assertIn("nothing was written", why)
+            self.assertEqual(read_state(ctx), {})
 
         def test_a_lock_held_now_is_waited_for_and_then_given_up(self):
             """The wait is bounded: a run that cannot get the lock answers why, and says
             nothing was written rather than writing over what the holder is writing."""
             ctx = ctx_for(make_fork(self.tmp))
             path = state_path(ctx, shared=True)
-            take_state_lock(path)
+            held = take_state_lock(path)
             try:
                 with mock.patch.object(sys.modules[__name__], "STATE_LOCK_WAIT", 0.05):
                     why = write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"})
             finally:
-                drop_state_lock(path)
+                drop_state_lock(held)
             self.assertIn("held by another forkflow run", why)
             self.assertIn(state_lock_path(path), why)   # the file, so it can be looked at
-            self.assertIn("delete that one file", why)  # and the way out when nobody holds it
+            self.assertIn("released the moment the run holding it ends", why)
             self.assertEqual(read_state(ctx), {})
             self.assertEqual(write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"}), "")
 
@@ -11416,17 +11471,41 @@ def run_tests() -> None:
             path = state_path(ctx, shared=True)
             with open(path) as fh:
                 before = fh.read()
-            take_state_lock(path)
+            held = take_state_lock(path)
             try:
                 with mock.patch.object(sys.modules[__name__], "STATE_LOCK_WAIT", 0.05):
                     code, out, err = run("-C", fork, "ship")
             finally:
-                drop_state_lock(path)
+                drop_state_lock(held)
             self.assertEqual(code, 0, err + out)        # the work happened: not a failure
             self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
             with open(path) as fh:
                 self.assertEqual(fh.read(), before)     # nothing written beside the holder
             self.assertIn("held by another forkflow run", out)
+            self.assertIn("could not record that", out)
+            self.assertNotIn("after the MR is merged, next:", out)
+
+        def test_a_run_on_a_python_that_cannot_lock_records_nothing_and_says_so(self):
+            """The same refusal, for the platform rather than for the holder: a Python with
+            neither `fcntl` nor `msvcrt` has no lock to take, and forkflow will not write the
+            state file unserialised. Run, not read - a real `ship`, whose push and branch are
+            left exactly as it made them while the state file keeps the bytes it had."""
+            fork = make_fork(self.tmp)
+            name = self.feature(fork)
+            ctx = ctx_for(fork)
+            self.assertEqual(write_state(ctx, "sync", {"branch": "sync/x", "backup": "b"}), "")
+            path = state_path(ctx, shared=True)
+            with open(path) as fh:
+                before = fh.read()
+            module = sys.modules[__name__]
+            with mock.patch.object(module, "fcntl", None), \
+                 mock.patch.object(module, "msvcrt", None):
+                code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)        # the work happened: not a failure
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+            with open(path) as fh:
+                self.assertEqual(fh.read(), before)     # nothing written unserialised
+            self.assertIn("neither `fcntl` nor `msvcrt`", out)
             self.assertIn("could not record that", out)
             self.assertNotIn("after the MR is merged, next:", out)
 
@@ -15117,11 +15196,16 @@ def run_tests() -> None:
             self.assertEqual(self.owners("save_state("), {"save_state", "change_state"})
             self.assertEqual(self.owners("take_state_lock("),
                              {"take_state_lock", "change_state"})
-            # and the one thing that may delete a lock somebody else created is the steal,
-            # which takes the lock's identity from the descriptor it judged (see it)
-            self.assertEqual(self.owners("steal_stale_lock("),
-                             {"steal_stale_lock", "take_state_lock"})
-            self.assertEqual(self.owners("os.unlink(lock)"), {"steal_stale_lock"})
+            # nothing here may ever delete the lock file: the lock is the kernel's, on the
+            # open descriptor, and a run that unlinks the path releases whatever a third
+            # run holds by then. So the pathname is used in exactly one place - the open -
+            # and the lock calls themselves are behind one helper
+            self.assertEqual(self.owners("state_lock_path("),
+                             {"state_lock_path", "take_state_lock"})
+            self.assertEqual(self.owners("lock_exclusive("),
+                             {"lock_exclusive", "take_state_lock"})
+            self.assertEqual(self.owners("fcntl.flock("), {"lock_exclusive"})
+            self.assertEqual(self.owners("msvcrt.locking("), {"lock_exclusive"})
             self.assertEqual(self.owners("drop_state_lock("),
                              {"drop_state_lock", "change_state"})
             self.assertEqual(self.owners("change_state("),

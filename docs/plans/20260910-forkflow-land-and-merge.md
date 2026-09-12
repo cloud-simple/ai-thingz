@@ -520,6 +520,27 @@ a run that was merely slow or stopped. The bounded wait still ends in a refusal 
 write (`change_state` returns the failure), and the refusal now names the lock file, how old it
 is, and that deleting that one file is the way out when no run is going.
 
+⚠️ review fix (phase 3, external, iteration 3): the staleness DESIGN was the problem, not that
+particular race - two runs can both judge one inode stale, and the second unlink then lands on
+whatever sits at the path by the time it runs, so no added check makes stat-then-unlink safe. The
+whole mechanism is replaced by a lock the OPERATING SYSTEM releases: `lock_exclusive` takes
+`fcntl.flock(LOCK_EX|LOCK_NB)` (POSIX) or `msvcrt.locking(LK_NBLCK)` (Windows) on a descriptor
+`take_state_lock` holds for the critical section and `drop_state_lock` closes. The kernel drops it
+when the process exits or is killed, so there is no staleness window, no record to judge and
+nothing to steal; the lock FILE is created once and never removed, because removing it is how one
+run came to release another's. `STATE_LOCK_STALE` and `steal_stale_lock` are gone, and with them
+the two tests that existed only for them
+(`test_a_lock_left_by_a_run_that_died_is_taken_rather_than_waited_on`,
+`test_a_lock_a_third_run_took_in_the_meantime_is_not_stolen`); a real subprocess that is SIGKILLed
+holding the lock now proves the release
+(`test_the_lock_a_killed_run_held_is_released_by_the_operating_system`). A Python with neither
+module, and a filesystem that answers the lock call with an error rather than with "held", both
+REFUSE and say which - never a write that is not serialised - and the docstring says plainly that
+flock on a network filesystem can be unreliable and that forkflow builds no fallback for it, since
+every fallback is another staleness judgement. The bounded wait still ends in a refusal. The source
+invariant now pins the lock's PATHNAME to `take_state_lock` alone, so nothing added later can
+unlink it, and pins `fcntl.flock`/`msvcrt.locking` to `lock_exclusive`.
+
 ### `land`
 
 `cmd_land(args)` -> `resolve_ctx(need_upstream=True, need_trunk=True, strict_mirror=False)`, header,
