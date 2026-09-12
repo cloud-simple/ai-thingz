@@ -561,6 +561,34 @@ not an answer computed as if it had been. The `--merge` refusal tests' `snapshot
 state file's RECORDS (`work_state`, which drops `upstream_configs`): a refused run writing down
 what it read of upstream's is the point of the memory, not a change it should not have made.
 
+⚠️ review fix (phase 3, external, iteration 4): A DEFENCE THAT CANNOT BE PROVEN MUST REFUSE IN A WAY
+THAT CANNOT BE FLUSHED. That memory could be made to forget, two ways, and each one reopened the
+gate it exists to hold (both reproduced in scratchpad `f10/repro15.py`).
+
+- EVICTION. `UPSTREAM_CONFIG_KEEP` dropped the oldest to make room, and HOW MANY versions get
+  published is the original project's choice. Publish enough and the digest of the file sitting
+  untracked in this working tree falls out; withdraw that version from every ref and the walk's
+  answer is still not empty, so no fail-closed condition fires and upstream's own config reads as
+  this fork's own. Nothing is dropped now: the bound stands, reaching it writes `CONFIG_MEMORY_FULL`
+  into the state file, `config_memory_unprovable` reads that on every later run, and `--merge` is
+  refused here from then on with the way out that needs no memory at all - merged by hand. 500
+  versions of one small file is a number no real project comes near, and a fork that somehow gets
+  there loses an opt-in flag, not any work. A dry run answers the same and writes nothing.
+- SILENT `{}`. A state file that could not be parsed read as `{}` in `read_state` and nowhere else,
+  so a truncated write, a full disk or a hand edit forgot `upstream_configs` in silence - and the
+  next `change_state` wrote the file back out with one key in it, so the record was gone for good
+  and the refusal could be flushed by any ordinary ship. The file is parsed in ONE place now
+  (`load_state`, which answers what it holds AND why it cannot be read); `read_state` keeps the
+  tolerant answer so nothing that does not depend on the memory fails over it; `change_state` will
+  not write over a file it cannot read, and says so the way it already says a disk is full; and
+  `config_memory_unprovable` refuses `--merge`, naming the file and saying that deleting it is a
+  real choice that loses every record in it. `status`, `land` and the rest go on working. An
+  `upstream_configs` that is not a list of digests is the same fact by hand, and refuses the same.
+
+The source invariants pin `json.load` to `load_state`, `state_unreadable` to
+`config_memory_unprovable`, and `config_memory_unprovable` to `upstream_config_digests`, so a
+second parser or a second reader cannot answer this its own way.
+
 ⚠️ review fix (phase 3, external, iteration 3, second half): the ninth route - the comparison's
 two sides were not the same KIND of thing. One is the file as the working tree renders it (a plain
 read of the path), the other the blob as git stores it, and the repository - which upstream writes

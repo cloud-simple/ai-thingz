@@ -102,8 +102,11 @@ EXIT_INTERRUPTED = 130               # Ctrl-C, as the module docstring publishes
 EXIT_NOT_MERGED = 6                  # --merge: the branch is pushed, the merge request is
                                      # not merged (or not created) - all before it stands
 PUBLISHED_KEEP = 100                 # remembered (branch, commit) pushes - see record_published
-UPSTREAM_CONFIG_KEEP = 500           # remembered upstream `.forkflow.toml` digests, oldest
-                                     # first out - see remember_upstream_configs
+UPSTREAM_CONFIG_KEEP = 500           # remembered upstream `.forkflow.toml` digests. NOTHING
+                                     # IS EVER DROPPED TO MAKE ROOM: the memory fills and
+                                     # `--merge` refuses from then on. See
+                                     # remember_upstream_configs
+CONFIG_MEMORY_FULL = "upstream_configs_full"   # ... and the state key that says it did
 CONFIG_RENDER_ATTRS = ("filter", "ident",            # the attributes that make the working
                        "working-tree-encoding")      # tree's config differ from the blob git
                                      # stores in a way nothing here normalises back - see
@@ -886,16 +889,48 @@ def state_path(ctx: Ctx, shared: bool = False) -> str:
                         STATE_FILE)
 
 
-def read_state(ctx: Ctx, shared: bool = False) -> dict:
+def load_state(ctx: Ctx, shared: bool = False) -> Tuple[dict, str]:
+    """(what the state file holds, "") - or ({}, why it cannot be read at all).
+
+    The one parser, because "this file says nothing" and "this file cannot be read" are two
+    different facts and the difference decides things. An unparseable file used to answer
+    `{}` here and nowhere else, so a truncated write, a full disk or a hand edit was
+    indistinguishable from a clone that had never recorded anything: `upstream_configs` -
+    which is the only thing standing between a version upstream has withdrawn and the
+    `--merge` gate - was simply forgotten, in silence, and the next write put the file back
+    with one key in it so the record was gone for good (scratchpad `f10/repro15.py`).
+
+    So the two facts are told apart here and each caller decides what it costs.
+    `read_state` keeps the tolerant answer, because a command that does not depend on the
+    memory has no business failing over it; `change_state` will not write over a file it
+    cannot read, and `config_memory_unprovable` refuses `--merge`."""
     path = state_path(ctx, shared)
-    if not path or not os.path.exists(path):
-        return {}
+    if not path:
+        return ({}, f"git could not say where `{STATE_FILE}` lives")
+    if not os.path.exists(path):
+        return ({}, "")                    # never written here: no record to have lost
     try:
         with open(path, "r") as fh:
             data = json.load(fh)
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    except OSError as exc:
+        return ({}, f"`{path}` cannot be read ({exc.strerror or exc})")
+    except ValueError as exc:
+        return ({}, f"`{path}` is not the JSON object forkflow writes there ({exc})")
+    if not isinstance(data, dict):
+        return ({}, f"`{path}` holds a JSON {type(data).__name__} where forkflow writes an "
+                    f"object")
+    return (data, "")
+
+
+def read_state(ctx: Ctx, shared: bool = False) -> dict:
+    """What the state file holds, {} when it holds nothing this tool can read. Deliberately
+    tolerant: see `load_state`, and `state_unreadable` for the other half of the answer."""
+    return load_state(ctx, shared)[0]
+
+
+def state_unreadable(ctx: Ctx, shared: bool = False) -> str:
+    """Why the state file cannot be read, "" when it can be (or is not there at all)."""
+    return load_state(ctx, shared)[1]
 
 
 def save_state(ctx: Ctx, data: dict, shared: bool = False) -> str:
@@ -1048,7 +1083,15 @@ def change_state(ctx: Ctx, shared: bool, change) -> str:
     `pending` map, each adds its branch, and the second write puts the map back as the
     first found it - eight concurrent ships left ONE record, every time, and the ships
     whose records went are landable by nothing the tool offers. The same window let a land
-    clearing its own record write back a map from before another worktree's ship."""
+    clearing its own record write back a map from before another worktree's ship.
+
+    A file that cannot be READ is not written over. Read-modify-write on an unparseable
+    file is read-as-{}-and-replace: one key goes in and every record that was in there -
+    including what this clone had written down of the original project's configs, which is
+    the whole defence against a withdrawn version - is gone, with nothing said. So this
+    answers with the reason instead, the callers say what was lost the way they already do
+    for a disk that is full, and `config_memory_unprovable` refuses `--merge` until the
+    user deals with the file. Nothing here deletes it: what is in it is the user's."""
     path = state_path(ctx, shared)
     if not path:
         return f"git could not say where `{STATE_FILE}` lives"
@@ -1057,7 +1100,12 @@ def change_state(ctx: Ctx, shared: bool, change) -> str:
     except OSError as exc:
         return str(exc)
     try:
-        data = read_state(ctx, shared)
+        data, why = load_state(ctx, shared)
+        if why:
+            return (f"{why}, and writing over it would lose whatever is in there for good; "
+                    f"nothing was written. Look at that file - and if you accept losing "
+                    f"every record in it, including which `{CONFIG_FILE}`s the original "
+                    f"project has had, delete it")
         change(data)
         return save_state(ctx, data, shared)
     finally:
@@ -3009,11 +3057,21 @@ def remember_upstream_configs(ctx: Ctx, digests: set) -> Tuple[set, str]:
     are different bytes with a different digest, in no remembered set, and that is the way
     back every refusal here prints.
 
-    BOUNDED by `UPSTREAM_CONFIG_KEEP`, oldest first out - 500 distinct versions of one small
-    file, which no real project reaches, at 64 bytes each, so this cannot grow past about
-    34KB. A digest pushed out of the memory is a hole only where upstream has ALSO withdrawn
-    that version from every history this clone holds: while the version is still reachable,
-    the walk finds it again on every run and writes it back down.
+    NOTHING IS EVER DROPPED TO MAKE ROOM. The memory used to be bounded oldest-first-out at
+    `UPSTREAM_CONFIG_KEEP`, and that handed the eviction to the attacker: HOW MANY versions
+    get published is the original project's choice, not this fork's. Publish enough of them
+    and the digest of the version sitting untracked in this working tree falls out, then
+    withdraw that version from every ref - the walk's answer is not empty so no fail-closed
+    condition fires, and upstream's own file reads as this fork's own (scratchpad
+    `f10/repro15.py`, with the bound lowered: 500 commits is the same attack with more
+    typing).
+
+    So the bound still exists - a state file upstream can grow without end is its own
+    problem - but reaching it FAILS CLOSED rather than forgetting. `CONFIG_MEMORY_FULL` goes
+    into the state file, `config_memory_unprovable` reads it on every later run, and
+    `--merge` is refused here from then on with the way that needs no memory at all: have
+    the merge request merged by hand. 500 distinct versions of one small file is a number no
+    real project comes near, and a fork that somehow does loses an opt-in flag, not its work.
 
     What is remembered is what the tool has SEEN. A version that reached this clone and left
     it again with no provenance walk in between was never seen here - which is why the walk
@@ -3024,6 +3082,11 @@ def remember_upstream_configs(ctx: Ctx, digests: set) -> Tuple[set, str]:
     kept = remembered_upstream_configs(ctx)
     known = set(kept)
     fresh = [d for d in sorted(digests) if d not in known]
+    if len(kept) + len(fresh) > UPSTREAM_CONFIG_KEEP:
+        if ctx.dry_run:                             # a dry run answers, and writes nothing
+            return (set(), memory_full_refusal(ctx))
+        failed = change_state(ctx, True, lambda data: data.update({CONFIG_MEMORY_FULL: True}))
+        return (set(), failed or memory_full_refusal(ctx))
     if not fresh or ctx.dry_run:
         return (known | set(digests), "")
 
@@ -3031,9 +3094,14 @@ def remember_upstream_configs(ctx: Ctx, digests: set) -> Tuple[set, str]:
         now = [d for d in (data.get("upstream_configs") or []) if isinstance(d, str)]
         here = set(now)
         now.extend(d for d in fresh if d not in here)
-        data["upstream_configs"] = now[-UPSTREAM_CONFIG_KEEP:]
+        if len(now) > UPSTREAM_CONFIG_KEEP:   # another run wrote between the read and here
+            data[CONFIG_MEMORY_FULL] = True   # - nothing is dropped, the memory is full
+            now = now[:UPSTREAM_CONFIG_KEEP]
+        data["upstream_configs"] = now
 
     why = change_state(ctx, True, change)
+    if not why and read_state(ctx, shared=True).get(CONFIG_MEMORY_FULL):
+        return (set(), memory_full_refusal(ctx))   # another run filled it between the two
     if why:
         return (set(), f"this clone cannot write down which `{CONFIG_FILE}`s the original "
                        f"project has ({why}), and a version it has since stopped being able "
@@ -3042,6 +3110,69 @@ def remember_upstream_configs(ctx: Ctx, digests: set) -> Tuple[set, str]:
                        f"same command without `--merge` and have the merge request merged "
                        f"by hand")
     return (known | set(digests), "")
+
+
+def memory_full_refusal(ctx: Ctx) -> str:
+    """Why `--merge` is refused once this clone has written down as many of the original
+    project's `.forkflow.toml`s as it will hold - the same words whichever run finds it."""
+    return (f"this clone has written down {UPSTREAM_CONFIG_KEEP} different `{CONFIG_FILE}`s "
+            f"of the original project's, which is as many as it holds, and it will not drop "
+            f"one to make room: how many versions get published is the original project's "
+            f"choice, and a version dropped is a version that would read as one the project "
+            f"never had. So `--merge` is refused here from now on. Run the same command "
+            f"without `--merge` and have the merge request merged by hand - that needs no "
+            f"memory at all. The record is `{state_path(ctx, shared=True) or STATE_FILE}`; "
+            f"deleting it starts this clone's memory over and loses every version written "
+            f"down so far, which is what the refusal is protecting")
+
+
+def config_memory_unprovable(ctx: Ctx) -> str:
+    """"" when this clone's memory of the original project's `.forkflow.toml`s can be
+    trusted, otherwise why it cannot - and then `--merge` is REFUSED.
+
+    The memory (`remember_upstream_configs`) is the only thing that answers a version
+    upstream has since withdrawn from every ref, so a memory that has been made to forget is
+    an open gate. Two ways it can have been:
+
+    - the state file is there and cannot be READ - truncated by an interrupted write,
+      half-written by a full disk, edited by hand into something that is not an object, or
+      unreadable outright. That used to answer `{}` and nothing else: the memory was simply
+      gone, in silence, and upstream's own file - brought in by a sync, untracked by hand,
+      and withdrawn upstream since - read as this fork's own with `merge = "self"` in it
+      (scratchpad `f10/repro15.py`). The refusal names the file and says what deleting it
+      costs, because deleting it is a real choice and it is the user's to make;
+    - `upstream_configs` is there but is not a list of strings. Same fact, by hand.
+    - the memory is FULL (`CONFIG_MEMORY_FULL`, `memory_full_refusal`).
+
+    Only `--merge` is refused. Everything else in this tool goes on working with an
+    unreadable state file: `read_state` answers `{}` on purpose, a `land` that finds no
+    `pending` says so, and `change_state` refuses to write over the file rather than making
+    the damage permanent. A corrupt state file is a reason not to trust a provenance answer,
+    not a reason for the tool to stop."""
+    why = state_unreadable(ctx, shared=True)
+    if why:
+        return (f"{why}, and that file is where this clone writes down which `{CONFIG_FILE}`s "
+                f"the original project has had. Without it a version the project has since "
+                f"withdrawn from every branch reads as one it never had, so `--merge` cannot "
+                f"be proven here. Look at that file; if you accept losing every record in it "
+                f"you can delete it, and this clone starts remembering again from what its "
+                f"refs carry today. Or run the same command without `--merge` and have the "
+                f"merge request merged by hand")
+    data = read_state(ctx, shared=True)
+    if data.get(CONFIG_MEMORY_FULL):
+        return memory_full_refusal(ctx)
+    kept = data.get("upstream_configs")
+    if kept is not None and not (isinstance(kept, list)
+                                 and all(isinstance(d, str) for d in kept)):
+        return (f"`{state_path(ctx, shared=True)}` holds an `upstream_configs` that is not a "
+                f"list of digests, so what this clone has written down of the original "
+                f"project's `{CONFIG_FILE}`s cannot be read and a version the project has "
+                f"since withdrawn would read as one it never had. Put that key back as a "
+                f"list of strings, or delete the file and accept losing every record in it - "
+                f"or run the same command without `--merge` and have the merge request "
+                f"merged by hand")
+    return ""
+
 
 def foreign_remote_refs(ctx: Ctx) -> list:
     """Every remote-tracking ref that is not `origin`'s.
@@ -3386,7 +3517,10 @@ def upstream_config_digests(ctx: Ctx) -> Tuple[set, str]:
       their whole histories (`config_versions_in`);
     - what this clone has WRITTEN DOWN of upstream's, from every earlier run
       (`remember_upstream_configs`) - because a version that is gone from every ref is not
-      a version upstream never had, and nothing read out of the repository can say so;
+      a version upstream never had, and nothing read out of the repository can say so. A
+      memory that has been made to forget - a state file that cannot be read, or one the
+      original project has published enough versions to fill - is a refusal and not a short
+      answer (`config_memory_unprovable`);
     - and what the refs the CONFIG names carry, which only ever WIDENS the answer
       (`upstream_scope_refs`) and is deliberately never written down: a config that names
       this fork's own trunk would otherwise put the fork's own bytes into the memory for
@@ -3396,7 +3530,8 @@ def upstream_config_digests(ctx: Ctx) -> Tuple[set, str]:
     cheap half (30ms of the 1.0s measured in `config_versions_in`), and the expensive half -
     one `cat-file` per distinct version - is paid once per version in each, so the cost of
     the split is a second walk and not a second read of the repository's configs."""
-    blind = history_unprovable(ctx) or config_render_unprovable(ctx)
+    blind = (history_unprovable(ctx) or config_render_unprovable(ctx)
+             or config_memory_unprovable(ctx))
     if blind:
         return (set(), blind)
     theirs = foreign_remote_refs(ctx)
@@ -3530,7 +3665,10 @@ def fork_config_state(ctx: Ctx) -> Tuple[str, Optional[str], str]:
     original project's configs are (a shallow, partial, grafted or replaced clone, an
     object that is not here, a walk git refused), or the file it would judge is not the same
     kind of thing as the blobs it would be judged against (a symlink, a rendering attribute -
-    `config_render_unprovable`). Every state below it is a statement about
+    `config_render_unprovable`), or what this clone wrote down of the project's own configs
+    cannot be trusted (a state file that cannot be read, a memory the project has published
+    enough versions to fill - `config_memory_unprovable`). Every state below it is a
+    statement about
     a set that would then be short, and a short set reads upstream's own file as this
     fork's - so the answer is the reason, and `--merge` is refused with it. It is decided
     first because it is a fact about the clone, true whichever file is being judged.
@@ -6303,6 +6441,13 @@ def run_tests() -> None:
                                             capture_output=True).returncode))
         return ran
 
+    def without_stamp(text: str) -> str:
+        """The same message with `keep_aside`'s `forkflow-config-<UTC>.toml` names taken
+        out. Two calls a second apart word a refusal identically but for that stamp, so a
+        test comparing one refusal with another must not depend on which side of a tick of
+        the clock it landed on."""
+        return re.sub(r"forkflow-config-\d{8}-\d{6}\.toml", "forkflow-config-STAMP.toml", text)
+
     def kept_configs(fork: str) -> list:
         """The copies a remedy made, newest name last - `keep_aside`'s destinations."""
         gitdir = os.path.dirname(git_path(fork, "x"))
@@ -7018,13 +7163,19 @@ def run_tests() -> None:
             self.assertEqual(sh("git", "status", "--porcelain", cwd=fork), "")
 
         def test_an_absent_or_unreadable_file_is_no_state_rather_than_a_crash(self):
+            """READING stays tolerant, so nothing that does not depend on the state file
+            fails over one that cannot be read. Writing does not: see
+            `test_a_state_file_that_cannot_be_read_refuses_merge_and_is_kept`."""
             ctx = ctx_for(make_fork(self.tmp))
             self.assertEqual(read_state(ctx), {})                        # absent
+            self.assertEqual(state_unreadable(ctx), "")                  # and no complaint
             for text in ("{not json", '["a", "list"]', ""):
                 with open(state_path(ctx), "w") as fh:
                     fh.write(text)
                 self.assertEqual(read_state(ctx), {}, repr(text))
                 self.assertEqual(resumable(ctx, "ship", "feat/x"), {})
+                self.assertIn(state_path(ctx), state_unreadable(ctx), repr(text))
+            os.unlink(state_path(ctx))              # what the refusal says to do about it
             write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"})
             self.assertEqual(resumable(ctx, "ship", "feat/x")["backup"], "b")
 
@@ -7095,8 +7246,14 @@ def run_tests() -> None:
             os.mkdir(state_path(ctx))                       # nothing can be written there
             why = write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"})
             self.assertIn(STATE_FILE, why)
+            self.assertIn("nothing was written", why)
             self.assertEqual(read_state(ctx), {})
-            self.assertEqual(save_state(ctx, {"a": 1}), why)
+            # a directory there cannot be read either, and that is what is answered first -
+            # a file that cannot be READ is never written over. `save_state` answers for
+            # itself too, so a caller reaching it directly is not left guessing
+            self.assertIn(STATE_FILE, save_state(ctx, {"a": 1}))
+            os.rmdir(state_path(ctx))
+            self.assertEqual(write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"}), "")
 
         def test_the_read_and_the_write_it_leads_to_are_one_operation(self):
             """`os.replace` makes each write whole for a READER and does nothing about the
@@ -7224,24 +7381,72 @@ def run_tests() -> None:
             self.assertEqual(read_state(ctx), {})
             self.assertEqual(write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"}), "")
 
-        def test_what_this_clone_remembers_of_upstreams_configs_is_bounded(self):
-            """Hashes, never contents, and a bounded number of them: oldest first out at
-            `UPSTREAM_CONFIG_KEEP`, so the memory cannot grow without end. A digest pushed
-            out is a hole only where upstream has ALSO withdrawn that version from every
-            history this clone holds - while it is still reachable the walk finds it again
-            and writes it back down."""
+        def test_a_full_memory_refuses_for_good_and_never_drops_a_digest(self):
+            """Hashes, never contents, and a bounded number of them - but reaching the bound
+            FAILS CLOSED instead of forgetting. It used to drop the oldest, and HOW MANY
+            versions get published is the original project's choice: publish enough and the
+            digest of the file sitting untracked in this working tree falls out, then
+            withdraw that version from every ref, and upstream's own config reads as this
+            fork's own with no fail-closed condition firing (scratchpad `f10/repro15.py`).
+
+            So nothing is dropped. The memory fills, the state file says so, and `--merge`
+            is refused here from then on - which costs a real fork nothing, since no project
+            publishes 500 versions of one small file, and costs this one an opt-in flag
+            rather than any work."""
             ctx = ctx_for(make_fork(self.tmp))
             digests = ["%064x" % n for n in range(UPSTREAM_CONFIG_KEEP + 10)]
             known, why = remember_upstream_configs(ctx, set(digests[:5]))
             self.assertEqual((known, why), (set(digests[:5]), ""))
-            for start in range(5, len(digests), 25):
-                self.assertEqual(remember_upstream_configs(ctx, set(digests[start:start + 25]))[1],
-                                 "")
+            for start in range(5, UPSTREAM_CONFIG_KEEP, 25):
+                chunk = digests[start:min(start + 25, UPSTREAM_CONFIG_KEEP)]
+                self.assertEqual(remember_upstream_configs(ctx, set(chunk))[1], "")
             kept = remembered_upstream_configs(ctx)
             self.assertEqual(len(kept), UPSTREAM_CONFIG_KEEP)
-            self.assertEqual(kept[-1], digests[-1])         # the newest is there
-            self.assertEqual(kept[0], digests[10])          # the ten oldest went
-            self.assertNotIn(digests[0], kept)
+            self.assertEqual(sorted(kept), sorted(digests[:UPSTREAM_CONFIG_KEEP]))
+            self.assertEqual(config_memory_unprovable(ctx), "")       # full, and still fine
+
+            known, why = remember_upstream_configs(ctx, {digests[-1]})   # one too many
+            self.assertEqual(known, set())
+            self.assertIn(str(UPSTREAM_CONFIG_KEEP), why)
+            self.assertIn("will not drop one to make room", why)
+            self.assertIn("merged by hand", why)
+            self.assertIn(state_path(ctx, shared=True), why)   # the file, and what losing it costs
+            # nothing was dropped, and the refusal is now this clone's, not this run's
+            self.assertEqual(sorted(remembered_upstream_configs(ctx)),
+                             sorted(digests[:UPSTREAM_CONFIG_KEEP]))
+            self.assertEqual(config_memory_unprovable(ctx), why)
+            # and it stands on every later run, whatever that run walks - the one reader
+            # every provenance answer goes through asks before it asks anything else
+            self.assertEqual(upstream_config_digests(ctx), (set(), why))
+            self.assertEqual(upstream_config_digests(ctx_for(ctx.root, dry_run=True)),
+                             (set(), why))
+
+        def test_a_full_memory_is_a_refusal_a_dry_run_makes_too(self):
+            """A dry run must answer what the real run would, and write nothing doing it."""
+            ctx = ctx_for(make_fork(self.tmp), dry_run=True)
+            digests = {"%064x" % n for n in range(UPSTREAM_CONFIG_KEEP + 1)}
+            known, why = remember_upstream_configs(ctx, digests)
+            self.assertEqual(known, set())
+            self.assertIn("will not drop one to make room", why)
+            self.assertFalse(os.path.exists(state_path(ctx, shared=True)))
+
+        def test_a_memory_another_run_filled_in_between_is_not_dropped_either(self):
+            """The room left is worked out twice on purpose: once from what was read before
+            the lock was taken, and again under it, because another worktree can fill the
+            memory in between. Under the lock nothing is dropped either - the flag goes in
+            and this run refuses too. Here the reader is made to answer as it would have
+            before that other run wrote, which is the window itself."""
+            ctx = ctx_for(make_fork(self.tmp))
+            digests = ["%064x" % n for n in range(UPSTREAM_CONFIG_KEEP + 5)]
+            full = digests[:UPSTREAM_CONFIG_KEEP]
+            change_state(ctx, True, lambda data: data.update({"upstream_configs": full}))
+            with mock.patch.object(sys.modules[__name__], "remembered_upstream_configs",
+                                   lambda c: []):
+                known, why = remember_upstream_configs(ctx, set(digests[-3:]))
+            self.assertEqual(known, set())
+            self.assertIn("will not drop one to make room", why)
+            self.assertEqual(remembered_upstream_configs(ctx), full)      # nothing dropped
+            self.assertEqual(config_memory_unprovable(ctx), why)          # and it stands
 
         def test_a_memory_that_cannot_be_written_is_a_refusal_not_a_short_answer(self):
             """A version the original project has since withdrawn would read as one it never
@@ -7263,6 +7468,58 @@ def run_tests() -> None:
             ctx = ctx_for(make_fork(self.tmp), dry_run=True)
             self.assertEqual(remember_upstream_configs(ctx, {"a" * 64}), ({"a" * 64}, ""))
             self.assertFalse(os.path.exists(state_path(ctx, shared=True)))
+
+        def test_a_state_file_that_cannot_be_read_refuses_merge_and_is_kept(self):
+            """An unreadable state file used to answer `{}` and say nothing, which forgets
+            `upstream_configs` - the only thing that answers a version upstream has
+            withdrawn from every ref. One truncated write and upstream's own file read as
+            this fork's own (`f10/repro15.py`). Worse, the next write put the file back with
+            one key in it, so the record was gone for good and the refusal could be flushed
+            by any ordinary ship.
+
+            Now: `--merge` is refused, naming the file and what deleting it costs; the file
+            is not written over; and everything that does not depend on the memory goes on
+            working, because a corrupt state file is not a reason for the tool to stop."""
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            shared = state_path(ctx, shared=True)
+            remember_upstream_configs(ctx, {"a" * 64})
+            with open(shared) as fh:
+                whole = fh.read()
+            for damage in (whole[:len(whole) // 2], "", "[1, 2]", "not json at all"):
+                with open(shared, "w") as fh:
+                    fh.write(damage)
+                why = config_memory_unprovable(ctx)
+                self.assertIn(shared, why, repr(damage))
+                self.assertIn("delete it", why)
+                self.assertIn("merged by hand", why)
+                self.assertEqual(upstream_config_digests(ctx), (set(), why))
+                self.assertEqual(fork_config_state(ctx)[0], "unprovable")
+                self.assertEqual(fork_merge_mode(ctx), "manual")
+                # not written over, and the reason says what the write would have cost
+                failed = write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"})
+                self.assertIn(shared, failed)
+                self.assertIn("nothing was written", failed)
+                self.assertIn("lose whatever is in there for good", failed)
+                with open(shared) as fh:
+                    self.assertEqual(fh.read(), damage)
+                # and what does not depend on the memory is unaffected
+                self.assertEqual(read_state(ctx, shared=True), {})
+                self.assertEqual(pending_entries(ctx), {})
+                self.assertEqual(run("-C", fork, "status")[0], 0)
+            os.unlink(shared)                       # the user's choice, and the way back
+            self.assertEqual(config_memory_unprovable(ctx), "")
+            self.assertEqual(remember_upstream_configs(ctx, {"a" * 64}), ({"a" * 64}, ""))
+
+        def test_a_memory_that_is_not_a_list_of_digests_is_a_refusal_too(self):
+            """The hand-edited shape of the same fact."""
+            ctx = ctx_for(make_fork(self.tmp))
+            for record in ({"a": 1}, "a" * 64, [1, 2], ["ok" * 32, 7]):
+                change_state(ctx, True, lambda d: d.update({"upstream_configs": record}))
+                why = config_memory_unprovable(ctx)
+                self.assertIn("not a list of digests", why, repr(record))
+                self.assertEqual(fork_config_state(ctx)[0], "unprovable")
+                self.assertEqual(fork_merge_mode(ctx), "manual")
 
     class TestPendingEntry(Base):
         """`land` works from the `pending` record and nothing else, so what is read back
@@ -13495,20 +13752,46 @@ def run_tests() -> None:
         def test_merge_lands_its_own_entry_even_when_the_record_cannot_be_written(self):
             """`save_state` swallows a write that fails - a restore point that cannot be
             recorded is still one - so `--merge` must not depend on reading its record back:
-            it lands the entry it holds. The shared state file is made unwritable (a
-            directory where the file goes)."""
+            it lands the entry it holds. Every write of the state file fails here while the
+            file stays READABLE, because those are two different facts now: one that cannot
+            be read is a memory that has been made to forget, and the test below is that."""
             fork = make_fork(self.tmp, config='merge = "self"\n')
             name = self.feature(fork)
-            blocker = os.path.join(fork, ".git", STATE_FILE)        # the main worktree's
-            write(fork, os.path.join(".git", STATE_FILE, "keep"), "")
-            with on_platform(self.platform("gitlab")):
+
+            def dies(data, fh, **kw):
+                raise OSError("disk full")
+
+            with on_platform(self.platform("gitlab")), mock.patch.object(json, "dump", dies):
                 code, out, err = run("-C", fork, "ship", "--merge")
             self.assertEqual(code, 0, err + out)
             shipped = self.value(self.tool_argv_for("gitlab", "merge"), "--sha")
             self.assertEqual(rev(fork, "refs/heads/develop"), shipped)
             self.assertEqual(checked_out(fork), "develop")
             self.assertEqual(rev(fork, "refs/heads/" + name), "")
-            self.assertTrue(os.path.isdir(blocker))
+            self.assertEqual(self.entries(fork), {})            # nothing was recorded
+            self.assertFalse(os.path.exists(git_path(fork, STATE_FILE)))
+
+        def test_a_state_file_that_cannot_be_read_refuses_merge_before_any_push(self):
+            """The other half. A state file that cannot be READ is where this clone's memory
+            of the original project's configs went, and without it a version the project has
+            withdrawn reads as one it never had - so `--merge` is refused, at the gate,
+            before anything is pushed, naming the file. A plain `ship` is not refused: it
+            does not depend on that memory."""
+            fork = make_fork(self.tmp, config='merge = "self"\n')
+            name = self.feature(fork)
+            blocker = os.path.join(fork, ".git", STATE_FILE)        # the main worktree's
+            write(fork, os.path.join(".git", STATE_FILE, "keep"), "")
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, EXIT_PRECONDITION, err + out)
+            self.assertIn(blocker, err)
+            self.assertIn("merged by hand", err)
+            self.assertEqual(origin_sha(fork, name), "")            # nothing pushed
+            self.assertEqual(self.tool_argv_for("gitlab", "merge"), [])
+            self.assertTrue(os.path.isdir(blocker))                 # and left alone
+            self.assertEqual(run("-C", fork, "status")[0], 0)       # the rest goes on
+            self.ship_in(fork)                                      # and so does a plain ship
+            self.assertNotEqual(origin_sha(fork, name), "")
 
         def b_landed_while_on_a(self) -> Tuple[str, dict, dict]:
             """One worktree: feat/b shipped, then feat/a shipped and still checked out, and
@@ -14008,7 +14291,7 @@ def run_tests() -> None:
             self.assertIn("theirs-real.toml", why)             # the link and its target
             self.assertIn("cp -p --", why)                     # copied aside before anything
             self.assertIn(git_path(fork, "forkflow-config-"), why)   # and the copy is named
-            self.assertIn(why, fork_merge_refusal(ctx))
+            self.assertIn(without_stamp(why), without_stamp(fork_merge_refusal(ctx)))
             # a file of this fork's own, written here, is this fork's own again
             os.unlink(os.path.join(fork, CONFIG_FILE))
             write(fork, CONFIG_FILE, theirs + "# ours\n")
@@ -14141,7 +14424,7 @@ def run_tests() -> None:
                 self.assertIn(attr.split("=")[0], why)          # the attribute is named
                 self.assertIn(CONFIG_FILE, why)
                 self.assertIn(git_path(fork, os.path.join("info", "attributes")), why)
-                self.assertIn(why, fork_merge_refusal(ctx))
+                self.assertIn(without_stamp(why), without_stamp(fork_merge_refusal(ctx)))
             # the way out the message prints, run as printed: the attribute is turned off
             # for that one path in this clone's own attributes file (additive, nothing of
             # anybody's overwritten) AND the converted file is taken off disk. It does not
@@ -14344,6 +14627,22 @@ def run_tests() -> None:
             self.assertNotIn(config_digest(theirs), walked)  # and no history holds these
 
             self.assertEqual(self.mode(fork), "manual")     # remembered, so still upstream's
+
+            # and the memory cannot be flushed into an open gate. Damage the file it lives
+            # in - a truncated write, a full disk, a hand edit - and the answer used to be
+            # `{}`: the record simply gone, in silence, and upstream's own file read as this
+            # fork's own with `merge = "self"` in it (`f10/repro15.py`)
+            shared = state_path(ctx, shared=True)
+            with open(shared) as fh:
+                whole = fh.read()
+            with open(shared, "w") as fh:
+                fh.write(whole[:len(whole) // 2])
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "unprovable")
+            self.assertEqual(self.mode(fork), "manual")
+            self.assertIn(shared, fork_config_state(ctx_for(fork))[2])
+            with open(shared, "w") as fh:                   # put it back as it was
+                fh.write(whole)
+
             write(fork, CONFIG_FILE, theirs + "# ours\n")
             self.assertEqual(self.mode(fork), "self")       # an edit of the fork's own
 
@@ -15916,6 +16215,8 @@ def run_tests() -> None:
                              {"history_unprovable", "upstream_config_digests"})
             self.assertEqual(self.owners("config_render_unprovable("),
                              {"config_render_unprovable", "upstream_config_digests"})
+            self.assertEqual(self.owners("config_memory_unprovable("),
+                             {"config_memory_unprovable", "upstream_config_digests"})
             self.assertEqual(self.owners("config_versions_in("),
                              {"config_versions_in", "upstream_config_digests"})
             self.assertEqual(self.owners("remember_upstream_configs("),
@@ -15928,8 +16229,9 @@ def run_tests() -> None:
             # it and never reaches the memory
             self.assertEqual(calls_in("upstream_config_digests"),
                              {"history_unprovable", "config_render_unprovable",
-                              "foreign_remote_refs", "set", "config_versions_in",
-                              "remember_upstream_configs", "upstream_scope_refs"})
+                              "config_memory_unprovable", "foreign_remote_refs", "set",
+                              "config_versions_in", "remember_upstream_configs",
+                              "upstream_scope_refs"})
             # and the bytes are turned into what is compared and written down in one place
             self.assertEqual(self.owners("config_digest("),
                              {"config_digest", "config_versions_in", "config_is_upstreams"})
@@ -16028,6 +16330,16 @@ def run_tests() -> None:
             self.assertEqual(self.owners("save_state("), {"save_state", "change_state"})
             self.assertEqual(self.owners("take_state_lock("),
                              {"take_state_lock", "change_state"})
+            # and the state file is PARSED in one place too, so "this file says nothing" and
+            # "this file cannot be read" stay two different answers. A second parser is how
+            # an unreadable file came to read as {} and forget the provenance memory
+            self.assertEqual(self.owners("json.load("), {"load_state"})
+            self.assertEqual(self.owners("load_state("),
+                             {"load_state", "read_state", "state_unreadable", "change_state"})
+            # a write over a file that cannot be read makes the damage permanent, so the
+            # decision not to lives with the one writer
+            self.assertEqual(self.owners("state_unreadable("),
+                             {"state_unreadable", "config_memory_unprovable"})
             # nothing here may ever delete the lock file: the lock is the kernel's, on the
             # open descriptor, and a run that unlinks the path releases whatever a third
             # run holds by then. So the pathname is used in exactly one place - the open -
