@@ -286,6 +286,9 @@ is committed there - an untracked `.forkflow.toml` in the working tree, where `s
 The checked-out branch's own copy is never read for it: a sync branch carries upstream's file, so
 upstream's `merge = "self"` can never switch the gate off, and a config upstream wrote onto the
 trunk (a trunk bootstrapped from an upstream that tracks the file) counts as no declaration at all.
+Whose file it is is decided by its bytes, against every `.forkflow.toml` the original project has
+ever had - the whole history of `upstream/<branch>` and of the mirror, not just their tips, so a
+version upstream has since retired is still upstream's. Any edit of your own makes it yours.
 It is asked again right before the merge command runs; a fork that no longer says `"self"` by then
 (a teammate's commit the run's fetch brought in) gets exit 6 with the MR open. So the ship that
 first commits the config is `--mr`, merged by hand: once committed on a branch it is neither

@@ -240,14 +240,36 @@ fork-written one look upstream's - and `own_untracked_config`'s "in none of the 
 MERGE_HEAD" was as blind: upstream's file, brought in by an ordinary sync and untracked by hand, is
 byte for byte the state `setup` leaves this fork's own template in, and it opened the gate with
 nothing merged by anyone. `upstream_config_texts` now fingerprints every `.forkflow.toml` upstream
-has - tips only: `<upstream>/<branch>`, the mirror on origin and here, the merge base of upstream
-and `origin/<trunk>`, and `MERGE_HEAD` during a sync merge; no history walked, the scope stated at
-the helper - and `config_is_upstreams` is the one question both readers and the message builders
+has - and `config_is_upstreams` is the one question both readers and the message builders
 ask, pinned by `TestSourceInvariants.test_whose_config_it_is_is_decided_by_its_bytes_in_one_place`.
 Any edit the fork makes to the file makes the bytes the fork's, which is the way back every refusal
 prints: the refusal now says whose file it is (`fork_merge_refusal`) instead of "no `merge = "self"`
 in this fork's own config" about a file that plainly reads `merge = "self"`, and it names the ship
 that gets a config of the fork's own onto the trunk.
+
+⚠️ deviation (review phase 3, external, iteration 1): the scope of "every `.forkflow.toml` upstream
+has" is upstream's HISTORY, not its tips. Iteration 5 sampled `<upstream>/<branch>`, the mirror on
+origin and here, the merge base of upstream and `origin/<trunk>`, and `MERGE_HEAD` during a sync
+merge, and recorded the miss as acceptable. It is not: it is the fifth route with a wait in it.
+Upstream's file, left on disk untracked, is refused while upstream still holds those bytes at a
+tip - and once upstream edits its own config and the mirror moves past, the stale bytes in the
+working tree match nothing sampled and a file this fork never wrote becomes "the fork's own",
+`gate` (arbitrary shell) included. `upstream_config_texts` now walks the history of
+`<upstream>/<branch>`, of the mirror on origin and here, and of `MERGE_HEAD` while a sync merge is
+being resolved: `git rev-list --objects --full-history <refs> -- :(icase).forkflow.toml` lists, in
+one call, the commits that changed the path and the blob each holds there, and every DISTINCT
+version is read once. `--full-history` follows every parent of a merge, so a version that exists
+only on a side branch or only in a merge's own resolution counts too; the merge base is inside
+upstream's history and is no longer sampled separately; the tips are still read through the
+case-folding `config_text`, because `:(icase)` matches ASCII case only. Cost, measured on a
+50,000-commit upstream: `fork_merge_mode` 0.146s against 0.054s before, and the walk is reached
+only under `--merge` (`merge_gate` returns first without the flag), so no ordinary command pays it.
+`fork_config_state` reads the set ONCE per decision and hands it to the questions it asks -
+`config_is_upstreams`, `written_by_upstream` and `own_untracked_config` take it as an optional
+argument - and nothing keeps it between calls: `fork_merge_mode` runs twice per `--merge` run on
+purpose, and `TestMergeModeAskedAgainBeforeTheMerge.test_the_fetch_can_make_the_untracked_config_upstreams`
+fails if the set survives the run's own fetch. The invariant's `owners("upstream_config_texts(")`
+gains `fork_config_state` for that one read.
 
 ### Flags and dispatch
 
