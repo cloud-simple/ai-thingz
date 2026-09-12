@@ -104,9 +104,11 @@ EXIT_NOT_MERGED = 6                  # --merge: the branch is pushed, the merge 
 PUBLISHED_KEEP = 100                 # remembered (branch, commit) pushes - see record_published
 UPSTREAM_CONFIG_KEEP = 500           # remembered upstream `.forkflow.toml` digests, oldest
                                      # first out - see remember_upstream_configs
-CONFIG_RENDER_ATTRS = ("filter", "ident", "text", "eol",   # attributes that make the working
-                       "working-tree-encoding", "diff")    # tree's config differ from the
-                                     # blob git stores - see config_render_unprovable
+CONFIG_RENDER_ATTRS = ("filter", "ident",            # the attributes that make the working
+                       "working-tree-encoding")      # tree's config differ from the blob git
+                                     # stores in a way nothing here normalises back - see
+                                     # config_render_unprovable for why `text`, `eol` and
+                                     # `diff` are NOT among them
 STATE_LOCK_WAIT = 5.0                # seconds a run waits for another worktree's state write
 STATE_LOCK_POLL = 0.02               # between tries while it waits
 HELD_ELSEWHERE = frozenset(          # what the lock calls answer with while another run
@@ -2937,7 +2939,10 @@ def config_fingerprint(text: str) -> str:
     line endings, or an editor that dropped the last newline, is not this fork *writing*
     the file, and reading it as one would open the `--merge` gate on upstream's settings.
     Everything else is compared literally - one character of the fork's own is what makes
-    the file the fork's."""
+    the file the fork's.
+
+    This is also why `text` and `eol` are not among `CONFIG_RENDER_ATTRS`: both do line
+    endings and nothing else, so both are undone here before anything is compared."""
     body = text.replace("\r\n", "\n").replace("\r", "\n")
     return "\n".join(line.rstrip() for line in body.splitlines()).strip("\n")
 
@@ -3219,13 +3224,35 @@ def config_render_unprovable(ctx: Ctx) -> str:
       ever stored under that name is the string "theirs.toml", so upstream's own settings -
       read through the link - match nothing and pass as this fork's own.
     - a `.gitattributes` upstream controls. `filter` runs a program over the file on
-      checkout, `ident` expands `$Id$` into the blob's own hash, `text`/`eol` rewrite line
-      endings beyond what `config_fingerprint` normalises back, `working-tree-encoding`
-      holds the working tree in another encoding entirely, and `diff` names a textconv.
-      Each one makes the rendered file differ from every blob that could have produced it.
+      checkout, `ident` expands `$Id$` into the blob's own hash, and
+      `working-tree-encoding` holds the working tree in another encoding entirely. Each one
+      makes the rendered file differ from every blob that could have produced it, in a way
+      nothing on the reading side puts back.
 
     Both were reproduced against the gate (scratchpad `f9/repro1.py`): upstream's config,
     with `merge = "self"` and a `gate` in it, read as `untracked_own` and opened `--merge`.
+
+    `text`, `eol` and `diff` are deliberately NOT refused, and that matters more than it
+    looks: `* text=auto` is in an enormous number of repositories, and refusing it would
+    take `--merge` away from ordinary forks that are doing nothing unusual at all. They are
+    safe for two different reasons.
+
+    - `text` and `eol` change LINE ENDINGS and nothing else, and both sides of the
+      comparison already have their line endings taken off them: `working_config_text`
+      reads the file in text mode, where Python turns CRLF and CR into LF before anything
+      here sees it, and `config_fingerprint` does the same to the blob. Upstream's own
+      config, checked out through `eol=crlf` with CRLF really on disk, still compares equal
+      to the blob it came from and is still caught as upstream's - measured both ways
+      round (LF stored / CRLF on disk, and CRLF stored / LF on disk) in scratchpad
+      `f10/repro4.py` and held by
+      `test_line_endings_are_normalised_so_text_and_eol_are_safe_to_allow`.
+    - `diff` names a diff driver, and a diff driver's `textconv` is run to produce DIFF
+      OUTPUT. It is never part of a checkout, so the bytes on disk are the blob's either
+      way - also measured in `f10/repro4.py`, with a `textconv` that rewrites `self`.
+
+    If either reason ever stops holding - a `text` that did more than line endings, a
+    `diff` that reached the working tree - the attribute belongs back in
+    `CONFIG_RENDER_ATTRS`, and the tests above are what would say so.
 
     forkflow does not try to REPRODUCE git's rendering rules to compare like with like -
     that is a moving target, and a version of it that is subtly wrong is an open gate. It
@@ -3365,7 +3392,11 @@ def config_is_upstreams(ctx: Ctx, text: Optional[str],
 def working_config_text(ctx: Ctx) -> Optional[str]:
     """The working tree's `.forkflow.toml` as it stands, None when no file is listed under
     exactly that name (a case variant is not it - `load_config` refuses those) or it cannot
-    be read. The bytes, not the settings: provenance is about the file."""
+    be read. The bytes, not the settings: provenance is about the file.
+
+    Read in TEXT mode on purpose: Python turns CRLF and CR into LF here, which is half of
+    why a `text` or `eol` attribute cannot make upstream's config read as this fork's
+    (`config_render_unprovable`). `config_fingerprint` is the other half."""
     try:
         if CONFIG_FILE not in os.listdir(ctx.root):
             return None
@@ -13907,11 +13938,12 @@ def run_tests() -> None:
             the working tree is not the bytes of any blob that could have produced it, and
             upstream's config - `.gitattributes` and all, brought in by a sync - read as this
             fork's own (`f9/repro1.py`). Every attribute that rewrites the file between the
-            object store and the working tree is refused the same way."""
+            object store and the working tree is refused the same way - but only those. The
+            attributes that do line endings (`text`, `eol`) and the one that does diff
+            output (`diff`) are NOT here, and the test below says why."""
             fork = make_fork(self.tmp)
             theirs = 'merge = "self"\n# $Id$\n'
-            for attr in ("ident", "filter=mangle", "text=auto", "eol=crlf",
-                         "working-tree-encoding=UTF-16", "diff=toml"):
+            for attr in ("ident", "filter=mangle", "working-tree-encoding=UTF-16"):
                 write(fork, ".gitattributes", CONFIG_FILE + " " + attr + "\n")
                 write(fork, CONFIG_FILE, theirs)
                 ctx = ctx_for(fork)
@@ -13929,6 +13961,94 @@ def run_tests() -> None:
                          + "\n")
             self.assertEqual(fork_config_state(ctx_for(fork))[0], "untracked_own")
             self.assertEqual(self.mode(fork), "self")
+
+        def theirs_through_an_attribute(self, fork: str, attr: str, theirs) -> bytes:
+            """Upstream's `.gitattributes` and upstream's `.forkflow.toml`, checked out into
+            this fork's working tree and untracked by hand - the shape a sync leaves behind,
+            and the one the whole rendering question is about. Answers the raw bytes that
+            landed on disk, so a test can say what git actually did to them."""
+            commit_upstream(self.tmp, ".gitattributes", CONFIG_FILE + " " + attr + "\n",
+                            "theirs: attributes")
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            sh("git", "checkout", "-q", "upstream/main", "--", ".gitattributes", cwd=fork)
+            sh("git", "checkout", "-q", "upstream/main", "--", CONFIG_FILE, cwd=fork)
+            sh("git", "rm", "-q", "--cached", "--ignore-unmatch", "--",
+               CONFIG_FILE, ".gitattributes", cwd=fork)
+            with open(os.path.join(fork, CONFIG_FILE), "rb") as fh:
+                return fh.read()
+
+        def test_line_endings_are_normalised_so_text_and_eol_are_safe_to_allow(self):
+            """`text` and `eol` were refused with `filter` and `ident`, and they do not
+            belong there: they change LINE ENDINGS and nothing else, and both sides of the
+            provenance comparison already have their line endings taken off them
+            (`working_config_text` reads in text mode, `config_fingerprint` normalises the
+            blob). This is the claim the narrowing rests on, so it is measured rather than
+            assumed - CRLF really reaches the working tree here, and upstream's config is
+            STILL read as upstream's afterwards.
+
+            Both sides of the comparison, one each way round: the blob stored with LF while
+            `eol=crlf` puts CRLF on disk, and the blob stored with CRLF while the file on
+            disk has LF."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch theirs"]\n'
+            raw = self.theirs_through_an_attribute(fork, "eol=crlf", theirs)
+            self.assertIn(b"\r\n", raw)                  # git really did convert it
+            ctx = ctx_for(fork)
+            self.assertEqual(working_config_text(ctx), theirs)    # and it reads back as LF
+            self.assertEqual(fork_config_state(ctx)[0], "untracked_upstreams")
+            self.assertEqual(self.mode(fork), "manual")           # still upstream's
+            write(fork, CONFIG_FILE, theirs + "# ours\n")         # the way back, unchanged
+            self.assertEqual(self.mode(fork), "self")
+
+            # and the blob's own side: upstream STORED a version with CRLF in it (`-text`
+            # keeps git's hands off the bytes on the way in), and this working tree holds
+            # the same settings with LF. Same file, different line endings, still upstream's
+            crlf = 'merge = "self"\r\ngate = ["touch crlf"]\r\n'
+            commit_upstream(self.tmp, ".gitattributes", CONFIG_FILE + " -text\n",
+                            "theirs: attributes, verbatim")
+            commit_upstream(self.tmp, CONFIG_FILE, crlf, "theirs: forkflow with CRLF")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            stored = sh("git", "cat-file", "blob", "upstream/main:" + CONFIG_FILE, cwd=fork)
+            self.assertIn("\r", stored)                  # CRLF really is what git holds
+            write(fork, CONFIG_FILE, crlf.replace("\r\n", "\n"))
+            ctx = ctx_for(fork)
+            self.assertEqual(fork_config_state(ctx)[2], "")       # and nothing is refused
+            self.assertEqual(fork_config_state(ctx)[0], "untracked_upstreams")
+            self.assertEqual(self.mode(fork), "manual")
+            write(fork, CONFIG_FILE, 'merge = "self"\n# ours\n')
+            self.assertEqual(self.mode(fork), "self")
+
+        def test_a_diff_attribute_never_reaches_the_working_tree(self):
+            """`diff` names a diff driver, and a driver's `textconv` is run to produce DIFF
+            OUTPUT - never as part of a checkout. It was in the refusing set anyway; the
+            bytes say it does not belong there, and upstream's config stays upstream's."""
+            theirs = 'merge = "self"\ngate = ["touch theirs"]\n'
+            fork = make_fork(self.tmp)
+            sh("git", "config", "diff.toml.textconv", "sed s/self/ZZZZ/", cwd=fork)
+            raw = self.theirs_through_an_attribute(fork, "diff=toml", theirs)
+            self.assertEqual(raw.decode(), theirs)      # the textconv changed nothing here
+            ctx = ctx_for(fork)
+            self.assertEqual(fork_config_state(ctx)[0], "untracked_upstreams")
+            self.assertEqual(self.mode(fork), "manual")
+
+        def test_an_ordinary_fork_is_never_refused_for_its_gitattributes(self):
+            """The over-refusal this narrowing exists for. `* text=auto` is in an enormous
+            number of repositories and says nothing at all about whose config this is; a
+            fork carrying it used to be told `--merge` could not be proven here, with a
+            remedy to write into its git directory. A plain clone with one `upstream`
+            remote, its own `.forkflow.toml` on the trunk and that line in `.gitattributes`
+            reaches `--merge` like any other fork."""
+            fork = make_fork(self.tmp, config='merge = "self"\n# ours\n')
+            for rules in ("* text=auto\n",
+                          "* text=auto eol=lf\n",
+                          "*.md text\n*.png binary\n" + CONFIG_FILE + " diff=toml\n",
+                          CONFIG_FILE + " text eol=crlf diff\n"):
+                write(fork, ".gitattributes", rules)
+                ctx = ctx_for(fork)
+                self.assertEqual(fork_config_state(ctx)[2], "", rules)   # nothing refused
+                self.assertEqual(fork_config_state(ctx)[0], "trunk_own", rules)
+                self.assertEqual(self.mode(fork), "self", rules)
 
         def test_an_attribute_on_a_case_variant_of_the_name_is_looked_at_too(self):
             """A case-insensitive filesystem makes `.ForkFlow.toml` and `.forkflow.toml` one

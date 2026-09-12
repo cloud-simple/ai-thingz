@@ -582,6 +582,20 @@ before it replaces the link with a real file; for the attribute, an APPEND to `i
 the git directory, which git reads before any `.gitattributes` in the tree and which overwrites
 nothing. Neither commits anything anywhere.
 
+⚠️ review fix (phase 3, external, iteration 4): that refusing set was too wide and broke ORDINARY
+forks. `CONFIG_RENDER_ATTRS` is `filter`, `ident`, `working-tree-encoding` now - `text`, `eol` and
+`diff` are gone from it. `* text=auto` is in an enormous number of repositories and says nothing
+about whose config a file is; with the wider set, a plain clone carrying that one line was told
+`--merge` could not be proven here. The two reasons the three are safe were MEASURED, not assumed
+(scratchpad `f10/repro4.py`, and `test_line_endings_are_normalised_so_text_and_eol_are_safe_to_allow`
+/ `test_a_diff_attribute_never_reaches_the_working_tree`): `text` and `eol` do line endings and
+nothing else, and both sides of the comparison already have theirs taken off them
+(`working_config_text` reads in text mode, `config_fingerprint` normalises the blob) - upstream's
+config checked out through `eol=crlf`, with CRLF really on disk, still compares equal to the blob it
+came from and is still refused; and a `diff` driver's `textconv` produces diff OUTPUT and never
+touches a checkout, measured with a `textconv` that rewrites the file. If either reason ever stops
+holding, the attribute goes back in the tuple and those two tests are what say so.
+
 ### `land`
 
 `cmd_land(args)` -> `resolve_ctx(need_upstream=True, need_trunk=True, strict_mirror=False)`, header,
