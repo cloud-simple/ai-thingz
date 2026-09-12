@@ -678,6 +678,13 @@ did not fetch, so it cannot tell whether MR ... has landed" and names the same c
 `ship/SKILL.md`, `sync/SKILL.md` and `setup/SKILL.md` say this; the dry-run tests now assert on
 `FETCH_HEAD` and on every file in `.git/objects` (`odb()`).
 
+⚠️ review fix (phase 3, external, iteration 3): the FLAG'S OWN HELP was missed in that round and
+still read "(it does fetch, and simulates the merge)" - the first place anybody reads what the flag
+does. It now says what the flag does, and `test_the_dry_run_help_does_not_promise_a_fetch` reads
+the sentence out of the parser so it cannot drift again. Every other description of `--dry-run` -
+the module docstring, the README, this plan and all five skills - was re-read in the same pass and
+already said "does not fetch".
+
 Every printed command goes through `sh_arg`. **Invariant edit 2:** `land_trunk` is the second owner
 of the `"merge", "--ff-only"` needle. `test_only_advance_mirror_moves_the_mirror` keeps
 `"update-ref"` pinned to `advance_mirror` under its existing name; the ff-only assertion moves to a

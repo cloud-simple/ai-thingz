@@ -5699,7 +5699,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
                         help="repository directory (default: cwd)")
     common.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS,
                         help="report what would happen; move no branch, push nothing, "
-                             "write no config (it does fetch, and simulates the merge)")
+                             "write no config or hook - and fetch nothing (`git ls-remote` "
+                             "reports what each remote has instead). The merge is still "
+                             "simulated, into a scratch directory")
     common.add_argument("--force", action="store_true", default=argparse.SUPPRESS,
                         help="`sync`: recreate an existing sync branch; `setup`: replace a "
                              "foreign pre-push hook. No effect on status, check or ship; "
@@ -15303,6 +15305,20 @@ def run_tests() -> None:
                 self.assertEqual(parse_args(argv).dir, "/x", argv)
             for argv in (["--force", "setup"], ["setup", "--force"]):
                 self.assertTrue(parse_args(argv).force, argv)
+
+        def test_the_dry_run_help_does_not_promise_a_fetch(self):
+            """A flag's own help is the first place anybody reads what it does, and this one
+            still said "(it does fetch, and simulates the merge)" long after the no-write
+            contract stopped it fetching - a fetch moves `FETCH_HEAD` and `refs/remotes/*`
+            and brings objects in, so `fetch_preview` asks `git ls-remote` instead. Read out
+            of the parser, so the sentence a user is shown is the one under test."""
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+                parse_args(["--help"])
+            text = " ".join(out.getvalue().split())
+            self.assertIn("--dry-run", text)
+            self.assertIn("fetch nothing", text)
+            self.assertNotIn("does fetch", text)
 
         def test_defaults(self):
             args = parse_args(["status"])
