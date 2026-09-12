@@ -294,7 +294,11 @@ Whose file it is is decided by its bytes, against every `.forkflow.toml` the ori
 ever had - the whole history of every remote-tracking ref that is not `origin`'s, plus the mirror,
 not just their tips, so a version upstream has since retired is still upstream's. Any edit of your
 own makes it yours. The refs walked are deliberately not the ones the config names: a config
-choosing the evidence against itself is no check at all. And the walk fails CLOSED - a clone that
+choosing the evidence against itself is no check at all. What those refs carried is also written
+down - as hashes, in `.git/forkflow-state.json`, where the original project cannot write - because
+a version that is gone from every ref (upstream force-pushed, withdrew the branch, or this clone
+pruned) is not a version upstream never had: what was once upstream's stays upstream's, and your
+own edit of the file is new bytes that no such record holds. And the walk fails CLOSED - a clone that
 cannot prove what the original project has had gets exit 2 for `--merge` alone, with the condition
 named: shallow (`git fetch --unshallow <upstream>` ends it), partial (`--filter`), history rewritten
 by `refs/replace/*` or `info/grafts`, nothing of upstream's fetched, or an object that cannot be

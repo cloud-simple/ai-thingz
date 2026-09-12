@@ -541,6 +541,26 @@ every fallback is another staleness judgement. The bounded wait still ends in a 
 invariant now pins the lock's PATHNAME to `take_state_lock` alone, so nothing added later can
 unlink it, and pins `fcntl.flock`/`msvcrt.locking` to `lock_exclusive`.
 
+⚠️ review fix (phase 3, external, iteration 3): the eighth route, and the first that no read of
+the repository can close - YOU CANNOT PROVE ABSENCE FROM A HISTORY YOU NO LONGER HOLD. Upstream
+force-pushes the commit that carried a `.forkflow.toml` away, withdraws the branch, or this clone
+prunes; the walk then reads a history holding every version of upstream's but that one, so the
+answer is not empty, no fail-closed condition fires, and the file sitting in the working tree - the
+one a sync brought in - reads as this fork's own with upstream's `merge = "self"` in it. So the
+fork REMEMBERS. `upstream_config_digests` (the renamed `upstream_config_texts`; it answers in
+`config_digest`s now, a sha256 over the normalised bytes) walks `foreign_remote_refs` first and
+hands what it read to `remember_upstream_configs`, which writes down every digest new to this
+clone through the one locked writer and answers everything it remembers. The refs the CONFIG names
+still widen the answer for the run that reads them (`upstream_scope_refs`, a second
+`config_versions_in`) and are deliberately NOT written down: a config calling a branch of the
+fork's the `mirror` would otherwise put the fork's own bytes into the memory for good. A fork that
+adopts upstream's config and later edits it is not trapped - edited bytes are new bytes with a
+digest no memory holds. Bounded at `UPSTREAM_CONFIG_KEEP` = 500, oldest first out, about 34KB;
+a dry run writes down nothing, and a memory that cannot be written is a REFUSAL naming the reason,
+not an answer computed as if it had been. The `--merge` refusal tests' `snapshot` now compares the
+state file's RECORDS (`work_state`, which drops `upstream_configs`): a refused run writing down
+what it read of upstream's is the point of the memory, not a change it should not have made.
+
 ### `land`
 
 `cmd_land(args)` -> `resolve_ctx(need_upstream=True, need_trunk=True, strict_mirror=False)`, header,

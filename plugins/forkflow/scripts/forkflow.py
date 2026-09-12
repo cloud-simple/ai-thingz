@@ -53,6 +53,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import errno
+import hashlib
 import json
 import os
 import re
@@ -101,6 +102,8 @@ EXIT_INTERRUPTED = 130               # Ctrl-C, as the module docstring publishes
 EXIT_NOT_MERGED = 6                  # --merge: the branch is pushed, the merge request is
                                      # not merged (or not created) - all before it stands
 PUBLISHED_KEEP = 100                 # remembered (branch, commit) pushes - see record_published
+UPSTREAM_CONFIG_KEEP = 500           # remembered upstream `.forkflow.toml` digests, oldest
+                                     # first out - see remember_upstream_configs
 STATE_LOCK_WAIT = 5.0                # seconds a run waits for another worktree's state write
 STATE_LOCK_POLL = 0.02               # between tries while it waits
 HELD_ELSEWHERE = frozenset(          # what the lock calls answer with while another run
@@ -2936,6 +2939,80 @@ def config_fingerprint(text: str) -> str:
     return "\n".join(line.rstrip() for line in body.splitlines()).strip("\n")
 
 
+def config_digest(text: str) -> str:
+    """A `.forkflow.toml`'s bytes as provenance compares them, and as the state file writes
+    them down: a sha256 over `config_fingerprint`'s normalised form, so what is remembered
+    is a hash and never anybody's file."""
+    return hashlib.sha256(config_fingerprint(text).encode("utf-8")).hexdigest()
+
+
+def remembered_upstream_configs(ctx: Ctx) -> list:
+    """The `config_digest`s of the original project's `.forkflow.toml`s this clone has
+    written down, oldest first ({} entries when it has written down none)."""
+    kept = read_state(ctx, shared=True).get("upstream_configs")
+    return [d for d in (kept if isinstance(kept, list) else []) if isinstance(d, str)]
+
+
+def remember_upstream_configs(ctx: Ctx, digests: set) -> Tuple[set, str]:
+    """Write down each of `digests` this clone has not written down before, and answer
+    everything it now remembers - or why it could not be written, which is a refusal.
+
+    YOU CANNOT PROVE ABSENCE FROM A HISTORY YOU NO LONGER HOLD. Upstream force-pushes the
+    branch, withdraws it, or this fork prunes, and the version that reached this working
+    tree is gone from every ref a walk can reach while the rest of upstream's history is
+    still there - so the walk's answer is short by exactly the version in question, the
+    empty-baseline refusal does not fire, and upstream's own bytes read as this fork's.
+    Nothing read out of the repository closes that, because the repository is the thing
+    that no longer holds it.
+
+    So the fork REMEMBERS, in the one place upstream cannot write - `.git/forkflow-state.json`,
+    through the one locked writer (`change_state`), as hashes and never as contents. What
+    was once the original project's stays the original project's, and a withdrawal changes
+    nothing at all.
+
+    Only what `foreign_remote_refs` carried is written down. That is the frame upstream
+    cannot choose; the refs the config names widen the answer for the run that reads them
+    and are left out of the memory on purpose, because a config naming this fork's own
+    trunk would otherwise write the fork's own bytes in for good.
+
+    A fork that ADOPTS a config of upstream's and then edits it is not trapped: edited bytes
+    are different bytes with a different digest, in no remembered set, and that is the way
+    back every refusal here prints.
+
+    BOUNDED by `UPSTREAM_CONFIG_KEEP`, oldest first out - 500 distinct versions of one small
+    file, which no real project reaches, at 64 bytes each, so this cannot grow past about
+    34KB. A digest pushed out of the memory is a hole only where upstream has ALSO withdrawn
+    that version from every history this clone holds: while the version is still reachable,
+    the walk finds it again on every run and writes it back down.
+
+    What is remembered is what the tool has SEEN. A version that reached this clone and left
+    it again with no provenance walk in between was never seen here - which is why the walk
+    runs twice per `--merge` run, before the push and again after the run's own fetch.
+
+    A dry run writes nothing (the no-write contract) and answers with the memory plus what
+    was just walked."""
+    kept = remembered_upstream_configs(ctx)
+    known = set(kept)
+    fresh = [d for d in sorted(digests) if d not in known]
+    if not fresh or ctx.dry_run:
+        return (known | set(digests), "")
+
+    def change(data: dict) -> None:
+        now = [d for d in (data.get("upstream_configs") or []) if isinstance(d, str)]
+        here = set(now)
+        now.extend(d for d in fresh if d not in here)
+        data["upstream_configs"] = now[-UPSTREAM_CONFIG_KEEP:]
+
+    why = change_state(ctx, True, change)
+    if why:
+        return (set(), f"this clone cannot write down which `{CONFIG_FILE}`s the original "
+                       f"project has ({why}), and a version it has since stopped being able "
+                       f"to see in any ref would then read as one the project never had. "
+                       f"Nothing else is refused: fix that and run this again, or run the "
+                       f"same command without `--merge` and have the merge request merged "
+                       f"by hand")
+    return (known | set(digests), "")
+
 def foreign_remote_refs(ctx: Ctx) -> list:
     """Every remote-tracking ref that is not `origin`'s.
 
@@ -2954,7 +3031,7 @@ def foreign_remote_refs(ctx: Ctx) -> list:
 
 
 def upstream_scope_refs(ctx: Ctx) -> list:
-    """The refs `upstream_config_texts` walks - chosen without asking the `.forkflow.toml`
+    """The refs `upstream_config_digests` walks - chosen without asking the `.forkflow.toml`
     whose provenance is the whole question.
 
     The scope used to be the refs the CONFIG names: `<upstream>/<branch>` and the mirror,
@@ -3046,13 +3123,12 @@ def history_unprovable(ctx: Ctx) -> str:
     return ""
 
 
-def upstream_config_texts(ctx: Ctx) -> Tuple[set, str]:
-    """(every `.forkflow.toml` the original project has EVER had, fingerprinted; "" - or
-    why this clone cannot be asked that at all, which is a refusal, see `fork_config_state`).
+def config_versions_in(ctx: Ctx, refs: Sequence[str]) -> Tuple[set, str]:
+    """(every `.forkflow.toml` any of `refs` has EVER carried, as `config_digest`s; "" - or
+    why this clone cannot be read for them, which is a refusal wherever it is asked).
 
-    SCOPE - histories, not tips, over `upstream_scope_refs` (which is where the refs are
-    chosen, and why they are not the config's). For each of them EVERY version of the file
-    its history has carried, not only the one at the tip.
+    HISTORIES, not tips. For each ref every version of the file its history has carried,
+    not only the one at the tip.
 
     Sampling the tips was the first shape of this and it left the gate open on a delay.
     Upstream's file, brought in by a sync and left on disk untracked, was refused while
@@ -3084,12 +3160,10 @@ def upstream_config_texts(ctx: Ctx) -> Tuple[set, str]:
     those bytes, and treated as absence each one is an open gate. So each answers with the
     reason instead of a short set, on top of the whole-repository conditions
     `history_unprovable` names."""
-    blind = history_unprovable(ctx)
-    if blind:
-        return (set(), blind)
-    refs = upstream_scope_refs(ctx)
+    if not refs:
+        return (set(), "")
     fold = CONFIG_FILE.casefold()
-    texts = set()
+    digests = set()
     for revision in refs:
         name = config_name_at(ctx, revision)  # None: no file in its tree; the exact name
         if name is None:                      # when the tree cannot be listed, so `show` says
@@ -3101,7 +3175,7 @@ def upstream_config_texts(ctx: Ctx) -> Tuple[set, str]:
                            f"({why[0] if why else 'git gave no reason'}) - a version the "
                            f"original project has may be missing here; complete the clone, "
                            f"or have the merge request merged by hand")
-        texts.add(config_fingerprint(text))
+        digests.add(config_digest(text))
     rc, listing, err = git_rc("rev-list", "--objects", "--full-history", *refs, "--",
                               f":(icase){CONFIG_FILE}", cwd=ctx.root)
     if rc != 0:
@@ -3122,8 +3196,46 @@ def upstream_config_texts(ctx: Ctx) -> Tuple[set, str]:
                            f"clone), and a version the original project had would be read "
                            f"as one it never had; complete the clone, or have the merge "
                            f"request merged by hand")
-        texts.add(config_fingerprint(text))
-    return (texts, "")
+        digests.add(config_digest(text))
+    return (digests, "")
+
+
+def upstream_config_digests(ctx: Ctx) -> Tuple[set, str]:
+    """(every `.forkflow.toml` the original project has EVER had, as `config_digest`s; "" -
+    or why this clone cannot be asked that at all, which is a refusal, see
+    `fork_config_state`).
+
+    Three parts, and each is there because of a route that was open without it:
+
+    - what the refs upstream cannot choose carry NOW (`foreign_remote_refs`), read over
+      their whole histories (`config_versions_in`);
+    - what this clone has WRITTEN DOWN of upstream's, from every earlier run
+      (`remember_upstream_configs`) - because a version that is gone from every ref is not
+      a version upstream never had, and nothing read out of the repository can say so;
+    - and what the refs the CONFIG names carry, which only ever WIDENS the answer
+      (`upstream_scope_refs`) and is deliberately never written down: a config that names
+      this fork's own trunk would otherwise put the fork's own bytes into the memory for
+      good, and no later edit of the config could take them out again.
+
+    The two walks are two `rev-list`s over sets that mostly overlap; the walk itself is the
+    cheap half (30ms of the 1.0s measured in `config_versions_in`), and the expensive half -
+    one `cat-file` per distinct version - is paid once per version in each, so the cost of
+    the split is a second walk and not a second read of the repository's configs."""
+    blind = history_unprovable(ctx)
+    if blind:
+        return (set(), blind)
+    theirs = foreign_remote_refs(ctx)
+    seen, why = config_versions_in(ctx, theirs)
+    if why:
+        return (set(), why)
+    known, why = remember_upstream_configs(ctx, seen)
+    if why:
+        return (set(), why)
+    named = [ref for ref in upstream_scope_refs(ctx) if ref not in set(theirs)]
+    wider, why = config_versions_in(ctx, named)
+    if why:
+        return (set(), why)
+    return (known | wider, "")
 
 
 def config_is_upstreams(ctx: Ctx, text: Optional[str],
@@ -3143,7 +3255,7 @@ def config_is_upstreams(ctx: Ctx, text: Optional[str],
       HEAD and from MERGE_HEAD - exactly the state `setup` leaves this fork's template in.
 
     The bytes lie in neither direction. A `.forkflow.toml` is this fork's own precisely
-    when it differs from every `.forkflow.toml` upstream has (`upstream_config_texts`),
+    when it differs from every `.forkflow.toml` upstream has (`upstream_config_digests`),
     so any edit the fork makes to the file makes it the fork's - the way back every
     refusal prints. None (there is no file) is not upstream's: nothing came from there.
 
@@ -3155,8 +3267,8 @@ def config_is_upstreams(ctx: Ctx, text: Optional[str],
     if text is None:
         return False
     if upstreams is None:
-        upstreams, _ = upstream_config_texts(ctx)   # the refusal is `fork_config_state`'s
-    return config_fingerprint(text) in upstreams
+        upstreams, _ = upstream_config_digests(ctx)  # the refusal is `fork_config_state`'s
+    return config_digest(text) in upstreams
 
 
 def working_config_text(ctx: Ctx) -> Optional[str]:
@@ -3235,7 +3347,7 @@ def fork_config_state(ctx: Ctx) -> Tuple[str, Optional[str], str]:
       in, which is byte for byte the state `setup` leaves the fork's own template in;
     - `none` - no readable file anywhere it would be read from.
 
-    Before any of them, `unprovable`: `upstream_config_texts` could not be asked what the
+    Before any of them, `unprovable`: `upstream_config_digests` could not be asked what the
     original project's configs are (a shallow, partial, grafted or replaced clone, an
     object that is not here, a walk git refused). Every state below it is a statement about
     a set that would then be short, and a short set reads upstream's own file as this
@@ -3247,9 +3359,9 @@ def fork_config_state(ctx: Ctx) -> Tuple[str, Optional[str], str]:
 
     What upstream's configs are is read ONCE here and handed to each question this one
     decision asks - the states below ask it of up to two files, and the walk behind it
-    (`upstream_config_texts`) would otherwise be repeated for one answer. Nothing keeps it
+    (`upstream_config_digests`) would otherwise be repeated for one answer. Nothing keeps it
     beyond this call: `fork_merge_mode` runs twice per `--merge` run on purpose."""
-    upstreams, blind = upstream_config_texts(ctx)
+    upstreams, blind = upstream_config_digests(ctx)
     if blind:
         return ("unprovable", working_config_text(ctx), blind)
     trunk_name = f"{ctx.origin}/{ctx.trunk}"
@@ -6904,6 +7016,46 @@ def run_tests() -> None:
             self.assertIn("released the moment the run holding it ends", why)
             self.assertEqual(read_state(ctx), {})
             self.assertEqual(write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"}), "")
+
+        def test_what_this_clone_remembers_of_upstreams_configs_is_bounded(self):
+            """Hashes, never contents, and a bounded number of them: oldest first out at
+            `UPSTREAM_CONFIG_KEEP`, so the memory cannot grow without end. A digest pushed
+            out is a hole only where upstream has ALSO withdrawn that version from every
+            history this clone holds - while it is still reachable the walk finds it again
+            and writes it back down."""
+            ctx = ctx_for(make_fork(self.tmp))
+            digests = ["%064x" % n for n in range(UPSTREAM_CONFIG_KEEP + 10)]
+            known, why = remember_upstream_configs(ctx, set(digests[:5]))
+            self.assertEqual((known, why), (set(digests[:5]), ""))
+            for start in range(5, len(digests), 25):
+                self.assertEqual(remember_upstream_configs(ctx, set(digests[start:start + 25]))[1],
+                                 "")
+            kept = remembered_upstream_configs(ctx)
+            self.assertEqual(len(kept), UPSTREAM_CONFIG_KEEP)
+            self.assertEqual(kept[-1], digests[-1])         # the newest is there
+            self.assertEqual(kept[0], digests[10])          # the ten oldest went
+            self.assertNotIn(digests[0], kept)
+
+        def test_a_memory_that_cannot_be_written_is_a_refusal_not_a_short_answer(self):
+            """A version the original project has since withdrawn would read as one it never
+            had, so a memory that cannot be written answers with the reason and leaves the
+            way out that needs no state file at all - have the request merged by hand."""
+            ctx = ctx_for(make_fork(self.tmp))
+            os.mkdir(state_path(ctx, shared=True))          # nothing can be written there
+            known, why = remember_upstream_configs(ctx, {"a" * 64})
+            self.assertEqual(known, set())
+            self.assertIn("cannot write down which", why)
+            self.assertIn(CONFIG_FILE, why)
+            self.assertIn("merged by hand", why)
+            os.rmdir(state_path(ctx, shared=True))
+            self.assertEqual(remember_upstream_configs(ctx, {"a" * 64}), ({"a" * 64}, ""))
+
+        def test_a_dry_run_writes_down_no_upstream_config(self):
+            """The no-write contract: a dry run answers with the memory plus what it walked
+            and leaves no file behind."""
+            ctx = ctx_for(make_fork(self.tmp), dry_run=True)
+            self.assertEqual(remember_upstream_configs(ctx, {"a" * 64}), ({"a" * 64}, ""))
+            self.assertFalse(os.path.exists(state_path(ctx, shared=True)))
 
     class TestPendingEntry(Base):
         """`land` works from the `pending` record and nothing else, so what is read back
@@ -13585,7 +13737,7 @@ def run_tests() -> None:
             self.assertEqual(self.mode(fork), "self")
 
         def test_a_config_upstream_no_longer_has_at_its_tip_is_still_upstreams(self):
-            """The scope `upstream_config_texts` reads is every version the history of
+            """The scope `upstream_config_digests` reads is every version the history of
             `<upstream>/<branch>` and of the mirror has carried, not their tips. So a
             config the fork adopted whole at its last sync stays upstream's after upstream
             has edited its own since - here it is still the merge base of upstream and the
@@ -13626,6 +13778,82 @@ def run_tests() -> None:
             self.assertEqual(self.mode(fork), "manual")
             write(fork, CONFIG_FILE, theirs + "# ours\n")
             self.assertEqual(self.mode(fork), "self")
+
+        def withdraw_and_replace(self, gone: str, instead: str) -> None:
+            """Upstream rewrites its branch: the commit that carried `gone` is not in the
+            history any more and `instead` is what the branch carries now. A force-push, a
+            withdrawn branch and a pruned fetch all leave this behind - a history with every
+            other version of upstream's in it and not that one."""
+            seed = os.path.join(self.tmp, "seed")
+            sh("git", "reset", "-q", "--hard", "HEAD~1", cwd=seed)
+            write(seed, CONFIG_FILE, instead)
+            sh("git", "add", "-A", cwd=seed)
+            sh("git", "commit", "-q", "-m", "theirs: forkflow, rewritten", cwd=seed)
+            sh("git", "push", "-q", "--force", "origin", "main", cwd=seed)
+            self.assertNotEqual(gone, instead)
+
+        def test_a_version_upstream_withdrew_from_every_ref_is_still_upstreams(self):
+            """You cannot prove absence from a history you no longer hold. Upstream's
+            `.forkflow.toml`, brought in by a sync and untracked by hand, is refused while
+            upstream still carries those bytes - and upstream then FORCE-PUSHES that commit
+            away and puts another version in its place. The walk now reads a history holding
+            every version of upstream's but that one, so the answer is not empty, no
+            fail-closed condition fires, and a file this fork never wrote read as the fork's
+            own - with upstream's `merge = "self"` in it, and upstream's `gate` behind it.
+
+            So the fork REMEMBERS, in the one place upstream cannot write: what was once the
+            original project's stays the original project's, and the withdrawal changes
+            nothing. The way back is the one every refusal here prints - edit the file, and
+            edited bytes are new bytes that no memory holds."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch theirs"]\n'
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            self.advance_mirror(fork)
+            write(fork, CONFIG_FILE, theirs)     # a sync brought it in; untracked by hand
+            self.assertEqual(self.mode(fork), "manual")
+            self.assertEqual(remembered_upstream_configs(ctx_for(fork)),
+                             [config_digest(theirs)])       # written down while it was there
+
+            self.withdraw_and_replace(theirs, theirs + "# theirs, rewritten\n")
+            sh("git", "fetch", "-q", "--prune", "upstream", cwd=fork)
+            sh("git", "branch", "-f", "main", "upstream/main", cwd=fork)
+            sh("git", "push", "-q", "--force", "origin", "main:refs/heads/main", cwd=fork)
+            sh("git", "fetch", "-q", "--prune", "origin", cwd=fork)
+            ctx = ctx_for(fork)
+            walked, why = config_versions_in(ctx, upstream_scope_refs(ctx))
+            self.assertEqual(why, "")
+            self.assertTrue(walked)                         # the baseline is NOT empty
+            self.assertNotIn(config_digest(theirs), walked)  # and no history holds these
+
+            self.assertEqual(self.mode(fork), "manual")     # remembered, so still upstream's
+            write(fork, CONFIG_FILE, theirs + "# ours\n")
+            self.assertEqual(self.mode(fork), "self")       # an edit of the fork's own
+
+        def test_what_is_written_down_comes_only_from_the_refs_upstream_cannot_choose(self):
+            """The memory is permanent, so what goes into it is taken from the frame upstream
+            cannot choose (`foreign_remote_refs`) and from nowhere else. The refs the CONFIG
+            names widen the answer for the run that reads them and are left out on purpose:
+            a config aiming the walk at this fork's own trunk would otherwise write the
+            fork's own bytes in for good, and no later edit of the config could take them
+            out again.
+
+            Here the config on the trunk calls a branch of the FORK's the `mirror`, and that
+            branch carries the fork's own config, so the walk reads the fork's own bytes as
+            upstream's and refuses - which is the safe direction, and is what the superset
+            scope is for. What must not happen is the refusal outliving the config that
+            caused it: the fork edits the file, and the gate opens again."""
+            config = 'merge = "self"\nmirror = "ours"\n'
+            fork = make_fork(self.tmp, config=config)
+            sh("git", "push", "-q", "origin", "develop:refs/heads/ours", cwd=fork)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            ctx = ctx_for(fork)
+            self.assertIn("refs/remotes/origin/ours", upstream_scope_refs(ctx))
+            self.assertEqual(fork_config_state(ctx)[0], "trunk_upstreams")
+            self.assertEqual(self.mode(fork), "manual")     # it aimed the walk at the fork
+            self.assertNotIn(config_digest(config), remembered_upstream_configs(ctx))
+            second_clone_commit(self.tmp, path=CONFIG_FILE, content='merge = "self"\n')
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertEqual(self.mode(fork), "self")       # nothing was written down about it
 
         def blank_upstream_branch(self, name: str = "blank") -> None:
             """A branch of the original project's own that never carried a config - the ref
@@ -13801,17 +14029,36 @@ def run_tests() -> None:
             fixture of a test about the untracked config."""
             return ShipBase.feature(self, fork, name, commits, push, only_own=True)
 
+        def work_state(self, fork: str) -> Optional[dict]:
+            """The state file with the provenance memory taken out - what a run RECORDED,
+            which is what a refused run has to leave exactly as it found it. None when there
+            is no state file at all.
+
+            `upstream_configs` is not a record of work: it is what this clone has written
+            down of the original project's `.forkflow.toml`s (`remember_upstream_configs`),
+            and a run that asks a provenance question writes down what it read whether it
+            then goes on or refuses. That is the whole point of it - what was once
+            upstream's stays upstream's, and a refusal is exactly when it matters."""
+            path = git_path(fork, STATE_FILE)
+            if not os.path.exists(path):
+                return None
+            with open(path) as fh:
+                raw = fh.read()
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                return {"unreadable": raw}
+            if isinstance(data, dict):
+                data.pop("upstream_configs", None)
+                return data or None          # a file holding only the memory is no record
+            return {"not an object": raw}
+
         def snapshot(self, fork: str) -> tuple:
             """Everything a run could have changed: every ref on origin and in the clone,
-            and the state file."""
-            path = git_path(fork, STATE_FILE)
-            state = None
-            if os.path.exists(path):
-                with open(path) as fh:
-                    state = fh.read()
+            and every record in the state file."""
             return (sh("git", "ls-remote", "origin", cwd=fork),
                     sh("git", "for-each-ref", "--format=%(refname) %(objectname)", cwd=fork),
-                    state)
+                    self.work_state(fork))
 
         def refused(self, fork: str, *argv: str, why: str = REFUSED, named: bool = True) -> str:
             """Exit 2 naming `why`, nothing changed and no platform tool run; answers with
@@ -13835,11 +14082,11 @@ def run_tests() -> None:
             self.refused(fork, "sync", "--merge", why=why, named=named)
             self.assertEqual(sh("git", "ls-remote", "--heads", "origin",
                                 "refs/heads/" + DEFAULT_BACKUP_PREFIX + "*", cwd=fork), "")
-            self.assertFalse(os.path.exists(git_path(fork, STATE_FILE)))
+            self.assertFalse(self.work_state(fork))      # no record of work of any kind
             self.feature(fork)
             self.refused(fork, "ship", "--merge", why=why, named=named)
             self.assertEqual(origin_sha(fork, "feat/x"), "")
-            self.assertFalse(os.path.exists(git_path(fork, STATE_FILE)))
+            self.assertFalse(self.work_state(fork))
 
         @needs_tomllib
         def test_refused_on_a_manual_fork_with_the_config_committed(self):
@@ -15125,18 +15372,33 @@ def run_tests() -> None:
             # `fork_config_state` reads the set once and hands it to the two questions it
             # asks; every other answer computes it for itself, and nothing else may
             # decide what upstream's configs are
-            self.assertEqual(self.owners("upstream_config_texts("),
-                             {"upstream_config_texts", "config_is_upstreams",
+            self.assertEqual(self.owners("upstream_config_digests("),
+                             {"upstream_config_digests", "config_is_upstreams",
                               "fork_config_state"})
-            # and the two halves of it that decide what may be read and whether the answer
-            # can be trusted at all are its own, so neither can be re-derived elsewhere
+            # and the parts of it that decide what may be read, whether the answer can be
+            # trusted at all, and what this clone has written down of upstream's, are its
+            # own - so none of them can be re-derived, or skipped, elsewhere
             self.assertEqual(self.owners("upstream_scope_refs("),
-                             {"upstream_scope_refs", "upstream_config_texts"})
+                             {"upstream_scope_refs", "upstream_config_digests"})
             self.assertEqual(self.owners("history_unprovable("),
-                             {"history_unprovable", "upstream_config_texts"})
+                             {"history_unprovable", "upstream_config_digests"})
+            self.assertEqual(self.owners("config_versions_in("),
+                             {"config_versions_in", "upstream_config_digests"})
+            self.assertEqual(self.owners("remember_upstream_configs("),
+                             {"remember_upstream_configs", "upstream_config_digests"})
             self.assertEqual(self.owners("foreign_remote_refs("),
                              {"foreign_remote_refs", "upstream_scope_refs",
-                              "history_unprovable"})
+                              "history_unprovable", "upstream_config_digests"})
+            # what is written down comes from the refs upstream cannot choose, and from
+            # nowhere else: `upstream_scope_refs` widens the answer for the run that reads
+            # it and never reaches the memory
+            self.assertEqual(calls_in("upstream_config_digests"),
+                             {"history_unprovable", "foreign_remote_refs", "set",
+                              "config_versions_in", "remember_upstream_configs",
+                              "upstream_scope_refs"})
+            # and the bytes are turned into what is compared and written down in one place
+            self.assertEqual(self.owners("config_digest("),
+                             {"config_digest", "config_versions_in", "config_is_upstreams"})
             self.assertEqual(calls_in("upstream_scope_refs"),
                              {"foreign_remote_refs", "has_ref", "set",
                               "merge_in_progress", "add"})
@@ -15210,7 +15472,8 @@ def run_tests() -> None:
                              {"drop_state_lock", "change_state"})
             self.assertEqual(self.owners("change_state("),
                              {"change_state", "write_state", "record_published",
-                              "record_pending", "forget_pending"})
+                              "record_pending", "forget_pending",
+                              "remember_upstream_configs"})
 
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
