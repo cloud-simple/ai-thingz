@@ -107,6 +107,10 @@ UPSTREAM_CONFIG_KEEP = 500           # remembered upstream `.forkflow.toml` dige
                                      # `--merge` refuses from then on. See
                                      # remember_upstream_configs
 CONFIG_MEMORY_FULL = "upstream_configs_full"   # ... and the state key that says it did
+RENDERED_CONFIGS = "rendered_configs"   # the state key holding the digest of every working-
+                                     # tree config this clone has judged unprovable for a
+                                     # RENDERING reason - see config_rendered_before
+ATTRS_FILE = ".gitattributes"         # the only file in a tree that can render the config
 CONFIG_RENDER_ATTRS = ("filter", "ident",            # the attributes that make the working
                        "working-tree-encoding")      # tree's config differ from the blob git
                                      # stores in a way nothing here normalises back - see
@@ -3379,9 +3383,31 @@ def config_versions_in(ctx: Ctx, refs: Sequence[str]) -> Tuple[set, str]:
     return (digests, "")
 
 
+def config_path_names(root: str, listed: Sequence[str]) -> list:
+    """Every path in this working tree that answers to the config's name: the name itself,
+    any case variant beside it on disk, and every variant git tracks.
+
+    A case-insensitive filesystem makes them one file, so an attribute set on
+    `.ForkFlow.toml` reaches the file forkflow reads - which is why the question is asked of
+    all of them and not of `.forkflow.toml` alone."""
+    fold = CONFIG_FILE.casefold()
+    return sorted({CONFIG_FILE} | {n for n in listed if n.casefold() == fold}
+                  | set(tracked_config_names(root)))
+
+
 def config_render_unprovable(ctx: Ctx) -> str:
-    """"" when the `.forkflow.toml` provenance READS is the same kind of thing as the blobs
-    it is compared against, otherwise why it is not - and then `--merge` is REFUSED.
+    """"" when nothing is rendering the `.forkflow.toml` in this working tree RIGHT NOW,
+    otherwise why the file read from it is not the same kind of thing as the blobs it would
+    be compared against - and then `--merge` is REFUSED.
+
+    Asked only where the decision reads the working tree (`fork_config_state`), never for a
+    config committed on the trunk, which is read as a blob and which no attribute can reach.
+
+    What is set now is HALF the question, and the other half is two other functions':
+    `config_rendered_before` (these bytes were judged rendered here once, and turning the
+    attribute off does not un-render the file on disk) and `config_history_render_unprovable`
+    (the original project's history ever rendered this path, so an untracked file at it can
+    be one git wrote).
 
     The comparison has two sides and they are not the same kind of thing by themselves: one
     is the file as this working tree renders it (`working_config_text`, a plain read of the
@@ -3456,9 +3482,7 @@ def config_render_unprovable(ctx: Ctx) -> str:
         listed = os.listdir(root)
     except OSError as exc:
         return (f"`{root}` cannot be listed to see what `{CONFIG_FILE}` is ({exc.strerror or exc})")
-    fold = CONFIG_FILE.casefold()
-    names = sorted({CONFIG_FILE} | {n for n in listed if n.casefold() == fold}
-                   | set(tracked_config_names(root)))
+    names = config_path_names(root, listed)
     for name in names:
         full = os.path.join(root, name)
         if not os.path.islink(full):
@@ -3524,6 +3548,217 @@ def config_render_unprovable(ctx: Ctx) -> str:
                       f"`{keep}` is there to read, not to copy back.") + tracked
     return ""
 
+def remembered_rendered_configs(ctx: Ctx) -> list:
+    """The `config_digest`s of working-tree `.forkflow.toml`s this clone has judged
+    unprovable for a RENDERING reason ([] when it has judged none)."""
+    kept = read_state(ctx, shared=True).get(RENDERED_CONFIGS)
+    return [d for d in (kept if isinstance(kept, list) else []) if isinstance(d, str)]
+
+
+def remember_rendered_config(ctx: Ctx, text: Optional[str]) -> str:
+    """Write down that the file at the config's path, as it reads now, was judged unprovable
+    because something renders it. "" when there was nothing to write down or it was written;
+    otherwise why it could not be, which the refusal that called this then says out loud.
+
+    THE ATTRIBUTE IS A FACT ABOUT NOW AND THE CONVERSION HAPPENED AT CHECKOUT. `check-attr`
+    answers what is set this second; the file git already converted stays exactly where it
+    is once the attribute stops being reported. So the refusal could be ended with the
+    converted file still on disk, two ways, neither of them needing anything clever:
+
+    - the user runs only the FIRST of the two commands the refusal prints - the one the
+      message itself labels "First,", which turns the attribute off for that path in
+      `info/attributes`. `check-attr` then says `unset`, the loop passes over it, NO refusal
+      is produced, and the `ident`-expanded bytes of the original project's config read as
+      `untracked_own` with `merge = "self"` in them (scratchpad `q1/render2.py` case A;
+      `q1/E4.sh` runs it end to end and upstream's `gate` runs as shell);
+    - the original project deletes the `.gitattributes` that set it and the fork syncs. The
+      converted file is untracked, so the sync leaves it there and takes the attribute away
+      (`q1/render2.py` case B, `q1/E3.sh`). No user action at all beyond the untracking.
+
+    A point-in-time question cannot answer "were these bytes produced by a conversion", so
+    the VERDICT is remembered rather than re-derived: these BYTES were judged unprovable in
+    this clone, and nothing set or unset afterwards changes what they are. A digest, never
+    the file, in the one place the original project cannot write (the state file, through
+    `change_state`).
+
+    The way back is the way back everywhere else in this gate - the bytes decide. A file
+    with one character of the fork's own in it is a different digest, in no remembered set,
+    and provable again. That is what keeps the printed remedy working, because the remedy
+    takes the converted file OFF disk and leaves the user to write their own; a HALF-followed
+    remedy, which leaves that file exactly where it was, stays refused.
+
+    Nothing here is the original project's to grow: a digest is written only when this clone
+    refuses, and only about the one file in this working tree. Compare
+    `remember_upstream_configs`, whose size IS the project's choice, which is why that one
+    has a bound and this one needs none."""
+    if text is None or ctx.dry_run:      # nothing on disk / the no-write contract
+        return ""
+    digest = config_digest(text)
+    if digest in remembered_rendered_configs(ctx):
+        return ""
+
+    def change(data: dict) -> None:
+        now = [d for d in (data.get(RENDERED_CONFIGS) or []) if isinstance(d, str)]
+        if digest not in now:
+            now.append(digest)
+        data[RENDERED_CONFIGS] = now
+
+    why = change_state(ctx, True, change)
+    return (f"; this clone could not write that verdict down ({why}), so ending the "
+            f"condition would end this refusal with that same file still on disk" if why
+            else "")
+
+
+def config_rendered_before(ctx: Ctx) -> str:
+    """"" unless the file at the config's path holds bytes this clone has ALREADY judged
+    unprovable for a rendering reason - and then `--merge` is REFUSED, whatever
+    `check-attr` says today. `remember_rendered_config` is why."""
+    text = working_config_text(ctx)
+    if text is None or config_digest(text) not in remembered_rendered_configs(ctx):
+        return ""
+    save, keep = keep_aside(ctx.root, CONFIG_FILE)
+    return (f"the `{CONFIG_FILE}` in this working tree holds bytes this clone has already "
+            f"judged unprovable because something rendered them - a `filter`, `ident` or "
+            f"`working-tree-encoding` attribute on that path, or a symbolic link at it - and "
+            f"the verdict is written down in "
+            f"`{state_path(ctx, shared=True) or STATE_FILE}`. An attribute is a fact about "
+            f"NOW and the conversion happened at CHECKOUT, so turning it off - or the "
+            f"original project deleting the `.gitattributes` that set it - leaves that file "
+            f"exactly where it was: this is a verdict about these bytes, not about what is "
+            f"set today. Take the file off disk: `{save} && rm -- {CONFIG_FILE}` copies what "
+            f"is there now into `{keep}` first. Then WRITE YOUR OWN `{CONFIG_FILE}` - "
+            f"nothing puts one back for you - and `--merge` reads that; one character of "
+            f"your own makes it a different file. `{keep}` is there to read, not to copy "
+            f"back. Or run the same command without `--merge` and have the merge request "
+            f"merged by hand")
+
+
+def attrs_render_the_config(ctx: Ctx, refs: Sequence[str]) -> Tuple[str, str]:
+    """(what ever set a rendering attribute on the config's path anywhere in the histories
+    of `refs`, "" when nothing ever did; or ("", why this clone cannot be asked that).
+
+    The question `config_render_unprovable` asks of the working tree, asked of HISTORY the
+    way `config_versions_in` asks about the config - because "is the attribute set now"
+    cannot answer "were these bytes produced by a conversion". A `.gitattributes` the
+    original project has since deleted converted every file checked out under it, and those
+    files are still on disk.
+
+    Only a ROOT `.gitattributes` can reach a file at the root, and the rooted pathspec lists
+    exactly those, so nothing under a directory has to be read.
+
+    Asked with GIT'S OWN MATCHER rather than one written here: each version is laid down as
+    the only `.gitattributes` of an empty scratch repository and `check-attr` is asked there.
+    Patterns, macros, precedence and case are then git's answer instead of a
+    re-implementation of them - and a re-implementation that was subtly wrong would either
+    refuse ordinary forks (`*.png filter=lfs` must not) or miss a real one (`*.toml ident`
+    must not). The scratch tree is empty and its `core.attributesFile` points at nothing, so
+    what is answered is what THAT version says and nothing else: not this clone's
+    `info/attributes` (which the printed remedy appends to) and not the working tree's own
+    `.gitattributes`.
+
+    FAIL CLOSED wherever the reading can fail - a walk git refuses, a blob that is not here,
+    a scratch repository that cannot be made. None of them is evidence that the original
+    project never set one."""
+    if not refs:
+        return ("", "")
+    fold = ATTRS_FILE.casefold()
+    rc, listing, err = git_rc("rev-list", "--objects", "--full-history", *refs, "--",
+                              f":(icase){ATTRS_FILE}", cwd=ctx.root)
+    if rc != 0:
+        tail = tail_lines(err, 1)
+        return ("", f"this clone's history cannot be walked for `{ATTRS_FILE}` "
+                    f"({tail[0] if tail else 'git gave no reason'}) - complete the clone, or "
+                    f"have the merge request merged by hand")
+    blobs = set()
+    for line in listing.splitlines():
+        sha, _, name = line.partition(" ")
+        if name.casefold() == fold:           # commits and trees come with no name at all
+            blobs.add(sha)
+    if not blobs:
+        return ("", "")
+    try:
+        listed = os.listdir(ctx.root)
+    except OSError:
+        listed = []
+    names = config_path_names(ctx.root, listed)
+    scratch = tempfile.mkdtemp(prefix="forkflow-attrs-")
+    try:
+        rc, _, err = git_rc("init", "-q", scratch)
+        if rc != 0:
+            tail = tail_lines(err, 1)
+            return ("", f"the `{ATTRS_FILE}` versions this clone's history carries cannot be "
+                        f"read for what they set on `{CONFIG_FILE}` "
+                        f"({tail[0] if tail else 'git gave no reason'})")
+        for sha in sorted(blobs):
+            rc, text, _ = git_rc("cat-file", "blob", sha, cwd=ctx.root)
+            if rc != 0:
+                return ("", f"the `{ATTRS_FILE}` this clone's history lists at {short(sha)} "
+                            f"cannot be read - the object is not here (a filtered or damaged "
+                            f"clone), and an attribute the original project set would read "
+                            f"as one it never set; complete the clone, or have the merge "
+                            f"request merged by hand")
+            with open(os.path.join(scratch, ATTRS_FILE), "w", encoding="utf-8",
+                      newline="") as fh:
+                fh.write(text)
+            rc, out, err = git_rc("-c", "core.attributesFile="
+                                  + os.path.join(scratch, "no-such-attributes"),
+                                  "check-attr", "-z", *CONFIG_RENDER_ATTRS, "--", *names,
+                                  cwd=scratch)
+            if rc != 0:
+                tail = tail_lines(err, 1)
+                return ("", f"git cannot say what the `{ATTRS_FILE}` at {short(sha)} sets on "
+                            f"`{CONFIG_FILE}` "
+                            f"({tail[0] if tail else 'git gave no reason'})")
+            fields = out.split("\0")
+            for i in range(0, len(fields) - 2, 3):
+                where, attr, value = fields[i], fields[i + 1], fields[i + 2]
+                if value in ("unspecified", "unset"):
+                    continue                  # not set, or set OFF: nothing is rendered
+                return (f"`{attr}` is set on `{where}` (to `{value}`) by the `{ATTRS_FILE}` "
+                        f"this clone's history carries at {short(sha)}", "")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    return ("", "")
+
+
+def config_history_render_unprovable(ctx: Ctx) -> str:
+    """"" when no `.gitattributes` in the history this clone holds of the original project's
+    ever rendered the config's path, otherwise why an UNTRACKED config cannot answer for
+    `merge` here - and then `--merge` is REFUSED.
+
+    An untracked `.forkflow.toml` is the one state where a file git itself wrote can pass
+    for one this fork wrote: git converts a file it CHECKS OUT, the fork then untracks it by
+    hand (`git rm --cached`, committed on a sync branch), and what is left on disk is byte
+    for byte the shape `setup` leaves this fork's own template in. Once the attribute is
+    gone - turned off, or deleted upstream - nothing on disk tells the two apart, and
+    converted bytes are in no upstream digest set, so they read as this fork's own
+    declaration with the original project's `merge` and the original project's `gate` in
+    them.
+
+    A config COMMITTED on the trunk is exposed to none of this: it is read with
+    `git show <origin/trunk>:<name>`, blob against blobs, and the working tree is never
+    consulted (`fork_config_state`). That is why the way forward this prints is a real one
+    and not a shrug - and it is the state this tool recommends anyway."""
+    found, why = attrs_render_the_config(ctx, upstream_scope_refs(ctx))
+    if why:
+        return why
+    if not found:
+        return ""
+    return (f"{found}, and git renders a file with that attribute differently from the bytes "
+            f"it stores it as. The attribute does not have to be set NOW: the conversion "
+            f"happens at CHECKOUT and the converted file stays when the `{ATTRS_FILE}` goes "
+            f"- so an untracked `{CONFIG_FILE}` in this working tree can be one git wrote "
+            f"out of the original project's own blob rather than one you wrote, and nothing "
+            f"on disk tells the two apart. While that is so, an untracked config cannot "
+            f"answer for `merge` here. One that CAN: a `{CONFIG_FILE}` committed on "
+            f"`{ctx.origin}/{ctx.trunk}` - that one is read as a blob, straight out of the "
+            f"object store, and no attribute can reach it. Put yours there the way "
+            f"everything else gets there: commit it on a branch off "
+            f"`{ctx.origin}/{ctx.trunk}` and ship it, have that merge request merged, and "
+            f"`--merge` works here. Or run the same command without `--merge` and have the "
+            f"merge request merged by hand")
+
+
 def upstream_config_digests(ctx: Ctx) -> Tuple[set, str]:
     """(every `.forkflow.toml` the original project has EVER had, as `config_digest`s; "" -
     or why this clone cannot be asked that at all, which is a refusal, see
@@ -3539,6 +3774,16 @@ def upstream_config_digests(ctx: Ctx) -> Tuple[set, str]:
       memory that has been made to forget - a state file that cannot be read, or one the
       original project has published enough versions to fill - is a refusal and not a short
       answer (`config_memory_unprovable`);
+
+    Whether the file being JUDGED is the same kind of thing as these blobs is not asked
+    here, and that is deliberate. This answers what the original project's configs are -
+    raw blobs, read out of the object store - and the question of rendering is about the
+    other side of the comparison. Asked here it reached the `trunk_*` states too, where the
+    config is read with `git show <origin/trunk>:<name>` and the working tree is never
+    consulted: a fork in the state this tool RECOMMENDS was refused by any `filter` or
+    `ident` on the config's path, and told to delete its own reviewed config for a condition
+    that could not change the answer. It is asked where the answer is read off the working
+    tree instead (`fork_config_state`).
     - and what the refs the CONFIG names carry, which only ever WIDENS the answer
       (`upstream_scope_refs`) and is deliberately never written down: a config that names
       this fork's own trunk would otherwise put the fork's own bytes into the memory for
@@ -3548,8 +3793,7 @@ def upstream_config_digests(ctx: Ctx) -> Tuple[set, str]:
     cheap half (30ms of the 1.0s measured in `config_versions_in`), and the expensive half -
     one `cat-file` per distinct version - is paid once per version in each, so the cost of
     the split is a second walk and not a second read of the repository's configs."""
-    blind = (history_unprovable(ctx) or config_render_unprovable(ctx)
-             or config_memory_unprovable(ctx))
+    blind = history_unprovable(ctx) or config_memory_unprovable(ctx)
     if blind:
         return (set(), blind)
     theirs = foreign_remote_refs(ctx)
@@ -3681,15 +3925,26 @@ def fork_config_state(ctx: Ctx) -> Tuple[str, Optional[str], str]:
 
     Before any of them, `unprovable`: `upstream_config_digests` could not be asked what the
     original project's configs are (a shallow, partial, grafted or replaced clone, an
-    object that is not here, a walk git refused), or the file it would judge is not the same
-    kind of thing as the blobs it would be judged against (a symlink, a rendering attribute -
-    `config_render_unprovable`), or what this clone wrote down of the project's own configs
-    cannot be trusted (a state file that cannot be read, a memory the project has published
-    enough versions to fill - `config_memory_unprovable`). Every state below it is a
-    statement about
+    object that is not here, a walk git refused), or what this clone wrote down of the
+    project's own configs cannot be trusted (a state file that cannot be read, a memory the
+    project has published enough versions to fill - `config_memory_unprovable`). Every state
+    below it is a statement about
     a set that would then be short, and a short set reads upstream's own file as this
     fork's - so the answer is the reason, and `--merge` is refused with it. It is decided
     first because it is a fact about the clone, true whichever file is being judged.
+
+    WHERE THE RENDERING QUESTIONS ARE ASKED IS PART OF THE ANSWER. They are about the file
+    on DISK - whether what reading the path gives is the same kind of thing as the blobs it
+    is compared against - so they are asked below the `trunk_*` states and nowhere above
+    them: a config committed on the trunk is read with `git show <origin/trunk>:<name>`,
+    blob against blobs, and no symlink, filter or `ident` can reach it. Asked above, they
+    refused the state this tool recommends and printed an `rm` of the fork's own reviewed
+    config for a condition that could not change the decision. Three of them, in order:
+    what is set NOW (`config_render_unprovable`), what these BYTES were already judged to be
+    (`config_rendered_before` - an attribute can be turned off and the converted file stays),
+    and, for an untracked config only, what the original project's own history ever set on
+    that path (`config_history_render_unprovable` - the file git wrote is still there after
+    the `.gitattributes` that rewrote it is deleted).
 
     The text is whatever the state was read from, None when there is none; the third field
     is that reason, "" in every other state.
@@ -3709,12 +3964,25 @@ def fork_config_state(ctx: Ctx) -> Tuple[str, Optional[str], str]:
         text = config_text(ctx, trunk_name)
         return ("trunk_upstreams" if written_by_upstream(ctx, text, upstreams)
                 else "trunk_own", text, "")
+    # below this line the answer is read off the WORKING TREE, and only below it can the
+    # way this clone renders that file change what the answer is
     here = working_config_text(ctx)
+    blind = config_render_unprovable(ctx)
+    if blind:
+        # ... and the verdict is written down, because the condition can be ENDED without
+        # the rendered file going anywhere: `remember_rendered_config`
+        return ("unprovable", here, blind + remember_rendered_config(ctx, here))
+    blind = config_rendered_before(ctx)
+    if blind:
+        return ("unprovable", here, blind)
     if tracked_config_names(ctx.root):
         return ("branch_upstreams" if config_is_upstreams(ctx, here, upstreams)
                 else "branch_own", here, "")
     if own_untracked_config(ctx, upstreams):
-        return ("untracked_own", here, "")
+        # the one state where a file GIT wrote can pass for one this fork wrote, so it is
+        # also the only one that has to ask what the original project's history renders
+        blind = config_history_render_unprovable(ctx)
+        return (("unprovable", here, blind) if blind else ("untracked_own", here, ""))
     if config_is_upstreams(ctx, here, upstreams):
         return ("untracked_upstreams", here, "")
     return ("none", here, "")
@@ -14524,21 +14792,185 @@ def run_tests() -> None:
             self.assertIn(kept[0], why)
             with open(kept[0], "rb") as fh:
                 self.assertEqual(fh.read(), rendered)
+            # the way back here is NOT another untracked file: the original project's own
+            # history sets `ident` on that path, so anything untracked at it can be
+            # something git wrote (`config_history_render_unprovable`). The way the refusal
+            # names is the trunk, where a config is read as a blob
             write(fork, CONFIG_FILE, 'merge = "self"\n# ours\n')
+            self.assertEqual(self.mode(fork), "manual")
+            self.assertIn("committed on `origin/develop`",
+                          fork_config_state(ctx_for(fork))[2])
+            self.ship_the_config(fork)
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "trunk_own")
+            self.assertEqual(self.mode(fork), "self")
+
+        def ship_the_config(self, fork: str) -> None:
+            """The fork's own `.forkflow.toml` on `origin/<trunk>`, the way the refusals
+            here name: committed on a branch off the trunk and merged onto it."""
+            sh("git", "add", "--", CONFIG_FILE, cwd=fork)
+            sh("git", "commit", "-q", "-m", "ours: our own config", cwd=fork)
+            sh("git", "push", "-q", "origin", "HEAD:refs/heads/develop", cwd=fork)
+            sh("git", "fetch", "-q", "--prune", "origin", cwd=fork)
+
+        def test_following_only_the_first_printed_command_is_still_refused(self):
+            """THE ATTRIBUTE IS A FACT ABOUT NOW AND THE CONVERSION HAPPENED AT CHECKOUT.
+
+            The refusal prints two commands and labels the first "First,". Running only that
+            one - the likeliest way a person follows a two-part instruction - turned the
+            attribute off in `info/attributes` and left the converted file exactly where it
+            was: `check-attr` then said `unset`, NO refusal was produced at all, and the
+            `ident`-expanded bytes of the original project's config read as `untracked_own`
+            with `merge = "self"` in them. Scratchpad `q1/E4.sh` runs it end to end and
+            upstream's `gate` runs as shell at the end of it.
+
+            The round before answered the same defect by printing a SECOND command rather
+            than by making the state safe, and its test ran every command printed, so the
+            half-followed case was never exercised. This one runs the first and stops."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch pwned"]\n# $Id$\n'
+            rendered = self.theirs_through_an_attribute(fork, "ident", theirs)
+            ctx = ctx_for(fork)
+            self.assertEqual(fork_config_state(ctx)[0], "unprovable")
+            why = fork_config_state(ctx)[2]
+            printed = [c for c in re.findall(r"`([^`]+)`", why)
+                       if c.startswith(SHELL_VERBS)]
+            self.assertGreater(len(printed), 1, printed)     # it really is a two-part remedy
+            for cmd in printed[:-1]:                         # everything but the last step,
+                self.assertEqual(subprocess.run(["sh", "-c", cmd], cwd=fork,   # which is the
+                                                capture_output=True).returncode, 0, cmd)
+                                                             # one that takes the file away
+
+            # the attribute is off now, and the file git converted is untouched
+            self.assertTrue(sh("git", "check-attr", "ident", "--", CONFIG_FILE,
+                               cwd=fork).endswith("unset"))
+            with open(os.path.join(fork, CONFIG_FILE), "rb") as fh:
+                self.assertEqual(fh.read(), rendered)
+
+            state = fork_config_state(ctx_for(fork))
+            self.assertEqual(state[0], "unprovable")         # and it is STILL refused
+            self.assertIn("already judged unprovable", state[2])
+            self.assertIn(CONFIG_FILE, state[2])
+            self.assertEqual(self.mode(fork), "manual")
+            # the verdict is about these bytes, so it is written down where the original
+            # project cannot reach it
+            self.assertEqual(read_state(ctx, shared=True)[RENDERED_CONFIGS],
+                             [config_digest(rendered.decode("utf-8"))])
+            # and what this refusal prints, run as printed, ends with no config at all
+            self.assertEqual([rc for _, rc in run_every_printed(state[2], fork)], [0])
+            self.assertFalse(os.path.lexists(os.path.join(fork, CONFIG_FILE)))
+
+        def test_an_attribute_the_project_has_since_deleted_still_refuses_what_it_wrote(self):
+            """The other way the condition ends with the converted file still on disk, and
+            this one needs no user action at all: the original project deletes the
+            `.gitattributes` that set the attribute, and the fork syncs. The converted file
+            is untracked, so the sync leaves it while taking the attribute away
+            (`q1/render2.py` case B, `q1/E3.sh`).
+
+            Nothing is written down here - this clone has never looked before - so the only
+            thing that can answer is what the project's own history sets on that path
+            (`config_history_render_unprovable`). An untracked config cannot answer for
+            `merge` while that is so, and the way forward the refusal names is the one this
+            tool recommends anyway: the config on the trunk, which is read as a blob."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch pwned"]\n# $Id$\n'
+            rendered = self.theirs_through_an_attribute(fork, "ident", theirs)
+            os.unlink(os.path.join(fork, ".gitattributes"))   # the project dropped it
+            ctx = ctx_for(fork)
+            self.assertEqual(git("check-attr", "ident", "--", CONFIG_FILE,
+                                 cwd=fork).split(": ")[-1], "unspecified")
+            self.assertEqual(read_state(ctx, shared=True).get(RENDERED_CONFIGS), None)
+            with open(os.path.join(fork, CONFIG_FILE), "rb") as fh:
+                self.assertEqual(fh.read(), rendered)        # still there, still converted
+
+            state = fork_config_state(ctx)
+            self.assertEqual(state[0], "unprovable")
+            self.assertIn("ident", state[2])
+            self.assertIn("does not have to be set NOW", state[2])
+            self.assertEqual(self.mode(fork), "manual")
+            # the way forward it names, taken: the fork's own config on the trunk
+            os.unlink(os.path.join(fork, CONFIG_FILE))
+            write(fork, CONFIG_FILE, 'merge = "self"\n# ours\n')
+            self.ship_the_config(fork)
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "trunk_own")
+            self.assertEqual(self.mode(fork), "self")
+
+        @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                         "root reads a mode-000 file anyway")
+        def test_a_gitattributes_the_history_lists_and_cannot_be_read_is_a_refusal(self):
+            """FAIL CLOSED, here as everywhere else the reading can fail: a version of the
+            project's `.gitattributes` this clone cannot open is not evidence that it never
+            set anything. Skipped over, the one version that set `ident` on the config's
+            path would be the one that is unreadable."""
+            fork = make_fork(self.tmp)
+            write(fork, CONFIG_FILE, 'merge = "self"\n')     # the fork's own, untracked
+            self.assertEqual(self.mode(fork), "self")
+            commit_upstream(self.tmp, ".gitattributes", "* text=auto\n", "theirs: attributes")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            blob = sh("git", "rev-parse", "upstream/main:.gitattributes", cwd=fork)
+            loose = os.path.join(fork, ".git", "objects", blob[:2], blob[2:])
+            self.assertTrue(os.path.exists(loose), loose)
+            os.chmod(loose, 0o000)
+            self.addCleanup(os.chmod, loose, 0o444)
+            state = fork_config_state(ctx_for(fork))
+            self.assertEqual(state[0], "unprovable")
+            self.assertIn(short(blob), state[2])
+            self.assertIn("cannot be read", state[2])
+            self.assertEqual(self.mode(fork), "manual")
+
+        def test_a_gitattributes_walk_git_refuses_is_a_refusal(self):
+            """The other half: a walk that fails answers with the reason and never with an
+            empty set. Asked of the walker directly - the same failure reaches the config
+            walk first in any real clone, and a guard that only a broken repository could
+            show is still the difference between "nothing set one" and "nothing was
+            read"."""
+            ctx = ctx_for(make_fork(self.tmp))
+            found, why = attrs_render_the_config(ctx, ["refs/remotes/upstream/main",
+                                                       "no-such-ref-at-all"])
+            self.assertEqual(found, "")
+            self.assertIn("cannot be walked", why)
+            self.assertIn("merged by hand", why)
+
+        def test_a_rendering_attribute_cannot_reach_a_config_on_the_trunk(self):
+            """The rendering question asked where it cannot matter, which is where it used
+            to be asked: before `fork_config_state` decided which file answers for `merge`.
+
+            In the `trunk_*` states the config is read with `git show <origin/trunk>:<name>`
+            - raw blob against raw blobs, the working tree never consulted - so nothing in
+            the working tree can change the answer. A fork in the state this tool RECOMMENDS
+            was nevertheless refused by any `filter`, `ident` or `working-tree-encoding` on
+            the config's path, and told that "the file sitting there was written by git's
+            conversion" and to `rm -- .forkflow.toml`: a fork following that deletes its own
+            reviewed config for a condition that cannot change the decision."""
+            fork = make_fork(self.tmp, config='merge = "self"\n')
+            for attr in ("ident", "filter=mangle", "working-tree-encoding=UTF-16"):
+                write(fork, ".gitattributes", CONFIG_FILE + " " + attr + "\n")
+                state = fork_config_state(ctx_for(fork))
+                self.assertEqual(state[0], "trunk_own", attr)
+                self.assertEqual(state[2], "", attr)
+                self.assertEqual(self.mode(fork), "self", attr)
+                self.assertNotIn("rm -- ", fork_merge_refusal(ctx_for(fork)))
+            # and the same for a symlink at the config's path: the trunk answers, not it
+            os.unlink(os.path.join(fork, CONFIG_FILE))
+            write(fork, "theirs-real.toml", 'merge = "self"\n')
+            os.symlink("theirs-real.toml", os.path.join(fork, CONFIG_FILE))
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "trunk_own")
             self.assertEqual(self.mode(fork), "self")
 
         def test_the_attribute_remedy_with_no_file_on_disk_removes_nothing(self):
             """The attribute can be set on a path with no file at it - a tracked variant on
             a case-sensitive filesystem. There is then nothing converted to take away, and
-            the remedy says so rather than printing an `rm` of a file that is not there."""
-            fork = make_fork(self.tmp, config='merge = "self"\n')
+            the remedy says so rather than printing an `rm` of a file that is not there.
+
+            No config on the trunk here: with one there the trunk answers and the working
+            tree is not read at all, which is what
+            `test_a_rendering_attribute_cannot_reach_a_config_on_the_trunk` is about."""
+            fork = make_fork(self.tmp)
             sh("git", "config", "core.ignorecase", "false", cwd=fork)
             write(fork, ".gitattributes", ".ForkFlow.toml ident\n")
             blob = sh("git", "hash-object", "-w", write(self.tmp, "v.txt", "theirs\n"),
                       cwd=fork)
             sh("git", "update-index", "--add", "--cacheinfo",
                "100644,%s,.ForkFlow.toml" % blob, cwd=fork)
-            os.unlink(os.path.join(fork, CONFIG_FILE))
             ctx = ctx_for(fork)
             why = fork_config_state(ctx)[2]
             self.assertIn("nothing to undo on disk", why)
@@ -16354,11 +16786,33 @@ def run_tests() -> None:
             # trusted at all, and what this clone has written down of upstream's, are its
             # own - so none of them can be re-derived, or skipped, elsewhere
             self.assertEqual(self.owners("upstream_scope_refs("),
-                             {"upstream_scope_refs", "upstream_config_digests"})
+                             {"upstream_scope_refs", "upstream_config_digests",
+                              "config_history_render_unprovable"})
             self.assertEqual(self.owners("history_unprovable("),
                              {"history_unprovable", "upstream_config_digests"})
+            # the rendering questions belong to the states that read the WORKING TREE, so
+            # they are called from `fork_config_state` - below `trunk_*` - and nowhere else.
+            # In `upstream_config_digests` the first of them refused a fork in the
+            # recommended state, where the config is a blob off `origin/<trunk>`
             self.assertEqual(self.owners("config_render_unprovable("),
-                             {"config_render_unprovable", "upstream_config_digests"})
+                             {"config_render_unprovable", "fork_config_state"})
+            self.assertEqual(self.owners("config_rendered_before("),
+                             {"config_rendered_before", "fork_config_state"})
+            self.assertEqual(self.owners("config_history_render_unprovable("),
+                             {"config_history_render_unprovable", "fork_config_state"})
+            self.assertEqual(self.owners("remember_rendered_config("),
+                             {"remember_rendered_config", "fork_config_state"})
+            # what this clone judged rendered is read where it is judged and where it is
+            # remembered, and the scratch repository that asks git what a historical
+            # `.gitattributes` sets is built in one place
+            self.assertEqual(self.owners("remembered_rendered_configs("),
+                             {"remembered_rendered_configs", "remember_rendered_config",
+                              "config_rendered_before"})
+            self.assertEqual(self.owners("attrs_render_the_config("),
+                             {"attrs_render_the_config", "config_history_render_unprovable"})
+            self.assertEqual(self.owners('"init"'), {"attrs_render_the_config"})
+            self.assertEqual(self.owners('"check-attr"'),
+                             {"config_render_unprovable", "attrs_render_the_config"})
             self.assertEqual(self.owners("config_memory_unprovable("),
                              {"config_memory_unprovable", "upstream_config_digests"})
             self.assertEqual(self.owners("config_versions_in("),
@@ -16372,13 +16826,14 @@ def run_tests() -> None:
             # nowhere else: `upstream_scope_refs` widens the answer for the run that reads
             # it and never reaches the memory
             self.assertEqual(calls_in("upstream_config_digests"),
-                             {"history_unprovable", "config_render_unprovable",
+                             {"history_unprovable",
                               "config_memory_unprovable", "foreign_remote_refs", "set",
                               "config_versions_in", "remember_upstream_configs",
                               "upstream_scope_refs"})
             # and the bytes are turned into what is compared and written down in one place
             self.assertEqual(self.owners("config_digest("),
-                             {"config_digest", "config_versions_in", "config_is_upstreams"})
+                             {"config_digest", "config_versions_in", "config_is_upstreams",
+                              "remember_rendered_config", "config_rendered_before"})
             self.assertEqual(calls_in("upstream_scope_refs"),
                              {"foreign_remote_refs", "has_ref", "set",
                               "merge_in_progress", "add"})
@@ -16423,7 +16878,8 @@ def run_tests() -> None:
             self.assertEqual(self.owners("cp -p --"), {"keep_aside"})
             self.assertEqual(self.owners("sh_arg(keep)"), {"keep_aside"})
             self.assertEqual(self.owners("keep_aside("),
-                             {"keep_aside", "variant_remedy", "config_render_unprovable"})
+                             {"keep_aside", "variant_remedy", "config_render_unprovable",
+                              "config_rendered_before"})
             # the same rule again on the printed text itself, so a copy spelled some other
             # way is caught too. Adjacent f-string pieces are glued back together first:
             # every remedy here is written across several lines
@@ -16499,7 +16955,7 @@ def run_tests() -> None:
             self.assertEqual(self.owners("change_state("),
                              {"change_state", "write_state", "record_published",
                               "record_pending", "forget_pending",
-                              "remember_upstream_configs"})
+                              "remember_upstream_configs", "remember_rendered_config"})
 
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
