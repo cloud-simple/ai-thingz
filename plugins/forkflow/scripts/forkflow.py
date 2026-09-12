@@ -104,6 +104,9 @@ EXIT_NOT_MERGED = 6                  # --merge: the branch is pushed, the merge 
 PUBLISHED_KEEP = 100                 # remembered (branch, commit) pushes - see record_published
 UPSTREAM_CONFIG_KEEP = 500           # remembered upstream `.forkflow.toml` digests, oldest
                                      # first out - see remember_upstream_configs
+CONFIG_RENDER_ATTRS = ("filter", "ident", "text", "eol",   # attributes that make the working
+                       "working-tree-encoding", "diff")    # tree's config differ from the
+                                     # blob git stores - see config_render_unprovable
 STATE_LOCK_WAIT = 5.0                # seconds a run waits for another worktree's state write
 STATE_LOCK_POLL = 0.02               # between tries while it waits
 HELD_ELSEWHERE = frozenset(          # what the lock calls answer with while another run
@@ -3200,6 +3203,94 @@ def config_versions_in(ctx: Ctx, refs: Sequence[str]) -> Tuple[set, str]:
     return (digests, "")
 
 
+def config_render_unprovable(ctx: Ctx) -> str:
+    """"" when the `.forkflow.toml` provenance READS is the same kind of thing as the blobs
+    it is compared against, otherwise why it is not - and then `--merge` is REFUSED.
+
+    The comparison has two sides and they are not the same kind of thing by themselves: one
+    is the file as this working tree renders it (`working_config_text`, a plain read of the
+    path), the other is the blob as git STORES it (`cat-file blob`). In an ordinary clone
+    those are the same bytes. The repository can make them differ, and the repository is
+    something the original project writes:
+
+    - a SYMLINK under the config's name. What git stores there is the link TARGET, a short
+      path; what reading the path gives is another file's contents. Upstream keeping its
+      settings in `theirs.toml` and a link at `.forkflow.toml` means every blob upstream
+      ever stored under that name is the string "theirs.toml", so upstream's own settings -
+      read through the link - match nothing and pass as this fork's own.
+    - a `.gitattributes` upstream controls. `filter` runs a program over the file on
+      checkout, `ident` expands `$Id$` into the blob's own hash, `text`/`eol` rewrite line
+      endings beyond what `config_fingerprint` normalises back, `working-tree-encoding`
+      holds the working tree in another encoding entirely, and `diff` names a textconv.
+      Each one makes the rendered file differ from every blob that could have produced it.
+
+    Both were reproduced against the gate (scratchpad `f9/repro1.py`): upstream's config,
+    with `merge = "self"` and a `gate` in it, read as `untracked_own` and opened `--merge`.
+
+    forkflow does not try to REPRODUCE git's rendering rules to compare like with like -
+    that is a moving target, and a version of it that is subtly wrong is an open gate. It
+    refuses, which is the direction this gate has taken at every other turn. Both conditions
+    are ones an ordinary fork never meets, both are ones a user can end, and the refusal
+    names the link or the attribute so they can.
+
+    Asked of every path that case-folds to the config's name - the one on disk, any case
+    variant beside it, and every variant git tracks - because a case-insensitive filesystem
+    makes them one file, and an attribute set on `.ForkFlow.toml` would otherwise reach the
+    file forkflow reads without being looked at. Failing to read the attributes at all is a
+    refusal too: it is not evidence that none is set."""
+    root = ctx.root
+    try:
+        listed = os.listdir(root)
+    except OSError as exc:
+        return (f"`{root}` cannot be listed to see what `{CONFIG_FILE}` is ({exc.strerror or exc})")
+    fold = CONFIG_FILE.casefold()
+    names = sorted({CONFIG_FILE} | {n for n in listed if n.casefold() == fold}
+                   | set(tracked_config_names(root)))
+    for name in names:
+        full = os.path.join(root, name)
+        if not os.path.islink(full):
+            continue
+        try:
+            target = os.readlink(full)
+        except OSError:
+            target = "?"
+        keep = git_path(root, f"forkflow-config-{utc_stamp('%Y%m%d-%H%M%S')}.toml")
+        save = f"test ! -e {sh_arg(keep)} && cp -p -- {sh_arg(name)} {sh_arg(keep)}"
+        return (f"`{name}` is a symbolic link (to `{target}`), so what git stores under that "
+                f"name is the link's target and what reading the path gives is another "
+                f"file's contents - two different things, and comparing them reads the "
+                f"original project's own config as one it never had. Put a real file there: "
+                f"`{save} && rm -- {sh_arg(name)} && cp -p -- {sh_arg(keep)} {sh_arg(name)}` "
+                f"copies what the link reads as now into `{keep}` first and then replaces the "
+                f"link with a file holding exactly that - nothing of yours is lost, and the "
+                f"file the link pointed at is left alone")
+    rc, out, err = git_rc("check-attr", "-z", *CONFIG_RENDER_ATTRS, "--", *names, cwd=root)
+    if rc != 0:
+        why = tail_lines(err, 1)
+        return (f"git cannot say what attributes are set on `{CONFIG_FILE}` "
+                f"({why[0] if why else 'git gave no reason'}), and an attribute that rewrites "
+                f"the file between the working tree and the object store would make the "
+                f"original project's own config read as one it never had")
+    fields = out.split("\0")
+    for i in range(0, len(fields) - 2, 3):
+        where, attr, value = fields[i], fields[i + 1], fields[i + 2]
+        if value in ("unspecified", "unset"):
+            continue                              # not set, or set OFF: nothing is rendered
+        attrs = git_path(root, os.path.join("info", "attributes"))
+        off = f"{where} " + " ".join("-" + a for a in CONFIG_RENDER_ATTRS)
+        return (f"`{attr}` is set on `{where}` (to `{value}`), by a `.gitattributes` this "
+                f"fork does not have to own, and git renders a file with that attribute "
+                f"differently from the bytes it stores it as - so the config read here and "
+                f"every stored `{CONFIG_FILE}` are two different kinds of thing, and the "
+                f"original project's own config can compare as bytes it never stored. "
+                f"`git check-attr -a -- {sh_arg(where)}` shows every attribute on it. To end "
+                f"it in this clone alone, turn them off for that one path in a file only this "
+                f"clone has: `printf '%s\\n' {sh_arg(off)} >> {sh_arg(attrs)}` - git reads "
+                f"`info/attributes` in the git directory before any `.gitattributes` in the "
+                f"tree, nothing of yours is overwritten, and a file git holds takes the change "
+                f"the next time it is checked out")
+    return ""
+
 def upstream_config_digests(ctx: Ctx) -> Tuple[set, str]:
     """(every `.forkflow.toml` the original project has EVER had, as `config_digest`s; "" -
     or why this clone cannot be asked that at all, which is a refusal, see
@@ -3221,7 +3312,7 @@ def upstream_config_digests(ctx: Ctx) -> Tuple[set, str]:
     cheap half (30ms of the 1.0s measured in `config_versions_in`), and the expensive half -
     one `cat-file` per distinct version - is paid once per version in each, so the cost of
     the split is a second walk and not a second read of the repository's configs."""
-    blind = history_unprovable(ctx)
+    blind = history_unprovable(ctx) or config_render_unprovable(ctx)
     if blind:
         return (set(), blind)
     theirs = foreign_remote_refs(ctx)
@@ -3349,7 +3440,9 @@ def fork_config_state(ctx: Ctx) -> Tuple[str, Optional[str], str]:
 
     Before any of them, `unprovable`: `upstream_config_digests` could not be asked what the
     original project's configs are (a shallow, partial, grafted or replaced clone, an
-    object that is not here, a walk git refused). Every state below it is a statement about
+    object that is not here, a walk git refused), or the file it would judge is not the same
+    kind of thing as the blobs it would be judged against (a symlink, a rendering attribute -
+    `config_render_unprovable`). Every state below it is a statement about
     a set that would then be short, and a short set reads upstream's own file as this
     fork's - so the answer is the reason, and `--merge` is refused with it. It is decided
     first because it is a fact about the clone, true whichever file is being judged.
@@ -13779,6 +13872,117 @@ def run_tests() -> None:
             write(fork, CONFIG_FILE, theirs + "# ours\n")
             self.assertEqual(self.mode(fork), "self")
 
+        def test_a_config_reached_through_a_symlink_is_not_judged_at_all(self):
+            """The two sides of the comparison have to be the same kind of thing. Upstream
+            keeps its settings in `theirs-real.toml` and a LINK at `.forkflow.toml`, so every
+            blob upstream ever stored under the config's name is the string
+            "theirs-real.toml" - while reading the path gives the settings the link points
+            at. A sync brings both in, the link is left on disk, and upstream's own
+            `merge = "self"` (with upstream's `gate` behind it) used to read as this fork's
+            own file: scratchpad `f9/repro1.py` gets `untracked_own` and `self` out of the
+            body before this one. forkflow does not reproduce git's rendering rules to
+            compare like with like - it refuses, names the link, and prints the way out."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch theirs"]\n'
+            write(fork, "theirs-real.toml", theirs)
+            os.symlink("theirs-real.toml", os.path.join(fork, CONFIG_FILE))
+            ctx = ctx_for(fork)
+            self.assertEqual(fork_config_state(ctx)[0], "unprovable")
+            self.assertEqual(self.mode(fork), "manual")
+            why = fork_config_state(ctx)[2]
+            self.assertIn("symbolic link", why)
+            self.assertIn("theirs-real.toml", why)             # the link and its target
+            self.assertIn("cp -p --", why)                     # copied aside before anything
+            self.assertIn(git_path(fork, "forkflow-config-"), why)   # and the copy is named
+            self.assertIn(why, fork_merge_refusal(ctx))
+            # a real file holding exactly what the link read as is this fork's own again
+            os.unlink(os.path.join(fork, CONFIG_FILE))
+            write(fork, CONFIG_FILE, theirs + "# ours\n")
+            self.assertEqual(self.mode(fork), "self")
+
+        def test_an_attribute_that_renders_the_config_is_not_judged_at_all(self):
+            """`ident` expands `$Id$` into the blob's own hash on checkout, so the file in
+            the working tree is not the bytes of any blob that could have produced it, and
+            upstream's config - `.gitattributes` and all, brought in by a sync - read as this
+            fork's own (`f9/repro1.py`). Every attribute that rewrites the file between the
+            object store and the working tree is refused the same way."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\n# $Id$\n'
+            for attr in ("ident", "filter=mangle", "text=auto", "eol=crlf",
+                         "working-tree-encoding=UTF-16", "diff=toml"):
+                write(fork, ".gitattributes", CONFIG_FILE + " " + attr + "\n")
+                write(fork, CONFIG_FILE, theirs)
+                ctx = ctx_for(fork)
+                self.assertEqual(fork_config_state(ctx)[0], "unprovable", attr)
+                self.assertEqual(self.mode(fork), "manual", attr)
+                why = fork_config_state(ctx)[2]
+                self.assertIn(attr.split("=")[0], why)          # the attribute is named
+                self.assertIn(CONFIG_FILE, why)
+                self.assertIn(git_path(fork, os.path.join("info", "attributes")), why)
+                self.assertIn(why, fork_merge_refusal(ctx))
+            # turned off for that one path in this clone's own attributes file: the way out
+            # the message prints, and it is additive - nothing of anybody's is overwritten
+            with open(git_path(fork, os.path.join("info", "attributes")), "a") as fh:
+                fh.write(CONFIG_FILE + " " + " ".join("-" + a for a in CONFIG_RENDER_ATTRS)
+                         + "\n")
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "untracked_own")
+            self.assertEqual(self.mode(fork), "self")
+
+        def test_an_attribute_on_a_case_variant_of_the_name_is_looked_at_too(self):
+            """A case-insensitive filesystem makes `.ForkFlow.toml` and `.forkflow.toml` one
+            file, so an attribute set on the variant reaches the file forkflow reads. The
+            question is asked of every path that case-folds to the name - the one on disk,
+            any variant beside it, and every variant git tracks - and not of the exact
+            spelling alone.
+
+            Built with plumbing and with `core.ignorecase` off, so it holds on any
+            filesystem: where git has it on (the macOS and Windows default) git matches the
+            attribute pattern itself case-insensitively and the refusal comes either way,
+            which would make the test pass without asking about the variant at all."""
+            fork = make_fork(self.tmp)
+            sh("git", "config", "core.ignorecase", "false", cwd=fork)
+            write(fork, ".gitattributes", ".ForkFlow.toml ident\n")
+            write(fork, CONFIG_FILE, 'merge = "self"\n')
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "untracked_own")
+            blob = sh("git", "hash-object", "-w", write(self.tmp, "v.txt", "theirs\n"),
+                      cwd=fork)
+            sh("git", "update-index", "--add", "--cacheinfo",
+               "100644,%s,.ForkFlow.toml" % blob, cwd=fork)
+            ctx = ctx_for(fork)
+            self.assertEqual(fork_config_state(ctx)[0], "unprovable")
+            self.assertIn(".ForkFlow.toml", fork_config_state(ctx)[2])
+
+        def test_attributes_git_cannot_be_asked_about_are_a_refusal_too(self):
+            """A `check-attr` that fails is not evidence that nothing is set on the file -
+            a `.gitattributes` git refuses to parse is exactly where one would hide. It
+            fails closed, like every other reading this answer depends on."""
+            fork = make_fork(self.tmp)
+            write(fork, CONFIG_FILE, 'merge = "self"\n')
+            self.assertEqual(self.mode(fork), "self")
+            real = git_rc
+
+            def refuses(*argv, **kw):
+                if argv[:1] == ("check-attr",):
+                    return (128, "", "fatal: bad attributes line\n")
+                return real(*argv, **kw)
+
+            with mock.patch.object(sys.modules[__name__], "git_rc", refuses):
+                ctx = ctx_for(fork)
+                self.assertEqual(fork_config_state(ctx)[0], "unprovable")
+                self.assertIn("bad attributes line", fork_config_state(ctx)[2])
+                self.assertEqual(fork_merge_mode(ctx), "manual")
+
+        def test_attributes_that_say_nothing_about_the_config_change_nothing(self):
+            """The refusals above must never reach an ordinary fork. A `.gitattributes` that
+            covers other paths, and one that turns the attributes OFF for this one, both
+            leave the config exactly as readable as it was."""
+            fork = make_fork(self.tmp, config='merge = "self"\n')
+            self.assertEqual(self.mode(fork), "self")
+            write(fork, ".gitattributes",
+                  "*.md text\n*.png binary\nsrc/** diff=python\n" + CONFIG_FILE + " -text\n")
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "trunk_own")
+            self.assertEqual(self.mode(fork), "self")
+
         def withdraw_and_replace(self, gone: str, instead: str) -> None:
             """Upstream rewrites its branch: the commit that carried `gone` is not in the
             history any more and `instead` is what the branch carries now. A force-push, a
@@ -15382,6 +15586,8 @@ def run_tests() -> None:
                              {"upstream_scope_refs", "upstream_config_digests"})
             self.assertEqual(self.owners("history_unprovable("),
                              {"history_unprovable", "upstream_config_digests"})
+            self.assertEqual(self.owners("config_render_unprovable("),
+                             {"config_render_unprovable", "upstream_config_digests"})
             self.assertEqual(self.owners("config_versions_in("),
                              {"config_versions_in", "upstream_config_digests"})
             self.assertEqual(self.owners("remember_upstream_configs("),
@@ -15393,9 +15599,9 @@ def run_tests() -> None:
             # nowhere else: `upstream_scope_refs` widens the answer for the run that reads
             # it and never reaches the memory
             self.assertEqual(calls_in("upstream_config_digests"),
-                             {"history_unprovable", "foreign_remote_refs", "set",
-                              "config_versions_in", "remember_upstream_configs",
-                              "upstream_scope_refs"})
+                             {"history_unprovable", "config_render_unprovable",
+                              "foreign_remote_refs", "set", "config_versions_in",
+                              "remember_upstream_configs", "upstream_scope_refs"})
             # and the bytes are turned into what is compared and written down in one place
             self.assertEqual(self.owners("config_digest("),
                              {"config_digest", "config_versions_in", "config_is_upstreams"})

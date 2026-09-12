@@ -302,7 +302,12 @@ own edit of the file is new bytes that no such record holds. And the walk fails 
 cannot prove what the original project has had gets exit 2 for `--merge` alone, with the condition
 named: shallow (`git fetch --unshallow <upstream>` ends it), partial (`--filter`), history rewritten
 by `refs/replace/*` or `info/grafts`, nothing of upstream's fetched, or an object that cannot be
-read. Everything else still works; the way past it is the ordinary one, `--mr` and a person merging.
+read. The same for a config that is not the same *kind* of thing as the blobs it is compared
+against - a `.forkflow.toml` that is a symlink (git stores the link's target, reading the path
+follows it), or one a `.gitattributes` renders on checkout (`filter`, `ident`, `text`, `eol`,
+`working-tree-encoding`, `diff`): the refusal names the link or the attribute and the way to end
+it. A `.gitattributes` that says nothing about `.forkflow.toml`, or that turns those attributes
+off for it, changes nothing. Everything else still works; the way past it is the ordinary one, `--mr` and a person merging.
 It is asked again right before the merge command runs; a fork that no longer says `"self"` by then
 (a teammate's commit the run's fetch brought in) gets exit 6 with the MR open. So the ship that
 first commits the config is `--mr`, merged by hand: once committed on a branch it is neither

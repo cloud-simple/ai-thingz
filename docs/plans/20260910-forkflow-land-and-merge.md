@@ -561,6 +561,27 @@ not an answer computed as if it had been. The `--merge` refusal tests' `snapshot
 state file's RECORDS (`work_state`, which drops `upstream_configs`): a refused run writing down
 what it read of upstream's is the point of the memory, not a change it should not have made.
 
+⚠️ review fix (phase 3, external, iteration 3, second half): the ninth route - the comparison's
+two sides were not the same KIND of thing. One is the file as the working tree renders it (a plain
+read of the path), the other the blob as git stores it, and the repository - which upstream writes
+- has several ways to make those differ: a SYMLINK under the config's name (git stores the link
+target, reading the path follows the link), and a `.gitattributes` setting `filter`, `ident`,
+`text`, `eol`, `working-tree-encoding` or `diff` on it. Both were reproduced against the gate
+(scratchpad `f9/repro1.py`): upstream's own config, `merge = "self"` and a `gate` in it, came out
+`untracked_own` and `self`. `config_render_unprovable` refuses instead of trying to reproduce
+git's rendering rules - a version of those that is subtly wrong is an open gate - and it joins
+`history_unprovable` as the other half of `upstream_config_digests`'s `blind` answer, so the state
+is the same `unprovable` and `fork_merge_refusal` already knows how to print it. The question is
+asked of every path that case-folds to the config's name (on disk, beside it, and tracked), since
+a case-insensitive filesystem makes them one file; `unspecified` and `unset` are not "set", so a
+`.gitattributes` covering other paths - or turning these off for this one - changes nothing, and
+an ordinary fork never meets either condition. A `check-attr` that fails is a refusal too. Each
+refusal names the link (with its target) or the attribute (with its value), and prints a way out:
+for the link, a command that copies what it reads as now into the git directory and names the copy
+before it replaces the link with a real file; for the attribute, an APPEND to `info/attributes` in
+the git directory, which git reads before any `.gitattributes` in the tree and which overwrites
+nothing. Neither commits anything anywhere.
+
 ### `land`
 
 `cmd_land(args)` -> `resolve_ctx(need_upstream=True, need_trunk=True, strict_mirror=False)`, header,

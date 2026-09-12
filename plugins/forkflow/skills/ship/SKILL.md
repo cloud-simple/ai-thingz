@@ -94,8 +94,10 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    what those refs carried is also written down as hashes in `.git/forkflow-state.json`, so a
    version upstream has since force-pushed or withdrawn away is still upstream's - and it fails
    CLOSED: in a clone that cannot answer it - shallow, partial, `refs/replace/*` or grafts, nothing of
-   upstream's fetched, an object that cannot be read - `--merge` alone is exit 2 and the message
-   names the condition and the command that ends it. Never work around that gate -
+   upstream's fetched, an object that cannot be read, a `.forkflow.toml` that is a symlink or that a
+   `.gitattributes` renders on checkout (`filter`, `ident`, `text`, `eol`, `working-tree-encoding`,
+   `diff`) - `--merge` alone is exit 2 and the message names the condition and the command that
+   ends it. Never work around that gate -
    a reviewed fork is meant to stop here. The merge is the method rule 5 requires with a
    head-commit guard, so only the exact commit this run pushed can be merged: GitLab `glab mr
    merge <branch> --repo <fork> --sha <head> --auto-merge=false --remove-source-branch --yes`
