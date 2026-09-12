@@ -78,6 +78,11 @@ MERGE_TREE_GIT = (2, 38)             # `git merge-tree --write-tree` - older git
 BOTH_SIDES_SNIFF = 8192              # bytes of a blob looked at for a NUL before it is "binary"
 BOTH_SIDES_WIDTH = 48                # column the both-sides table pads paths to
 MAX_SYNC_RERUNS = 100                # `--force` reruns: `<name>-2` .. `<name>-99` before it gives up
+DRY_PREFIX = "would: "               # the marker every line a --dry-run did not run carries
+EXIT_PRECONDITION = 2                # the codes the module docstring's table publishes
+EXIT_CHECK = 3
+EXIT_CONFLICT = 4
+EXIT_UNSAFE = 5
 EXIT_INTERRUPTED = 130               # Ctrl-C, as the module docstring publishes it
 EXIT_NOT_MERGED = 6                  # --merge: the branch is pushed, the merge request is
                                      # not merged (or not created) - all before it stands
@@ -107,13 +112,14 @@ BACKUP_PURPOSE = {
 # --------------------------------------------------------------------------- #
 
 class Fail(Exception):
-    def __init__(self, msg: str, code: int = 2):
+    def __init__(self, msg: str, code: int = EXIT_PRECONDITION):
         super().__init__(msg)
         self.code = code
 
 
 def git(*args: str, cwd: Optional[str] = None, check: bool = True) -> str:
-    """Run git; raise Fail(..., 2) on failure unless check=False (then return "")."""
+    """Run git; raise Fail(..., EXIT_PRECONDITION) on failure unless check=False
+    (then return "")."""
     p = subprocess.run(["git", *args], cwd=cwd, capture_output=True)
     if p.returncode != 0:
         if check:
@@ -206,7 +212,9 @@ CONFIG_STRINGS = ("upstream", "upstream_branch", "mirror", "trunk",
 # `merge`: who merges this fork's merge requests. "manual" (the default) means a person does,
 # through the platform; "self" means whoever opened them - the solo fork - and is what lets
 # `sync --merge` / `ship --merge` merge the request they have just opened.
-MERGE_MODES = ("manual", "self")
+MERGE_MANUAL = "manual"              # the default: a person merges, through the platform
+MERGE_SELF = "self"                  # whoever opened the request merges it - what --merge needs
+MERGE_MODES = (MERGE_MANUAL, MERGE_SELF)
 
 
 def have_tomllib() -> bool:
@@ -992,7 +1000,7 @@ def name_status(ctx: Ctx, *args: str) -> list:
 
 
 def step(label: str, cmd: str, result: str, dry: bool = False) -> None:
-    prefix = "  would: " if dry else "  "
+    prefix = f"  {DRY_PREFIX}" if dry else "  "
     print(f"{prefix}{label}  $ {cmd}  -> {result}")
 
 
@@ -1037,13 +1045,13 @@ def upstream_tracked(ctx: Ctx, files: Sequence[str]) -> list:
 
 def divergence(ctx: Ctx) -> Tuple[Optional[int], Optional[int]]:
     """(files changed on origin/<trunk> since it left upstream, how many are upstream-tracked)."""
-    trunk_ref = f"{ctx.origin}/{ctx.trunk}"
-    if not rev(ctx.root, trunk_ref) or not rev(ctx.root, ctx.up()):
+    trunk_name = f"{ctx.origin}/{ctx.trunk}"
+    if not rev(ctx.root, trunk_name) or not rev(ctx.root, ctx.up()):
         return (None, None)
-    mb = git("merge-base", ctx.up(), trunk_ref, cwd=ctx.root, check=False)
+    mb = git("merge-base", ctx.up(), trunk_name, cwd=ctx.root, check=False)
     if not mb:
         return (None, None)
-    files = diff_names(ctx, mb, trunk_ref)
+    files = diff_names(ctx, mb, trunk_name)
     return (len(files), len(upstream_tracked(ctx, files)))
 
 
@@ -1306,7 +1314,7 @@ def push(ctx: Ctx, branch: str, lease: Optional[str] = None, backup_ref: str = "
         if not backup_ref:
             raise Fail(f"refusing to force-push `{branch}` without a confirmed backup: "
                        f"rule 4 allows a rewrite only behind a restore point on "
-                       f"{ctx.origin}", 5)
+                       f"{ctx.origin}", EXIT_UNSAFE)
         args.append(f"--force-with-lease={branch}:{lease}")
     if not has_ref(ctx.root, f"refs/remotes/{ctx.origin}/{branch}"):
         args.append("-u")
@@ -1320,11 +1328,11 @@ def push(ctx: Ctx, branch: str, lease: Optional[str] = None, backup_ref: str = "
                             cwd=ctx.root)
         if rc != 0 or f"refs/heads/{backup_ref}" not in out:
             raise Fail(f"the backup `{backup_ref}` is not on {ctx.origin}: refusing to "
-                       f"force-push `{branch}` without a restore point", 5)
+                       f"force-push `{branch}` without a restore point", EXIT_UNSAFE)
     rc, _, err = git_rc(*args, cwd=ctx.root)
     if rc != 0:
         step("push", cmd, "REJECTED")
-        raise Fail(f"push of `{branch}` was rejected by {ctx.origin}:\n{err.strip()}", 5)
+        raise Fail(f"push of `{branch}` was rejected by {ctx.origin}:\n{err.strip()}", EXIT_UNSAFE)
     # what a later `ship` reads back to know this tip is ours to replace, and not a teammate's
     record_published(ctx, branch, rev(ctx.root, f"refs/heads/{branch}"))
     step("push", cmd, "pushed")
@@ -1374,7 +1382,8 @@ def push_mirror(ctx: Ctx, target: str = "") -> str:
     rc, _, err = git_rc(*args, cwd=ctx.root)
     if rc != 0:
         step("mirror push", cmd, "REJECTED")
-        raise Fail(f"push of the mirror `{m}` was rejected by {ctx.origin}:\n{err.strip()}", 5)
+        raise Fail(f"push of the mirror `{m}` was rejected by {ctx.origin}:\n"
+                   f"{err.strip()}", EXIT_UNSAFE)
     step("mirror push", cmd, "pushed")
     return cmd
 
@@ -1445,7 +1454,8 @@ def bootstrap_trunk(ctx: Ctx, target: str) -> None:
     if rc != 0:
         git("branch", "-D", t, cwd=ctx.root, check=False)
         step("trunk", cmd, "REJECTED")
-        raise Fail(f"push of the new trunk `{t}` was rejected by {ctx.origin}:\n{err.strip()}", 5)
+        raise Fail(f"push of the new trunk `{t}` was rejected by {ctx.origin}:\n"
+                   f"{err.strip()}", EXIT_UNSAFE)
     step("trunk", cmd, f"created at {short(target)} and pushed")
 
 
@@ -1498,7 +1508,7 @@ def backup(ctx: Ctx, reason: str, from_ref: str) -> str:
         git("branch", "-D", name, cwd=ctx.root, check=False)
         raise Fail(f"backup `{name}` is not on {ctx.origin} after the push"
                    f"{': ' + err.strip() if err.strip() else ''}: refusing to go on "
-                   f"without a confirmed restore point", 5)
+                   f"without a confirmed restore point", EXIT_UNSAFE)
     step("backup", confirm, "confirmed on origin")
     print(f"    rollback: git reset --hard {sh_arg(f'{ctx.origin}/{name}')}")
     if purpose:
@@ -1653,7 +1663,7 @@ def open_mr(ctx: Ctx, branch: str, title: str, body: str, run_it: bool) -> str:
         if not ctx.dry_run:
             print(f"    description: {path}")
         return ""
-    shown = " ".join(shlex.quote(c) for c in cmd)
+    shown = shown_argv(cmd)
     if ctx.dry_run:
         step("mr", shown, "not run (dry run)", dry=True)
         return ""
@@ -1727,12 +1737,12 @@ def merge_mr(ctx: Ctx, kind: str, branch: str, url: str) -> None:
     costs nothing - the request stays open for a person to merge, which is exit 6."""
     head = "<pushed head>" if ctx.dry_run else rev(ctx.root, f"refs/heads/{branch}")
     cmd = merge_command(ctx, kind, branch, head)
-    shown = " ".join(shlex.quote(c) for c in cmd)
+    shown = shown_argv(cmd)
     if ctx.dry_run:
         step("merge", shown, "not run (dry run)", dry=True)
         step("land", land_cmd(), "not run (dry run)", dry=True)
         return
-    if fork_merge_mode(ctx) != "self":
+    if fork_merge_mode(ctx) != MERGE_SELF:
         step("merge", shown, "NOT RUN: this fork's config does not say merge = \"self\" now")
         raise Fail(f"--merge needs `merge = \"self\"` in this fork's own config - "
                    f"{fork_merge_source(ctx)} - and after this run's fetch and merge it does "
@@ -1987,25 +1997,25 @@ def run_check(ctx: Ctx, touched: Optional[Sequence[str]] = None,
         failures.append(f"gate `{cmd}` exited {rc}")
         break                                 # the first failure is the one to fix
 
-    trunk_ref = f"{ctx.origin}/{ctx.trunk}"
-    tip_cmd = f"git merge-base --is-ancestor {sh_arg(trunk_ref)} HEAD"
+    trunk_name = f"{ctx.origin}/{ctx.trunk}"
+    tip_cmd = f"git merge-base --is-ancestor {sh_arg(trunk_name)} HEAD"
     if current_branch(ctx) == ctx.trunk:
         step("tip", tip_cmd, f"skipped (on the trunk `{ctx.trunk}`)")
     else:
-        rc, _, err = git_rc("merge-base", "--is-ancestor", trunk_ref, "HEAD", cwd=ctx.root)
+        rc, _, err = git_rc("merge-base", "--is-ancestor", trunk_name, "HEAD", cwd=ctx.root)
         if rc == 0:
-            step("tip", tip_cmd, f"on {trunk_ref}'s tip")
+            step("tip", tip_cmd, f"on {trunk_name}'s tip")
         elif rc == 1:
-            ahead, behind = ahead_behind(ctx, "HEAD", trunk_ref)
+            ahead, behind = ahead_behind(ctx, "HEAD", trunk_name)
             where = f"behind by {behind}, ahead by {ahead}"
-            step("tip", tip_cmd, f"not on {trunk_ref}'s tip ({where})")
-            failures.append(f"not on {trunk_ref}'s tip ({where})")
+            step("tip", tip_cmd, f"not on {trunk_name}'s tip ({where})")
+            failures.append(f"not on {trunk_name}'s tip ({where})")
         else:
-            raise Fail(f"cannot compare HEAD with {trunk_ref}: {err.strip()}")
+            raise Fail(f"cannot compare HEAD with {trunk_name}: {err.strip()}")
 
     if failures:
         print("  check    FAILED: " + "; ".join(failures))
-        return 3
+        return EXIT_CHECK
     print("  check    ok")
     return 0
 
@@ -2394,7 +2404,7 @@ def merge_upstream(ctx: Ctx, name: str, target: str, commits: Sequence[str],
         raise Fail(f"merge of {short(target)} failed:\n{text}")
     report_paths("merge", cmd, unmerged, "conflicting file(s)")
     raise Fail(f"resolve the conflicts on `{name}`, `git add` them, "
-               f"then run `{continue_cmd('sync', args)}`", 4)
+               f"then run `{continue_cmd('sync', args)}`", EXIT_CONFLICT)
 
 
 def sync_body(ctx: Ctx, commits: Sequence[str], both: Sequence[Tuple[str, str]],
@@ -2512,15 +2522,15 @@ def finish_sync(ctx: Ctx, args: argparse.Namespace, name: str, commits: Sequence
 
     if ctx.dry_run:
         step("check", "forkflow check", "not run (dry run)", dry=True)
-    elif run_check(ctx, config_merged=gate_merged) == 3:
+    elif run_check(ctx, config_merged=gate_merged) == EXIT_CHECK:
         print(check_failure_hint(ctx, name, args))
-        return 3
+        return EXIT_CHECK
 
     base = rev(ctx.root, f"{ctx.origin}/{ctx.trunk}")   # what the merge was built on
     try:
         push(ctx, name)
     except Fail as exc:
-        if exc.code == 5:
+        if exc.code == EXIT_UNSAFE:
             print(f"  fix that, then: {resume}")
         raise
     title = (getattr(args, "title", None)
@@ -2574,12 +2584,12 @@ def merge_mode_in(text: Optional[str], where: str) -> Optional[str]:
     reads the same text for that (`written_by_upstream`), and two `git show`s of one path
     are two answers about two different files the moment the ref moves between them."""
     if text is None:
-        return MERGE_MODES[0]
+        return MERGE_MANUAL
     try:
         cfg = parse_config(text, where)
     except Fail:
         return None
-    return cfg.get("merge") or MERGE_MODES[0]
+    return cfg.get("merge") or MERGE_MANUAL
 
 
 def config_fingerprint(text: str) -> str:
@@ -2719,18 +2729,18 @@ def fork_merge_mode(ctx: Ctx) -> str:
     working tree let upstream's `merge = "self"` merge a reviewed fork's sync four ways -
     on `--continue`, under a case variant of the name, and from a sync branch left checked
     out. Anything else - no file, a file that cannot be read - is "manual"."""
-    trunk_ref = f"{ctx.origin}/{ctx.trunk}"
-    if has_ref(ctx.root, f"refs/remotes/{trunk_ref}") and config_name_at(ctx, trunk_ref):
+    trunk_name = f"{ctx.origin}/{ctx.trunk}"
+    if has_ref(ctx.root, f"refs/remotes/{trunk_name}") and config_name_at(ctx, trunk_name):
         # one read, two questions: whose the file is and what it says have to be asked of
         # the same bytes. The two calls a `--merge` run makes stay two reads on purpose -
         # the second, in `merge_mr`, is after this run's fetch moved the ref
-        text = config_text(ctx, trunk_ref)
+        text = config_text(ctx, trunk_name)
         if written_by_upstream(ctx, text):
-            return MERGE_MODES[0]
-        return merge_mode_in(text, f"{trunk_ref}:{CONFIG_FILE}") or MERGE_MODES[0]
+            return MERGE_MANUAL
+        return merge_mode_in(text, f"{trunk_name}:{CONFIG_FILE}") or MERGE_MANUAL
     if own_untracked_config(ctx):
-        return load_config(ctx.root).get("merge") or MERGE_MODES[0]
-    return MERGE_MODES[0]
+        return load_config(ctx.root).get("merge") or MERGE_MANUAL
+    return MERGE_MANUAL
 
 
 def fork_merge_source(ctx: Ctx) -> str:
@@ -2756,7 +2766,7 @@ def fork_merge_refusal(ctx: Ctx) -> str:
     the fork's own makes the file the fork's. A `{ship}` is named only for a config that
     already is this fork's - printed commands are followed to the letter, and shipping
     upstream's bytes to the trunk changes nothing about whose word `merge` is."""
-    trunk_ref = f"{ctx.origin}/{ctx.trunk}"
+    trunk_name = f"{ctx.origin}/{ctx.trunk}"
     ship = rerun_cmd("ship", argparse.Namespace(mr=True))
     theirs = (f"is the original project's own `{CONFIG_FILE}`, byte for byte, so what it "
               f"says about `merge` is upstream's word and not this fork's - whatever you "
@@ -2765,11 +2775,11 @@ def fork_merge_refusal(ctx: Ctx) -> str:
     generic = (f"{fork_merge_source(ctx)}; a `{CONFIG_FILE}` the checked-out branch carries "
                f"is not read for it. This fork's merge requests are merged by hand.")
     here = working_config_text(ctx)
-    if has_ref(ctx.root, f"refs/remotes/{trunk_ref}") and config_name_at(ctx, trunk_ref):
-        if not written_by_upstream(ctx, config_text(ctx, trunk_ref)):
+    if has_ref(ctx.root, f"refs/remotes/{trunk_name}") and config_name_at(ctx, trunk_name):
+        if not written_by_upstream(ctx, config_text(ctx, trunk_name)):
             return generic              # this fork's own file; it just does not say "self"
-        return (f"the `{CONFIG_FILE}` committed on `{trunk_ref}` {theirs}. A sync brought "
-                f"it in and it was taken whole. {yours}on a branch off `{trunk_ref}`, "
+        return (f"the `{CONFIG_FILE}` committed on `{trunk_name}` {theirs}. A sync brought "
+                f"it in and it was taken whole. {yours}on a branch off `{trunk_name}`, "
                 f"commit it there and `{ship}` it; once that merge request is merged, "
                 f"`--merge` works here.")
     if tracked_config_names(ctx.root):
@@ -2778,19 +2788,19 @@ def fork_merge_refusal(ctx: Ctx) -> str:
             # on the trunk, where `merge` is still upstream's word and this refusal returns
             return (f"the `{CONFIG_FILE}` this branch carries {theirs}, and a config the "
                     f"checked-out branch carries is not read for `merge` in any case - only "
-                    f"the one on `{trunk_ref}`, and only while it is this fork's own. Edit "
+                    f"the one on `{trunk_name}`, and only while it is this fork's own. Edit "
                     f"the file in your fork, with `merge = \"self\"` set by you, and get "
-                    f"that onto `{trunk_ref}` the way everything else gets there.")
+                    f"that onto `{trunk_name}` the way everything else gets there.")
         return (f"{fork_merge_source(ctx)}; the `{CONFIG_FILE}` this branch carries is not "
                 f"read for it - committed on a branch it is neither untracked nor on "
-                f"`{trunk_ref}`. Get it onto the trunk first: `{ship}`, have that merge "
+                f"`{trunk_name}`. Get it onto the trunk first: `{ship}`, have that merge "
                 f"request merged, then: {land_cmd()}. A `merge = \"self\"` it carries "
                 f"counts from then on.")
     if config_is_upstreams(ctx, here):
         return (f"the untracked `{CONFIG_FILE}` in the working tree {theirs}. A sync brought "
                 f"it in and it was untracked by hand. {yours}and run this again; nothing has "
                 f"to be committed, an untracked config is read while none is on "
-                f"`{trunk_ref}`.")
+                f"`{trunk_name}`.")
     return generic
 
 
@@ -2879,7 +2889,7 @@ def merge_gate(ctx: Ctx, args: argparse.Namespace, resume_sync: bool = False,
     would otherwise be a push followed by a failure."""
     if not getattr(args, "merge", False):
         return
-    if fork_merge_mode(ctx) != "self":
+    if fork_merge_mode(ctx) != MERGE_SELF:
         # a resumed sync has a merge made and a branch to finish: the resume named keeps
         # `--mr` (which `--merge` implies), so it still opens the request the reviewer merges
         by_hand = (f" Resume without it - `{continue_cmd('sync', argparse.Namespace(mr=True))}`"
@@ -3037,24 +3047,24 @@ def ship_preflight(ctx: Ctx, args: Optional[argparse.Namespace] = None) -> str:
     return branch
 
 
-def rebase_onto(ctx: Ctx, branch: str, trunk_ref: str,
+def rebase_onto(ctx: Ctx, branch: str, trunk_name: str,
                 args: Optional[argparse.Namespace] = None) -> None:
     """Rebase locally so the trunk can fast-forward: `rebase locally, merge globally`."""
-    cmd = f"git rebase {sh_arg(trunk_ref)}"
-    tip = rev(ctx.root, trunk_ref)
+    cmd = f"git rebase {sh_arg(trunk_name)}"
+    tip = rev(ctx.root, trunk_name)
     if ctx.dry_run:
         step("rebase", cmd, f"would replay `{branch}` onto {short(tip)}", dry=True)
         return
-    rc, out, err = git_rc("rebase", trunk_ref, cwd=ctx.root)
+    rc, out, err = git_rc("rebase", trunk_name, cwd=ctx.root)
     if rc == 0:
         step("rebase", cmd, f"`{branch}` now sits on {short(tip)}")
         return
     if not rebase_in_progress(ctx):
-        raise Fail(f"rebase of `{branch}` onto {trunk_ref} failed:\n{(err or out).strip()}")
+        raise Fail(f"rebase of `{branch}` onto {trunk_name} failed:\n{(err or out).strip()}")
     unmerged = unmerged_paths(ctx)
     report_paths("rebase", cmd, unmerged, "conflicting file(s)")
     raise Fail(f"resolve the conflicts, `git add` them, run `git rebase --continue`, "
-               f"then `{continue_cmd('ship', args)}`", 4)
+               f"then `{continue_cmd('ship', args)}`", EXIT_CONFLICT)
 
 
 def commit_records(ctx: Ctx, base: str) -> list:
@@ -3123,13 +3133,14 @@ def squash(ctx: Ctx, base: str, message: str) -> str:
     if rc != 0:
         git("reset", "--soft", head_before, cwd=ctx.root)
         step("squash", cmd, "FAILED")
-        raise Fail(f"cannot commit the squashed change:\n{(err or out).strip()}", 5)
+        raise Fail(f"cannot commit the squashed change:\n{(err or out).strip()}", EXIT_UNSAFE)
     tree_after = git("rev-parse", "HEAD^{tree}", cwd=ctx.root)
     if tree_after != tree_before:
         git("reset", "--soft", head_before, cwd=ctx.root, check=False)   # leave no bad commit
         step("squash", cmd, "TREE MISMATCH")
         raise Fail(f"the squashed commit's tree {short(tree_after)} differs from "
-                   f"{short(tree_before)}: refusing to push a squash that changed the result", 5)
+                   f"{short(tree_before)}: refusing to push a squash that changed the "
+                   f"result", EXIT_UNSAFE)
     head = rev(ctx.root, "HEAD")
     step("squash", cmd, f"one commit {short(head)}, tree {short(tree_after)} unchanged")
     return head
@@ -3150,16 +3161,16 @@ def ship_body(ctx: Ctx, message: str, touched: Sequence[str]) -> str:
 def finish_ship(ctx: Ctx, args: argparse.Namespace, branch: str,
                 backup_ref: str, lease: str) -> int:
     """squash -> check -> push -> merge request: the tail both `ship` and `ship --continue` run."""
-    trunk_ref = f"{ctx.origin}/{ctx.trunk}"
+    trunk_name = f"{ctx.origin}/{ctx.trunk}"
     # here, not in `cmd_ship`: a rebase that dropped every commit (`git rebase --skip`) lands on
     # the trunk's tip too, and `--continue` resumes straight into this function
-    if not ctx.dry_run and rev(ctx.root, "HEAD") == rev(ctx.root, trunk_ref):
-        print(f"  nothing to ship: every commit of `{branch}` is already on {trunk_ref} "
+    if not ctx.dry_run and rev(ctx.root, "HEAD") == rev(ctx.root, trunk_name):
+        print(f"  nothing to ship: every commit of `{branch}` is already on {trunk_name} "
               f"(the backup `{backup_ref}` still holds the branch as it was)")
         return 0
-    mb = git("merge-base", trunk_ref, "HEAD", cwd=ctx.root)
+    mb = git("merge-base", trunk_name, "HEAD", cwd=ctx.root)
     records = commit_records(ctx, mb)
-    step("commits", f"git log --oneline {sh_arg(f'{trunk_ref}..HEAD')}",
+    step("commits", f"git log --oneline {sh_arg(f'{trunk_name}..HEAD')}",
          f"{len(records)} commit(s) to squash into one")
     for sha, subject, _ in records:
         print(f"    {short(sha)} {subject}")
@@ -3171,26 +3182,26 @@ def finish_ship(ctx: Ctx, args: argparse.Namespace, branch: str,
     try:
         squash(ctx, mb, message)
     except Fail as exc:
-        if exc.code == 5 and rollback:
+        if exc.code == EXIT_UNSAFE and rollback:
             print(rollback)
         raise
 
     if ctx.dry_run:
         warn_upstream_tracked(ctx, touched)      # the real run prints it after the squash
         step("check", "forkflow check", "not run (dry run)", dry=True)
-    elif run_check(ctx, touched) == 3:
+    elif run_check(ctx, touched) == EXIT_CHECK:
         if rollback:
             print(rollback)
         # the squash has already happened, so a plain rerun of `ship` starts from a branch whose
         # commits are no longer the published ones; `--continue` resumes this run instead
         print(f"  fix that on `{branch}` and commit it, then: {continue_cmd('ship', args)}")
-        return 3
+        return EXIT_CHECK
 
-    base = rev(ctx.root, trunk_ref)                    # what the squash was built on
+    base = rev(ctx.root, trunk_name)                    # what the squash was built on
     try:
         push(ctx, branch, lease=lease or None, backup_ref=backup_ref)
     except Fail as exc:
-        if exc.code == 5 and rollback:
+        if exc.code == EXIT_UNSAFE and rollback:
             print(rollback)
         raise
     title = (getattr(args, "title", None)
@@ -3286,7 +3297,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
     header(ctx, "ship")
     branch = ship_preflight(ctx, args)
     merge_gate(ctx, args, branch=branch)   # before `--continue`, the fetch, the backup, the push
-    trunk_ref = f"{ctx.origin}/{ctx.trunk}"
+    trunk_name = f"{ctx.origin}/{ctx.trunk}"
 
     if getattr(args, "cont", False):
         # a ship in progress is one this clone started: its backup and the lease its fetch
@@ -3296,23 +3307,23 @@ def cmd_ship(args: argparse.Namespace) -> int:
         if not state.get("backup"):
             raise Fail(f"no ship to continue on `{branch}`: `--continue` resumes the run that "
                        f"made the pre-ship backup - run `{rerun_cmd('ship', args)}`")
-        cmd = f"git merge-base --is-ancestor {sh_arg(trunk_ref)} HEAD"
-        rc, _, _ = git_rc("merge-base", "--is-ancestor", trunk_ref, "HEAD", cwd=ctx.root)
+        cmd = f"git merge-base --is-ancestor {sh_arg(trunk_name)} HEAD"
+        rc, _, _ = git_rc("merge-base", "--is-ancestor", trunk_name, "HEAD", cwd=ctx.root)
         if rc != 0:
-            step("continue", cmd, f"`{branch}` is not on {trunk_ref}'s tip")
+            step("continue", cmd, f"`{branch}` is not on {trunk_name}'s tip")
             raise Fail(f"the rebase did not complete; run `{rerun_cmd('ship', args)}` again")
         step("continue", cmd, "the rebase completed - resuming at the squash")
         return finish_ship(ctx, args, branch, state["backup"], state.get("lease", ""))
 
-    rc, cmd, result, err = fetch(ctx, (ctx.origin,), [trunk_ref])
+    rc, cmd, result, err = fetch(ctx, (ctx.origin,), [trunk_name])
     if rc != 0:
         step("fetch", cmd, "FAILED")
         raise Fail(f"fetch failed: {err.strip()}")
     step("fetch", cmd, result)
 
-    rc, _, _ = git_rc("merge-base", "--is-ancestor", "HEAD", trunk_ref, cwd=ctx.root)
+    rc, _, _ = git_rc("merge-base", "--is-ancestor", "HEAD", trunk_name, cwd=ctx.root)
     if rc == 0:
-        print(f"  nothing to ship: `{branch}` has no commits beyond {trunk_ref}")
+        print(f"  nothing to ship: `{branch}` has no commits beyond {trunk_name}")
         return 0
 
     # the lease is what the fetch just saw; the rebase and the squash come after it. A lease
@@ -3357,7 +3368,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
 
     backup_ref = backup(ctx, "pre-ship", "HEAD")
     write_state(ctx, "ship", {"branch": branch, "backup": backup_ref, "lease": lease})
-    rebase_onto(ctx, branch, trunk_ref, args)
+    rebase_onto(ctx, branch, trunk_name, args)
     return finish_ship(ctx, args, branch, backup_ref, lease)
 
 
@@ -3481,6 +3492,9 @@ def trunk_elsewhere(ctx: Ctx, resume: str = "") -> None:
                    f"every worktree of this clone sees the same pending records")
 
 
+# `trunk_ref` is always the full `refs/remotes/<origin>/<trunk>` and `trunk_name` always the
+# short `<origin>/<trunk>` git also accepts and messages print. A wrong refspec here means "no
+# such ref", silently, so the two never share a name.
 def land_trunk(ctx: Ctx) -> Tuple[str, str]:
     """Check the local trunk out and fast-forward it to `origin/<trunk>`. (old sha, new sha).
 
@@ -3494,20 +3508,20 @@ def land_trunk(ctx: Ctx) -> Tuple[str, str]:
     worktree is `land_preflight`'s, refused before anything moves."""
     t = ctx.trunk
     trunk_ref = f"refs/remotes/{ctx.origin}/{t}"
-    shown_ref = f"{ctx.origin}/{t}"
+    trunk_name = f"{ctx.origin}/{t}"
     new = rev(ctx.root, trunk_ref)
     if not new:
-        raise Fail(f"`{shown_ref}` does not resolve after the fetch: is the trunk still on "
+        raise Fail(f"`{trunk_name}` does not resolve after the fetch: is the trunk still on "
                    f"{ctx.origin}?")
     old = rev(ctx.root, f"refs/heads/{t}")
     if old and old != new:
         rc, _, _ = git_rc("merge-base", "--is-ancestor", old, trunk_ref, cwd=ctx.root)
         if rc != 0:
             raise Fail(f"`{t}` has commits {ctx.origin} lacks - the plugin never creates "
-                       f"these; resolve by hand (`git log {sh_arg(f'{shown_ref}..{t}')}`), "
+                       f"these; resolve by hand (`git log {sh_arg(f'{trunk_name}..{t}')}`), "
                        f"then run `{land_cmd()}` again")
     if not old:
-        cmd = f"git branch --no-track {sh_arg(t)} {sh_arg(shown_ref)}"
+        cmd = f"git branch --no-track {sh_arg(t)} {sh_arg(trunk_name)}"
         if ctx.dry_run:
             step("trunk", cmd, f"would create {t} at {short(new)}", dry=True)
         else:
@@ -3525,7 +3539,7 @@ def land_trunk(ctx: Ctx) -> Tuple[str, str]:
     if not old or old == new:
         step("trunk", f"git rev-parse {sh_arg(t)}", f"up to date at {short(new)}")
         return (old or new, new)
-    cmd = f"git merge --ff-only {sh_arg(shown_ref)}"
+    cmd = f"git merge --ff-only {sh_arg(trunk_name)}"
     if ctx.dry_run:
         step("trunk", cmd, f"{short(old)} -> {short(new)}", dry=True)
         return (old, new)
@@ -3630,9 +3644,9 @@ def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False,
     if not after_merge:
         land_preflight(ctx, resume)
 
-    shown_ref = f"{ctx.origin}/{ctx.trunk}"
-    trunk_ref = f"refs/remotes/{shown_ref}"
-    rc, cmd, result, err = fetch(ctx, (ctx.origin,), [shown_ref])
+    trunk_name = f"{ctx.origin}/{ctx.trunk}"
+    trunk_ref = f"refs/remotes/{trunk_name}"
+    rc, cmd, result, err = fetch(ctx, (ctx.origin,), [trunk_name])
     if rc != 0:
         step("fetch", cmd, "FAILED")
         raise Fail(f"fetch failed: {err.strip()}")
@@ -3643,7 +3657,7 @@ def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False,
     for e in chosen:
         kind, commit = e["kind"], e["commit"]
         label = f"`{e['branch']}` " if several else ""
-        ancestry = f"git merge-base --is-ancestor {sh_arg(short(commit))} {sh_arg(shown_ref)}"
+        ancestry = f"git merge-base --is-ancestor {sh_arg(short(commit))} {sh_arg(trunk_name)}"
         try:
             sha, how = landed(ctx, e)
         except Fail:
@@ -3657,18 +3671,18 @@ def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False,
             sha, how = None, ""         # nothing to judge - and `--force` judges nothing
         if sha is None:
             if several:
-                step("landed?", ancestry, f"no - {label}{short(commit)} is not on {shown_ref}")
-                waiting.append((e, f"not on {shown_ref} yet"))
+                step("landed?", ancestry, f"no - {label}{short(commit)} is not on {trunk_name}")
+                waiting.append((e, f"not on {trunk_name} yet"))
                 continue
             if not force:
-                step("landed?", ancestry, f"no - {short(commit)} is not on {shown_ref}")
+                step("landed?", ancestry, f"no - {short(commit)} is not on {trunk_name}")
                 if after_merge:
                     there = trunk_worktree_elsewhere(ctx)
                     where = f" in {there}, where `{ctx.trunk}` is checked out" if there else ""
                     raise Fail(f"the platform tool reported the merge request merged, but "
-                               f"{shown_ref} does not have {short(commit)} - the merge is "
+                               f"{trunk_name} does not have {short(commit)} - the merge is "
                                f"queued or waiting (a merge train, auto-merge, a required "
-                               f"pipeline?); once it is on {shown_ref}, run "
+                               f"pipeline?); once it is on {trunk_name}, run "
                                f"`{land_cmd(e['branch'])}`{where}",
                                EXIT_NOT_MERGED)
                 note = ""
@@ -3680,13 +3694,13 @@ def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False,
                     note += ("\n  other merge requests have landed - land each by its name: "
                              + ", ".join(f"`{land_cmd(b)}`" for b in others))
                 request = e.get("mr") or f"`{e['branch']}`"
-                raise Fail(f"MR {request} is not on {shown_ref} yet - merge it, then run "
+                raise Fail(f"MR {request} is not on {trunk_name} yet - merge it, then run "
                            f"`{land_cmd()}` again{note}")
             step("landed?", ancestry, "landing not verified (--force): fast-forwarding to "
-                                      f"whatever {shown_ref} holds")
+                                      f"whatever {trunk_name} holds")
         else:
             cmd = ancestry if how == "ancestor" else (
-                f"git cherry {sh_arg(short(commit))} {sh_arg(shown_ref)} "
+                f"git cherry {sh_arg(short(commit))} {sh_arg(trunk_name)} "
                 f"{sh_arg(short(e['base']))}")
             step("landed?", cmd, f"yes - {label}as {short(sha)} ({how})")
             if kind == "ship" and how == "ancestor":
@@ -3702,7 +3716,7 @@ def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False,
     if not landings:                       # only with several: one alone has raised above
         lines = "".join(f"\n  `{e['branch']}` (MR {e.get('mr') or '-'}): {why}"
                         for e, why in waiting)
-        raise Fail(f"nothing pending is on {shown_ref} yet - merge, then run `{land_cmd()}` "
+        raise Fail(f"nothing pending is on {trunk_name} yet - merge, then run `{land_cmd()}` "
                    f"again:{lines}")
 
     if after_merge:                        # landed: now what this worktree cannot do
@@ -3731,7 +3745,7 @@ def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False,
     said = "landed" if verified else "caught up, landing NOT verified"
     if several:
         said += " " + ", ".join(f"`{b}`" for b in verified)
-    print(f"  {'would: ' if ctx.dry_run else ''}{said}: {ctx.trunk} {moved} - you are on "
+    print(f"  {DRY_PREFIX if ctx.dry_run else ''}{said}: {ctx.trunk} {moved} - you are on "
           f"{ctx.trunk}")
     if ctx.platform == "github":
         for name in leftovers:
@@ -3844,7 +3858,7 @@ def template_text(ctx: Ctx) -> str:
         (f'mirror = {toml_string(ctx.mirror)}', "our fast-forward-only copy of it"),
         (f'trunk = {toml_string(ctx.trunk)}', "protected, MR-only branch with our work"),
         ("gate = []", 'e.g. ["make test", "terraform fmt"]'),
-        (f'merge = {toml_string(MERGE_MODES[0])}',
+        (f'merge = {toml_string(MERGE_MANUAL)}',
          '"self": this fork\'s MRs are merged by whoever opened them - enables --merge'),
         (f'sync_prefix = {toml_string(ctx.sync_prefix)}', ""),
         (f'backup_prefix = {toml_string(ctx.backup_prefix)}', ""),
@@ -4251,14 +4265,21 @@ exit $status
 """
 
 
+def shown_argv(cmd: Sequence[str]) -> str:
+    """An argv list as the one line printed for it: quoted with `shlex.quote`, so what is
+    shown is exactly the argv that ran. The merge request's two steps both run a tool and
+    print what they ran; this is the one place that renders it."""
+    return " ".join(shlex.quote(c) for c in cmd)
+
+
 def sh_arg(value: str) -> str:
     """One word of a command this script *prints* for a human or Claude to paste.
 
     Every branch and remote name reaches such a command, and `git check-ref-format` accepts
     `;`, a backtick and `$(` - names that come from `.forkflow.toml`, a tracked file a sync
-    can bring in from upstream. Quoted only when it has to be (`shlex.quote`, as `open_mr`
-    already renders its argv), so an ordinary name prints exactly as the reader expects and
-    only a name that would otherwise be more than one word changes shape."""
+    can bring in from upstream. Quoted only when it has to be (`shlex.quote`, as
+    `shown_argv` renders an argv), so an ordinary name prints exactly as the reader expects
+    and only a name that would otherwise be more than one word changes shape."""
     return shlex.quote(value)
 
 
@@ -4268,8 +4289,8 @@ def sh_quote(value: str) -> str:
     the word early and turn the rest of it into code.
 
     Used for the generated hook and for the platform report's fix commands, which are pasted
-    into a shell by hand; `open_mr` renders an argv list it also runs itself, and quotes that
-    with `shlex.quote` so what is shown is exactly the argv that ran."""
+    into a shell by hand; `shown_argv` renders an argv list this script also runs itself, and
+    quotes that with `shlex.quote` so what is shown is exactly the argv that ran."""
     return "'" + value.replace("'", "'\\''") + "'"
 
 
@@ -5155,6 +5176,14 @@ def run_tests() -> None:
                                    detect_platform=lambda url: platform,
                                    mr_target=lambda ctx: (PLATFORM_FORKS[platform], ""))
 
+    def as_gitlab():
+        """The fixture fork as a GitLab fork (`on_platform`), for the tests that read what
+        a merge request command was given."""
+        return on_platform("gitlab")
+
+    def as_github():
+        return on_platform("github")
+
     def merging_tool(tmp: str, name: str, trunk: str = "develop") -> None:
         """A glab/gh on PATH that opens AND merges: the platform simulated, not faked away.
 
@@ -5248,13 +5277,16 @@ def run_tests() -> None:
                  clone=shlex.quote(os.path.join(tmp, "platform-clone")))
         fake_tool(os.path.join(tmp, "bin"), name, script)
 
+    def lines_of(path: str) -> list:
+        """A recorded file as its lines, newline stripped - one argument per line, which is
+        how every fake tool here writes the argv it was given."""
+        with open(path) as fh:
+            return [ln.rstrip("\n") for ln in fh]
+
     def tool_argv(tmp: str, name: str, sub: str) -> list:
         """What `merging_tool` recorded for `<name> <mr|pr> <sub>`, [] when it never ran."""
         path = os.path.join(tmp, "%s-%s-argv.txt" % (name, sub))
-        if not os.path.exists(path):
-            return []
-        with open(path) as fh:
-            return [ln.rstrip("\n") for ln in fh]
+        return lines_of(path) if os.path.exists(path) else []
 
     def put_pending(fork: str, *entries: dict) -> None:
         """The shared `pending` map holding exactly `entries`, keyed by branch as
@@ -5294,7 +5326,7 @@ def run_tests() -> None:
     def run(*argv: str):
         return capture(main, list(argv))
 
-    def printed(text: str, start: str) -> str:
+    def printed_cmd(text: str, start: str) -> str:
         """The first command in `text` that begins with `start` - `backticked`, or the tail
         of a `then: forkflow ...` line: a printed remedy, to be run exactly as the user
         would paste it."""
@@ -5307,7 +5339,7 @@ def run_tests() -> None:
     def remedy_of(text: str) -> Tuple[str, str]:
         """The printed case-variant remedy - (the command as printed, the path it copies the
         working file to first) - read off the command itself, `test ! -e <path> && cp ...`."""
-        cmd = printed(text, "test ! -e ")
+        cmd = printed_cmd(text, "test ! -e ")
         return cmd, shlex.split(cmd)[3]
 
     def no_remedy(text: str) -> None:
@@ -5319,7 +5351,7 @@ def run_tests() -> None:
 
     def run_printed(text: str, start: str, fork: str):
         """Run the printed `forkflow ...` command that begins with `start`, in `fork`."""
-        return run("-C", fork, *shlex.split(printed(text, start))[1:])
+        return run("-C", fork, *shlex.split(printed_cmd(text, start))[1:])
 
     def ctx_for(fork: str, need_upstream: bool = True, need_trunk: bool = True,
                 strict_mirror: bool = True, **ns) -> Ctx:
@@ -6186,10 +6218,13 @@ def run_tests() -> None:
             self.assertEqual(pending_entries(ctx), {"feat/x": good})     # `mr` may be absent
 
         def test_a_dry_run_records_nothing(self):
+            """Asked of the shared file (`SHARED_STATE`), which is where `record_pending`
+            writes: the per-worktree path is the same file in a main worktree, so asking
+            that one would pass in a linked worktree with the record written."""
             fork = make_fork(self.tmp)
             ctx = ctx_for(fork, dry_run=True)
             record_pending(ctx, "ship", "develop", rev(fork, "origin/develop"))
-            self.assertFalse(os.path.exists(state_path(ctx)))
+            self.assertFalse(os.path.exists(state_path(ctx, shared=True)))
 
     class TestCleanTree(Base):
         def test_untracked_is_clean(self):
@@ -8180,11 +8215,23 @@ def run_tests() -> None:
         BASE_TF = 'resource "null_resource" "a" {\n  count = 1\n}\n'
 
         def feature(self, fork: str, name: str = "feat/x", commits: int = 1,
-                    push: bool = False) -> str:
+                    push: bool = False, only_own: bool = False) -> str:
+            """A feature branch off the trunk carrying `commits` commits of its own files.
+
+            `only_own` stages just the file it writes: `commit_fork` stages everything,
+            which would commit an untracked `.forkflow.toml` and turn a test about the
+            untracked config into one about a tracked one."""
             sh("git", "checkout", "-b", name, "develop", cwd=fork)
             for i in range(commits):
-                commit_fork(fork, "ours/f%d.txt" % i, "line %d\n" % i,
-                            "ours: step %d" % i, push=push)
+                path, message = "ours/f%d.txt" % i, "ours: step %d" % i
+                if not only_own:
+                    commit_fork(fork, path, "line %d\n" % i, message, push=push)
+                    continue
+                write(fork, path, "line %d\n" % i)
+                sh("git", "add", path, cwd=fork)
+                sh("git", "commit", "-q", "-m", message, cwd=fork)
+                if push:
+                    sh("git", "push", "origin", "%s:refs/heads/%s" % (name, name), cwd=fork)
             return name
 
         def backup_branch(self, fork: str) -> str:
@@ -9627,9 +9674,9 @@ def run_tests() -> None:
                 ("repos/*", repo[0], repo[1]),
             ])
 
-        def argv(self) -> list:
-            with open(self.log) as fh:
-                return [ln.rstrip("\n") for ln in fh]
+        def report_argv(self) -> list:
+            """The argv the report's own `glab api` / `gh api` fake recorded."""
+            return lines_of(self.log)
 
         def report(self, platform: str, origin: Optional[str] = None) -> str:
             """The report for a fork whose origin really is a hosted one: the paths it prints
@@ -9697,7 +9744,7 @@ def run_tests() -> None:
         def test_the_report_only_ever_reads(self):
             self.gitlab_tool()
             self.report("gitlab")
-            self.assertEqual(self.argv(), [
+            self.assertEqual(self.report_argv(), [
                 "api", "projects/acme%2Fteam%2Fwidget",
                 "api", "projects/acme%2Fteam%2Fwidget/protected_branches/develop",
                 "api", "projects/acme%2Fteam%2Fwidget/protected_branches/main"])
@@ -9755,7 +9802,7 @@ def run_tests() -> None:
             out = self.report("gitlab")
             self.assertIn("not checked (HTTP 500)", out)
             self.assertNotIn("trunk `develop`", out)
-            self.assertEqual(self.argv(), ["api", "projects/acme%2Fteam%2Fwidget"])
+            self.assertEqual(self.report_argv(), ["api", "projects/acme%2Fteam%2Fwidget"])
 
         def test_a_missing_tool_is_not_checked(self):
             ctx = ctx_for(make_fork(self.tmp))
@@ -9776,7 +9823,7 @@ def run_tests() -> None:
             self.assertIn("trunk `develop`: protected, force-push disallowed, "
                           "direct push blocked: ok", out)
             self.assertEqual(self.fixes(out), [])
-            self.assertEqual(self.argv(), [
+            self.assertEqual(self.report_argv(), [
                 "api", "repos/acme/widget",
                 "api", "repos/acme/widget/branches/develop/protection",
                 "api", "repos/acme/widget/branches/main/protection"])
@@ -9951,7 +9998,7 @@ def run_tests() -> None:
             self.assertIn("gh api -X PATCH repos/acme/widget -f default_branch=", out)
             self.assertIn("gh api -X PUT repos/acme/widget/branches/develop/protection", out)
             # and the reads the findings came from went to the fork as well
-            self.assertEqual(self.argv(), [
+            self.assertEqual(self.report_argv(), [
                 "api", "repos/acme/widget",
                 "api", "repos/acme/widget/branches/develop/protection",
                 "api", "repos/acme/widget/branches/main/protection"])
@@ -9980,7 +10027,7 @@ def run_tests() -> None:
             out = self.report("gitlab", origin="git@gitlab.example.com:acme/team/widget.git")
             self.assert_names_the_fork(out, "projects/acme%2Fteam%2Fwidget")
             self.assertIn("glab api --method PUT projects/acme%2Fteam%2Fwidget ", out)
-            self.assertEqual(self.argv(), [
+            self.assertEqual(self.report_argv(), [
                 "api", "projects/acme%2Fteam%2Fwidget",
                 "api", "projects/acme%2Fteam%2Fwidget/protected_branches/develop",
                 "api", "projects/acme%2Fteam%2Fwidget/protected_branches/main"])
@@ -10028,9 +10075,10 @@ def run_tests() -> None:
             self.assertFalse(os.path.exists(self.log))
 
     class TestPlatformReportInSetup(PlatformBase):
-        def as_gitlab(self):
+        def as_gitlab_host(self):
             """The fork under test pushes to a local origin: pretend it is a GitLab one, both
-            for the host and for the project path the report builds out of it."""
+            for the host and for the project path the report builds out of it. Not
+            `as_gitlab`, which names the fork for the merge request commands instead."""
             return mock.patch.multiple(sys.modules[__name__],
                                        detect_platform=lambda url: "gitlab",
                                        forge_path=lambda url: "acme/team/widget")
@@ -10044,7 +10092,7 @@ def run_tests() -> None:
             fork = make_fresh_fork(self.tmp)
             self.gitlab_tool(project=('{"default_branch":"main","merge_method":"ff"}', 0),
                              trunk=UNPROTECTED, mirror=UNPROTECTED)
-            with self.as_gitlab():
+            with self.as_gitlab_host():
                 code, out, err = run("-C", fork, "setup")
             self.assertEqual(code, 0, err + out)
             self.assertIn("default branch: `main` - it must be the trunk `develop`", out)
@@ -10054,13 +10102,13 @@ def run_tests() -> None:
         def test_a_dry_run_still_runs_the_read_only_report(self):
             fork = make_fork(self.tmp)
             self.gitlab_tool()
-            with self.as_gitlab():
+            with self.as_gitlab_host():
                 code, out, err = run("-C", fork, "setup", "--dry-run")
             self.assertEqual(code, 0, err + out)
             self.assertIn("read-only: default_branch=develop  merge_method=ff", out)
             self.assertIn("trunk `develop`: protected, force-push disallowed, "
                           "direct push blocked: ok", out)
-            self.assertEqual(self.argv(), [
+            self.assertEqual(self.report_argv(), [
                 "api", "projects/acme%2Fteam%2Fwidget",
                 "api", "projects/acme%2Fteam%2Fwidget/protected_branches/develop",
                 "api", "projects/acme%2Fteam%2Fwidget/protected_branches/main"])
@@ -10429,10 +10477,6 @@ def run_tests() -> None:
                       % (shlex.quote(log), shlex.quote(self.body_copy)))
             return log
 
-        def argv(self, log: str) -> list:
-            with open(log) as fh:
-                return [ln.rstrip("\n") for ln in fh]
-
         def body_of(self, argv: Sequence[str], flag: str) -> str:
             self.value(argv, flag)                       # the file was named on the command line
             with open(self.body_copy) as fh:
@@ -10440,12 +10484,6 @@ def run_tests() -> None:
 
         GL_FORK = PLATFORM_FORKS["gitlab"]         # see `on_platform`
         GH_FORK = PLATFORM_FORKS["github"]
-
-        def as_gitlab(self):
-            return on_platform("gitlab")
-
-        def as_github(self):
-            return on_platform("github")
 
         def test_sync_mr_runs_glab_with_the_sync_body(self):
             fork = make_fork(self.tmp)
@@ -10456,11 +10494,11 @@ def run_tests() -> None:
             log = self.record("glab")
             name = sync_branch_name()
 
-            with self.as_gitlab():
+            with as_gitlab():
                 code, out, err = run("-C", fork, "sync", "--mr")
             self.assertEqual(code, 0, err + out)
 
-            argv = self.argv(log)
+            argv = lines_of(log)
             self.assertEqual(argv[:2], ["mr", "create"])
             self.assertIn("--remove-source-branch", argv)
             # no terminal answers glab's confirmation under --mr; on the first real fork the
@@ -10492,11 +10530,11 @@ def run_tests() -> None:
             second_clone_commit(self.tmp)
             log = self.record("gh")
 
-            with self.as_github():
+            with as_github():
                 code, out, err = run("-C", fork, "ship", "--mr")
             self.assertEqual(code, 0, err + out)
 
-            argv = self.argv(log)
+            argv = lines_of(log)
             self.assertEqual(argv[:2], ["pr", "create"])
             self.assertNotIn("--yes", argv)      # gh has no such flag; --title/--body-file suffice
             self.assertEqual(self.value(argv, "--repo"), self.GH_FORK)   # fork, not upstream
@@ -10516,7 +10554,7 @@ def run_tests() -> None:
         def test_titles_are_overridden_and_the_command_is_only_printed_without_mr(self):
             fork = make_fork(self.tmp)
             commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
-            with self.as_gitlab():
+            with as_gitlab():
                 code, out, err = run("-C", fork, "sync", "--title", "sync: hand written")
             self.assertEqual(code, 0, err + out)
             self.assertIn("--title 'sync: hand written'", out)
@@ -10527,7 +10565,7 @@ def run_tests() -> None:
             sh("git", "checkout", "-b", "feat/x", "develop", cwd=fork)
             commit_fork(fork, "ours/a.txt", "a\n", "ours: a")
             second_clone_commit(self.tmp)
-            with self.as_github():
+            with as_github():
                 code, out, err = run("-C", fork, "ship", "--title", "ship: hand written")
             self.assertEqual(code, 0, err + out)
             self.assertIn("--title 'ship: hand written'", out)
@@ -10539,7 +10577,7 @@ def run_tests() -> None:
                       'echo "glab: not authenticated" >&2\nexit 1\n')
             name = sync_branch_name()
 
-            with self.as_gitlab():
+            with as_gitlab():
                 code, out, err = run("-C", fork, "sync", "--mr")
             self.assertEqual(code, 0, err + out)
             self.assertIn("FAILED (exit 1) - open it yourself", out)
@@ -10554,7 +10592,7 @@ def run_tests() -> None:
             second_clone_commit(self.tmp)
             absent = ["forkflow-no-such-tool", "pr", "create"]
 
-            with self.as_github(), mock.patch.object(
+            with as_github(), mock.patch.object(
                     sys.modules[__name__], "mr_command", lambda *a: absent):
                 code, out, err = run("-C", fork, "ship", "--mr")
             self.assertEqual(code, 0, err + out)
@@ -10720,7 +10758,8 @@ def run_tests() -> None:
             merging_tool(self.tmp, self.TOOLS[name])
             return name
 
-        def argv(self, platform: str, sub: str) -> list:
+        def tool_argv_for(self, platform: str, sub: str) -> list:
+            """What the merging fake for `platform` recorded for its `create` or `merge`."""
             return tool_argv(self.tmp, self.TOOLS[platform], sub)
 
         def upstream_change(self) -> None:
@@ -10754,8 +10793,8 @@ def run_tests() -> None:
             self.assertNotEqual(shipped, base)
             self.assertEqual(sh("git", "rev-list", "--parents", "-1", shipped,
                                 cwd=fork).split()[1:], [base])
-            self.assertEqual(self.argv("gitlab", "create")[:2], ["mr", "create"])
-            argv = self.argv("gitlab", "merge")
+            self.assertEqual(self.tool_argv_for("gitlab", "create")[:2], ["mr", "create"])
+            argv = self.tool_argv_for("gitlab", "merge")
             self.assertEqual(argv[:3], ["mr", "merge", name])          # by branch, not URL
             self.assertEqual(self.value(argv, "--repo"), PLATFORM_FORKS["gitlab"])
             self.assertEqual(self.value(argv, "--sha"), shipped)       # the pushed head
@@ -10779,7 +10818,7 @@ def run_tests() -> None:
             synced = origin_sha(fork, "develop")                      # fast-forwarded to ...
             self.assertEqual(sh("git", "rev-list", "--parents", "-1", synced, cwd=fork).split(),
                              [synced, base, rev(fork, "upstream/main")])  # ... the sync merge
-            argv = self.argv("gitlab", "merge")
+            argv = self.tool_argv_for("gitlab", "merge")
             self.assertEqual(argv[:3], ["mr", "merge", name])
             self.assertEqual(self.value(argv, "--sha"), synced)
             self.assertEqual(origin_sha(fork, name), "")               # the source is removed
@@ -10795,7 +10834,7 @@ def run_tests() -> None:
                 code, out, err = run("-C", fork, "ship", "--merge")
             self.assertEqual(code, 0, err + out)
             shipped = origin_sha(fork, name)
-            argv = self.argv("github", "merge")
+            argv = self.tool_argv_for("github", "merge")
             self.assertEqual(argv[:3], ["pr", "merge", name])
             self.assertEqual(self.value(argv, "--repo"), PLATFORM_FORKS["github"])
             self.assertEqual(self.value(argv, "--match-head-commit"), shipped)
@@ -10820,7 +10859,7 @@ def run_tests() -> None:
                 code, out, err = run("-C", fork, "sync", "--merge")
             self.assertEqual(code, 0, err + out)
             synced = origin_sha(fork, name)                    # gh deletes no branch
-            argv = self.argv("github", "merge")
+            argv = self.tool_argv_for("github", "merge")
             self.assertEqual(argv[:3], ["pr", "merge", name])
             self.assertEqual(self.value(argv, "--match-head-commit"), synced)
             self.assertIn("--merge", argv)
@@ -10868,7 +10907,8 @@ def run_tests() -> None:
                              ("ship", name, base))
             self.assertEqual(entry["commit"], rev(fork, "refs/heads/" + name))
             self.assertEqual(entry["mr"], MERGING_TOOL_URL[self.TOOLS[platform]])
-            self.assertEqual(self.value(self.argv(platform, "merge"), flag), entry["commit"])
+            self.assertEqual(self.value(self.tool_argv_for(platform, "merge"), flag),
+                             entry["commit"])
             self.assertNotEqual(origin_sha(fork, name), entry["commit"])    # it did move
             self.assertEqual(sh("git", "symbolic-ref", "--short", "HEAD", cwd=fork), name)
 
@@ -10909,9 +10949,10 @@ def run_tests() -> None:
             self.platform("gitlab")
             os.environ["FORKFLOW_FAKE_CREATE"] = "fail"
             entry = self.refused_merge(fork, name, "ship", base, "gitlab")
-            self.assertEqual(self.argv("gitlab", "create")[:2], ["mr", "create"])   # it ran ...
+            # the create ran ...
+            self.assertEqual(self.tool_argv_for("gitlab", "create")[:2], ["mr", "create"])
             self.assertEqual(entry["mr"], "")
-            self.assertEqual(self.argv("gitlab", "merge"), [])          # ... the merge never did
+            self.assertEqual(self.tool_argv_for("gitlab", "merge"), [])   # ... the merge never did
             self.assertEqual(origin_sha(fork, name), entry["commit"])   # pushed all the same
 
         def test_a_merge_request_the_tool_gave_no_url_for_is_exit_6(self):
@@ -10924,7 +10965,7 @@ def run_tests() -> None:
             os.environ["FORKFLOW_FAKE_CREATE"] = "nourl"
             entry = self.refused_merge(fork, name, "ship", base, "gitlab")
             self.assertEqual(entry["mr"], "")
-            self.assertEqual(self.argv("gitlab", "merge"), [])
+            self.assertEqual(self.tool_argv_for("gitlab", "merge"), [])
             self.assertEqual(origin_sha(fork, name), entry["commit"])
 
         def test_a_merge_the_tool_only_queued_is_exit_6_not_merged(self):
@@ -10994,8 +11035,8 @@ def run_tests() -> None:
             with on_platform(self.platform("gitlab")):
                 code, out, err = run("-C", fork, "ship", "--mr")
             self.assertEqual(code, 0, err + out)
-            self.assertEqual(self.argv("gitlab", "create")[:2], ["mr", "create"])
-            self.assertEqual(self.argv("gitlab", "merge"), [])
+            self.assertEqual(self.tool_argv_for("gitlab", "create")[:2], ["mr", "create"])
+            self.assertEqual(self.tool_argv_for("gitlab", "merge"), [])
             self.assertEqual(origin_sha(fork, "develop"), base)
             self.assertEqual(self.pending_of(fork)["mr"], MERGING_TOOL_URL["glab"])
             self.assertEqual(sh("git", "symbolic-ref", "--short", "HEAD", cwd=fork), name)
@@ -11018,8 +11059,8 @@ def run_tests() -> None:
             self.assertIn("would: merge", out)
             self.assertIn("glab mr merge " + name, out)
             self.assertIn("would: land", out)
-            self.assertEqual(self.argv("gitlab", "create"), [])       # neither tool ran
-            self.assertEqual(self.argv("gitlab", "merge"), [])
+            self.assertEqual(self.tool_argv_for("gitlab", "create"), [])       # neither tool ran
+            self.assertEqual(self.tool_argv_for("gitlab", "merge"), [])
             self.assertFalse(os.path.exists(git_path(fork, STATE_FILE)))    # no state at all
             self.assertEqual((origin_sha(fork, "develop"), origin_sha(fork, "main")), before)
             self.assertEqual(self.backup_branch(fork), "")
@@ -11687,7 +11728,8 @@ def run_tests() -> None:
             with on_platform(self.platform("gitlab")):
                 code, out, err = run("-C", fork, "ship", "--merge")
             self.assertEqual(code, 0, err + out)
-            shipped = self.value(self.argv("gitlab", "merge"), "--sha")   # what was pushed
+            # what was pushed
+            shipped = self.value(self.tool_argv_for("gitlab", "merge"), "--sha")
             self.assertEqual(sh("git", "rev-list", "--parents", "-1", shipped,
                                 cwd=fork).split()[1:], [old])
             self.assertIn("(ancestor)", out)
@@ -11715,7 +11757,7 @@ def run_tests() -> None:
                 code, out, err = run("-C", fork, "sync", "--merge")
             self.assertEqual(code, 0, err + out)
             self.assertIn("unless --merge lands it", out)
-            synced = self.value(self.argv("gitlab", "merge"), "--sha")
+            synced = self.value(self.tool_argv_for("gitlab", "merge"), "--sha")
             self.assertEqual(len(sh("git", "rev-list", "--parents", "-1", synced,
                                     cwd=fork).split()), 3)           # the sync's merge commit
             self.assert_landed(fork, name, synced)
@@ -11774,7 +11816,7 @@ def run_tests() -> None:
             with on_platform("gitlab"):
                 code, out, err = run("-C", fork, "sync", "--continue", "--merge")
             self.assertEqual(code, 0, err + out)
-            synced = self.value(self.argv("gitlab", "merge"), "--sha")
+            synced = self.value(self.tool_argv_for("gitlab", "merge"), "--sha")
             self.assertEqual(len(sh("git", "rev-list", "--parents", "-1", synced,
                                     cwd=fork).split()), 3)
             self.assert_landed(fork, name, synced)
@@ -11796,7 +11838,8 @@ def run_tests() -> None:
             with on_platform("gitlab"):
                 code, out, err = run("-C", fork, "ship", "--continue", "--merge")
             self.assertEqual(code, 0, err + out)
-            self.assert_landed(fork, name, self.value(self.argv("gitlab", "merge"), "--sha"))
+            self.assert_landed(fork, name,
+                               self.value(self.tool_argv_for("gitlab", "merge"), "--sha"))
             with open(os.path.join(fork, "shared.tf")) as fh:
                 self.assertIn("count = 4", fh.read())                # the resolution landed
 
@@ -11840,7 +11883,7 @@ def run_tests() -> None:
             self.assertTrue(err.startswith("forkflow: the merge request was merged; "
                                            "the local catch-up did not run: "), err)
             self.assertIn("commits origin lacks", err)
-            shipped = self.value(self.argv("gitlab", "merge"), "--sha")
+            shipped = self.value(self.tool_argv_for("gitlab", "merge"), "--sha")
             self.assertEqual(origin_sha(fork, "develop"), shipped)   # merged ...
             self.assertEqual(rev(fork, "refs/heads/develop"), own)   # ... not landed
             self.assertEqual(sh("git", "symbolic-ref", "--short", "HEAD", cwd=fork), name)
@@ -11895,7 +11938,7 @@ def run_tests() -> None:
             self.assertEqual(checked_out(linked), name)
             entry = self.pending_of(fork)
             self.assertEqual((entry["kind"], entry["branch"]), (kind, name))
-            self.assertEqual(printed(err, "forkflow land"), "forkflow land " + name)
+            self.assertEqual(printed_cmd(err, "forkflow land"), "forkflow land " + name)
             self.assertIn(" in %s," % fork, err)
             self.move_trunk(entry["commit"])
             with on_platform("gitlab"):
@@ -12103,7 +12146,7 @@ def run_tests() -> None:
                 code, out, err = run("-C", w1, "ship", "--merge")
             self.assertTrue(os.path.exists(done))                        # W2 did ship mid-way
             self.assertEqual(code, 0, err + out)
-            shipped = self.value(self.argv("gitlab", "merge"), "--sha")
+            shipped = self.value(self.tool_argv_for("gitlab", "merge"), "--sha")
             self.assertEqual(rev(fork, "refs/heads/develop"), shipped)
             self.assertEqual(checked_out(w1), "develop")
             self.assertEqual(rev(fork, "refs/heads/feat/a"), "")
@@ -12146,7 +12189,7 @@ def run_tests() -> None:
             with on_platform(self.platform("gitlab")):
                 code, out, err = run("-C", fork, "ship", "--merge")
             self.assertEqual(code, 0, err + out)
-            shipped = self.value(self.argv("gitlab", "merge"), "--sha")
+            shipped = self.value(self.tool_argv_for("gitlab", "merge"), "--sha")
             self.assertEqual(rev(fork, "refs/heads/develop"), shipped)
             self.assertEqual(checked_out(fork), "develop")
             self.assertEqual(rev(fork, "refs/heads/" + name), "")
@@ -12290,7 +12333,7 @@ def run_tests() -> None:
             with on_platform("gitlab"):
                 code, out, err = run("-C", fork, *hinted.group(1).split()[1:])
             self.assertEqual(code, 0, err + out)
-            self.assertEqual(self.argv("gitlab", "merge")[:3], ["mr", "merge", name])
+            self.assertEqual(self.tool_argv_for("gitlab", "merge")[:3], ["mr", "merge", name])
             self.assertEqual(origin_sha(fork, "develop"), rev(fork, "refs/heads/develop"))
             self.assertEqual(checked_out(fork), "develop")
             self.assertEqual(self.pending_of(fork), {})
@@ -12309,7 +12352,7 @@ def run_tests() -> None:
                 return run_printed(text, start, fork)
 
         def merged_and_landed(self, fork: str, branch: str) -> None:
-            self.assertEqual(self.argv("gitlab", "merge")[:3], ["mr", "merge", branch])
+            self.assertEqual(self.tool_argv_for("gitlab", "merge")[:3], ["mr", "merge", branch])
             self.assertEqual(origin_sha(fork, "develop"), rev(fork, "refs/heads/develop"))
             self.assertEqual(checked_out(fork), "develop")
             self.assertEqual(self.pending_of(fork, branch), {})
@@ -12606,8 +12649,8 @@ def run_tests() -> None:
 
         def not_merged(self, fork: str, branch: str, turned: str, code: int, out: str) -> None:
             self.assertEqual(code, EXIT_NOT_MERGED, out)
-            self.assertEqual(self.argv("gitlab", "merge"), [])
-            self.assertEqual(self.argv("gitlab", "create")[:2], ["mr", "create"])
+            self.assertEqual(self.tool_argv_for("gitlab", "merge"), [])
+            self.assertEqual(self.tool_argv_for("gitlab", "create")[:2], ["mr", "create"])
             self.assertEqual(origin_sha(fork, "develop"), turned)
             self.assertEqual(origin_sha(fork, branch), rev(fork, "refs/heads/" + branch))
             self.assertEqual(self.pending_of(fork, branch)["commit"],
@@ -12644,15 +12687,9 @@ def run_tests() -> None:
 
         def feature(self, fork: str, name: str = "feat/x", commits: int = 1,
                     push: bool = False) -> str:
-            """One commit of its own file only: `commit_fork` stages everything, which would
-            commit an untracked `.forkflow.toml` and make an "untracked" test a tracked one."""
-            sh("git", "checkout", "-b", name, "develop", cwd=fork)
-            for i in range(commits):
-                path = "ours/f%d.txt" % i
-                write(fork, path, "line %d\n" % i)
-                sh("git", "add", path, cwd=fork)
-                sh("git", "commit", "-q", "-m", "ours: step %d" % i, cwd=fork)
-            return name
+            """Own files only: an untracked `.forkflow.toml` must not be committed by the
+            fixture of a test about the untracked config."""
+            return ShipBase.feature(self, fork, name, commits, push, only_own=True)
 
         def snapshot(self, fork: str) -> tuple:
             """Everything a run could have changed: every ref on origin and in the clone,
@@ -13419,7 +13456,7 @@ def run_tests() -> None:
             name = sync_branch_name()
             self.assertEqual(origin_sha(fork, name), "")
             self.assertFalse(os.path.exists(flag))
-            sh("sh", "-c", printed(err, "git checkout"), cwd=fork)
+            sh("sh", "-c", printed_cmd(err, "git checkout"), cwd=fork)
             with open(os.path.join(fork, CONFIG_FILE)) as fh:
                 self.assertEqual(fh.read(), config)
             code, out, err = run_printed(err, "forkflow sync --continue", fork)
