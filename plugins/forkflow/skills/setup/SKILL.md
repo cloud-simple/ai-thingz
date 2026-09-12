@@ -37,9 +37,10 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before running it.
 
    Every step that would change something is printed as `would:` - the read-only steps (`remote`,
    `fetch`, `names`, `target`, `mirror`, `trunk`, `platform`) print without it; no config, no hook,
-   no template, no branch, no push. (The
-   fetch still runs, and the platform report still runs - every one of its calls is a GET.) A dry
-   run that would have to *add* the remote stops there: there is nothing to preview yet.
+   no template, no branch, no push. (Nothing is fetched either - a fetch writes `FETCH_HEAD`, the
+   remote-tracking refs and objects - so the preview is built from the refs on disk and the
+   `fetch` line says so; the platform report still runs, and every one of its calls is a GET.) A
+   dry run that would have to *add* the remote stops there: there is nothing to preview yet.
 
 3. **Run it.**
 
@@ -95,12 +96,18 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before running it.
    runs.
 
 6. **`.forkflow.toml`.** The template is written commented-out and left **untracked**; tell the
-   user to commit it once the branch names and the `gate` list are right, so everyone in the fork
-   shares them. Reading it needs Python 3.11+ (`tomllib`); a config that is present but unreadable
-   is exit 2 for every subcommand - it carries the safety-critical branch names. Committing it
-   also matters when the upstream project uses forkflow itself: git refuses a merge that would
-   write over an untracked file, so a `sync` bringing upstream's `.forkflow.toml` in stops (exit
-   2, nothing pushed) until the template is committed or removed.
+   user to commit it once the branch names, the `gate` list and `merge` are right, so everyone in
+   the fork shares them - on a branch off `origin/<trunk>`, shipped with `--mr` and merged by
+   hand, never on the trunk or the mirror - `merge = "self"` only if whoever opens this fork's
+   merge requests also merges them (it is what lets `--merge` merge; the default `"manual"`
+   refuses it; it is read from the untracked file until one is committed on the trunk, and from
+   the trunk's after that, in both cases only while those bytes are not a `.forkflow.toml` the
+   original project has). Reading it needs Python 3.11+ (`tomllib`); a config that is present but
+   unreadable is exit 2 for every subcommand - it carries the safety-critical branch names.
+   Committing it also matters when the upstream project uses forkflow itself: git refuses a merge
+   that would write over an untracked file, so a `sync` bringing upstream's `.forkflow.toml` in
+   stops (exit 2, nothing pushed) until the template is committed - never removed: it is this
+   fork's config.
 
 7. **Report** what changed in the clone (push URL, hook, config keys, any branch created), what
    was only reported (the platform findings and their fix commands), and what is left for the

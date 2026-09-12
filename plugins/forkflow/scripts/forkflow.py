@@ -24,8 +24,9 @@ Sequence rule: sync first, then ship; rebase locally, merge globally.
 Usage:
     forkflow.py status [--fetch | --offline] [-C DIR]
     forkflow.py check [-C DIR]
-    forkflow.py sync [--continue] [--mr] [--title T] [-C DIR] [--dry-run] [--force]
-    forkflow.py ship [--continue] [--mr] [--title T] [--message-file F] [-C DIR] [--dry-run] [--force]
+    forkflow.py sync [--continue] [--mr] [--merge] [--title T] [-C DIR] [--dry-run] [--force]
+    forkflow.py ship [--continue] [--mr] [--merge] [--title T] [--message-file F] [-C DIR] [--dry-run] [--force]
+    forkflow.py land [BRANCH] [--force] [-C DIR] [--dry-run]
     forkflow.py setup [--upstream NAME] [--upstream-url URL] [--trunk NAME] [--mirror NAME]
                       [-C DIR] [--dry-run] [--force]
     forkflow.py --test                        # run the embedded test suite
@@ -39,6 +40,8 @@ Exit codes:
     3   invariant checked by `check` (gate command failed, branch not on the trunk's tip)
     4   conflicts - resolve, then rerun with --continue
     5   rewrite safety (backup not confirmed, tree hash mismatch, push rejected)
+    6   merge request not created or not merged (--merge only) - the branch is pushed;
+        merge by hand, then forkflow land
     130 interrupted
 
 `.forkflow.toml` is optional; reading it needs Python 3.11+ (tomllib). A config file that is
@@ -49,10 +52,13 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import errno
+import hashlib
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -61,10 +67,23 @@ import urllib.parse
 from dataclasses import dataclass, field, replace
 from typing import Optional, Sequence, Tuple
 
+# The state file's lock is the operating system's (`lock_exclusive`). Neither module is on
+# every platform, and forkflow refuses to write the state file rather than write it
+# unserialised, so both are optional here and the absence of both is a refusal with a reason.
+try:
+    import fcntl                                  # POSIX
+except ImportError:                               # pragma: no cover - not POSIX
+    fcntl = None
+try:
+    import msvcrt                                 # Windows
+except ImportError:                               # pragma: no cover - not Windows
+    msvcrt = None
+
 CONFIG_FILE = ".forkflow.toml"
 STATE_FILE = "forkflow-state.json"   # in .git: ties a `--continue` run to the backup it belongs to
 HOOK_MARK = "# forkflow pre-push hook"
 DEFAULT_TRUNK = "develop"
+DEFAULT_MIRROR = "main"
 DEFAULT_SYNC_PREFIX = "sync/"
 DEFAULT_BACKUP_PREFIX = "backup/"
 README_POINTER = ("See *Adopting forkflow in an existing fork* in the project README "
@@ -74,8 +93,34 @@ MERGE_TREE_GIT = (2, 38)             # `git merge-tree --write-tree` - older git
 BOTH_SIDES_SNIFF = 8192              # bytes of a blob looked at for a NUL before it is "binary"
 BOTH_SIDES_WIDTH = 48                # column the both-sides table pads paths to
 MAX_SYNC_RERUNS = 100                # `--force` reruns: `<name>-2` .. `<name>-99` before it gives up
+DRY_PREFIX = "would: "               # the marker every line a --dry-run did not run carries
+EXIT_PRECONDITION = 2                # the codes the module docstring's table publishes
+EXIT_CHECK = 3
+EXIT_CONFLICT = 4
+EXIT_UNSAFE = 5
 EXIT_INTERRUPTED = 130               # Ctrl-C, as the module docstring publishes it
+EXIT_NOT_MERGED = 6                  # --merge: the branch is pushed, the merge request is
+                                     # not merged (or not created) - all before it stands
 PUBLISHED_KEEP = 100                 # remembered (branch, commit) pushes - see record_published
+# there is no bound on the remembered upstream `.forkflow.toml` digests, and that is a
+# decision: HOW MANY versions get published is the original project's choice, so any number
+# this refuses on is a number upstream can reach. See remember_upstream_configs
+RENDERED_CONFIGS = "rendered_configs"   # the state key holding the digest of every working-
+                                     # tree config this clone has judged unprovable for a
+                                     # RENDERING reason - see config_rendered_before
+ATTRS_FILE = ".gitattributes"         # the only file in a tree that can render the config
+CONFIG_RENDER_ATTRS = ("filter", "ident",            # the attributes that make the working
+                       "working-tree-encoding")      # tree's config differ from the blob git
+                                     # stores in a way nothing here normalises back - see
+                                     # config_render_unprovable for why `text`, `eol` and
+                                     # `diff` are NOT among them
+STATE_LOCK_WAIT = 5.0                # seconds a run waits for another worktree's state write
+STATE_LOCK_POLL = 0.02               # between tries while it waits
+HELD_ELSEWHERE = frozenset(          # what the lock calls answer with while another run
+    code for code in (getattr(errno, name, None)          # holds it - as against a
+                      for name in ("EACCES", "EAGAIN", "EWOULDBLOCK",  # filesystem that
+                                   "EINTR", "EDEADLK", "EDEADLOCK"))   # cannot lock at all
+    if code is not None)
 
 # The port each scheme reaches without being told: `ssh://host:22/o/r` and `host:o/r` are one
 # repository, and rule 1 is about the repository. Kept in step with `ff_repo_id` in the hook.
@@ -101,13 +146,14 @@ BACKUP_PURPOSE = {
 # --------------------------------------------------------------------------- #
 
 class Fail(Exception):
-    def __init__(self, msg: str, code: int = 2):
+    def __init__(self, msg: str, code: int = EXIT_PRECONDITION):
         super().__init__(msg)
         self.code = code
 
 
 def git(*args: str, cwd: Optional[str] = None, check: bool = True) -> str:
-    """Run git; raise Fail(..., 2) on failure unless check=False (then return "")."""
+    """Run git; raise Fail(..., EXIT_PRECONDITION) on failure unless check=False
+    (then return "")."""
     p = subprocess.run(["git", *args], cwd=cwd, capture_output=True)
     if p.returncode != 0:
         if check:
@@ -120,12 +166,44 @@ def git_ok(*args: str, cwd: Optional[str] = None) -> bool:
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True).returncode == 0
 
 
-def git_rc(*args: str, cwd: Optional[str] = None) -> Tuple[int, str, str]:
-    """(returncode, stdout, stderr) - for every call whose failure has its own exit code."""
-    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True)
+def git_rc(*args: str, cwd: Optional[str] = None,
+           env: Optional[dict] = None) -> Tuple[int, str, str]:
+    """(returncode, stdout, stderr) - for every call whose failure has its own exit code.
+
+    `env` replaces this process's environment for the one call (`merge_tree` sends the
+    objects git writes somewhere other than this repository)."""
+    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, env=env)
     return (p.returncode,
             p.stdout.decode("utf-8", "replace"),
             p.stderr.decode("utf-8", "replace"))
+
+
+def merge_tree(root: str, *args: str) -> Tuple[int, str, str]:
+    """`git merge-tree --write-tree ...` with the objects it writes sent somewhere other
+    than this repository's object database.
+
+    `--write-tree` is the only form modern git offers, and it writes the merged tree and a
+    blob per conflicting file - a real write, inside a `--dry-run` that promises none and
+    inside a `status` that only reports. Nothing needs those objects to survive the call:
+    both callers read stdout and throw the tree away. So they go to a temporary directory
+    (`GIT_OBJECT_DIRECTORY`) with this repository's own object database named as an
+    alternate to read from (`GIT_ALTERNATE_OBJECT_DIRECTORIES` - git follows alternates
+    transitively, so a clone that has its own still resolves everything), and the directory
+    is removed afterwards. The answer is identical to the unredirected call's.
+
+    When git cannot say where the objects live, the call is made as it always was: a
+    simulation that does not run is worse than a few unreachable objects."""
+    real = git_path(root, "objects")
+    if not real:
+        return git_rc("merge-tree", *args, cwd=root)
+    alternates = os.environ.get("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+    env = dict(os.environ, GIT_OBJECT_DIRECTORY=tempfile.mkdtemp(prefix="forkflow-odb-"),
+               GIT_ALTERNATE_OBJECT_DIRECTORIES=(real + os.pathsep + alternates
+                                                 if alternates else real))
+    try:
+        return git_rc("merge-tree", *args, cwd=root, env=env)
+    finally:
+        shutil.rmtree(env["GIT_OBJECT_DIRECTORY"], ignore_errors=True)
 
 
 def shell(cmd: str, cwd: str) -> Tuple[int, str]:
@@ -196,7 +274,13 @@ def short(sha: str) -> str:
 # --------------------------------------------------------------------------- #
 
 CONFIG_STRINGS = ("upstream", "upstream_branch", "mirror", "trunk",
-                  "sync_prefix", "backup_prefix")
+                  "sync_prefix", "backup_prefix", "merge")
+# `merge`: who merges this fork's merge requests. "manual" (the default) means a person does,
+# through the platform; "self" means whoever opened them - the solo fork - and is what lets
+# `sync --merge` / `ship --merge` merge the request they have just opened.
+MERGE_MANUAL = "manual"              # the default: a person merges, through the platform
+MERGE_SELF = "self"                  # whoever opened the request merges it - what --merge needs
+MERGE_MODES = (MERGE_MANUAL, MERGE_SELF)
 
 
 def have_tomllib() -> bool:
@@ -225,7 +309,9 @@ def parse_config(text: str, where: str) -> dict:
             return {}
         raise Fail(f"{where} needs Python 3.11+ (tomllib) to be read; "
                    f"this is Python {sys.version_info[0]}.{sys.version_info[1]}. "
-                   f"Remove the file or run forkflow with a newer Python.")
+                   f"Run forkflow with Python 3.11 or newer, or turn every line of the file "
+                   f"into a `#` comment (a file of comments configures nothing, and its "
+                   f"settings stay there to uncomment later).")
     import tomllib  # Python 3.11+, guarded by have_tomllib() above
     try:
         cfg = tomllib.loads(text)
@@ -240,14 +326,189 @@ def parse_config(text: str, where: str) -> dict:
     if gate is not None and (not isinstance(gate, list)
                              or any(not isinstance(c, str) for c in gate)):
         raise Fail(f"{where}: `gate` must be a list of shell commands")
+    merge = cfg.get("merge")
+    if merge is not None and merge not in MERGE_MODES:
+        raise Fail(f"{where}: `merge` must be "
+                   + " or ".join(f'"{mode}"' for mode in MERGE_MODES)
+                   + f', not "{merge}"')
     return cfg
 
 
+def config_name_in(names: Sequence[str]) -> Optional[str]:
+    """The name among `names` that is `.forkflow.toml` under some spelling of its case:
+    the exact name when it is there, else the first variant, else None."""
+    if CONFIG_FILE in names:
+        return CONFIG_FILE
+    variants = sorted(n for n in names if n.casefold() == CONFIG_FILE.casefold())
+    return variants[0] if variants else None
+
+
+def tracked_config_names(root: str) -> list:
+    """Every path in the index that is `.forkflow.toml` under some case of its name (each
+    stage of an unmerged one once). Every tracked path is read and case-folded, rather
+    than asked for with `:(icase)`, which matches ASCII case only."""
+    rc, out, _ = git_rc("ls-files", "-z", cwd=root)
+    fold = CONFIG_FILE.casefold()
+    return sorted({p for p in out.split("\0") if p and p.casefold() == fold}) if rc == 0 else []
+
+
+def remote_trunk(root: str) -> str:
+    """The trunk's name where the config cannot be read to say it: origin's default branch
+    (`origin/HEAD` - `setup`'s report insists it is the trunk), else the default name."""
+    head = git("symbolic-ref", "-q", "refs/remotes/origin/HEAD", cwd=root, check=False)
+    prefix = "refs/remotes/origin/"
+    return head[len(prefix):] if head.startswith(prefix) else DEFAULT_TRUNK
+
+
+def upstream_branch_names(root: str) -> set:
+    """The branch names the original project's remotes have here: `upstream/main` gives
+    `main`. A local branch of that name is this fork's mirror - `setup` bootstraps it by
+    that name - and the config that would say which branch the mirror is is the file that
+    cannot be read when this is asked. A mirror under a name upstream does not use is not
+    recognised here; the pre-push hook and `status` are what catch a commit on it."""
+    names = set()
+    out = git("for-each-ref", "--format=%(refname)", "refs/remotes/", cwd=root, check=False)
+    for ref in out.splitlines():
+        parts = ref.split("/", 4)                     # refs/remotes/<remote>/<branch...>
+        if len(parts) >= 4 and parts[2] != "origin" and parts[3] != "HEAD":
+            names.add("/".join(parts[3:]))
+    return names
+
+
+def no_commit_here(root: str, trunk: str) -> str:
+    """Why nothing may be committed on the checked-out branch, "" when something may.
+
+    Rules 2 and 6, and nothing besides: the trunk, by the name origin gives it and by the
+    default, and the mirror, by its name (`upstream_branch_names`, and the default). A
+    branch mistaken for one of those gets an explanation and no command, the safe
+    direction; the one miss is a trunk or a mirror under a name nothing here gives.
+
+    It used to answer for any branch contained in a remote-tracking ref that is not
+    origin's - "carries nothing but upstream's commits". On a fresh fork every branch is
+    still at upstream's tip, so `forkflow setup` - the first command a fork runs - and the
+    branch this refusal sends the user to both hit that clause, and nothing anywhere named
+    a fix: a dead end out of which only an unrelated commit led. Committing on a branch of
+    one's own is what the workflow is for. Whose a FILE is, which that clause was also
+    standing in for, is `config_is_upstreams`'s question, and its bytes answer it."""
+    branch = git("symbolic-ref", "-q", "--short", "HEAD", cwd=root, check=False)
+    if not branch:
+        return "HEAD is detached"
+    if branch == trunk:
+        return f"`{branch}` is origin's default branch"
+    if branch == DEFAULT_TRUNK:
+        return f"`{branch}` is the trunk"
+    if branch == DEFAULT_MIRROR or branch in upstream_branch_names(root):
+        return f"`{branch}` is the mirror of the original project"
+    return ""
+
+
+def keep_aside(root: str, name: str) -> Tuple[str, str]:
+    """(a printable command that copies the working file `name` aside, the path it copies
+    it to) - the one place in this script that builds a copy for a user to run.
+
+    Every remedy that overwrites, moves or deletes a working file begins with this, because
+    a printed command is followed to the letter and the file may hold an edit of the user's
+    that nothing else has. `test ! -e` makes a second run of the same line stop before it
+    could copy a restored file over the saved one, and the timestamp keeps two runs in one
+    second apart from... nothing, which is what `test ! -e` is there for.
+
+    The destination is ALWAYS inside the git directory, and that is the point of having one
+    owner: a remedy must never produce `.forkflow.toml` bytes. Twice now a remedy has ended
+    by copying something back INTO the config's path - the contents a symlink read as, and
+    a file git's own conversion had rewritten - and each time the bytes that landed there
+    were bytes no `.forkflow.toml` blob ever held, so they read as this fork's own and
+    opened `--merge` on the original project's settings. What a remedy may do is take the
+    obstacle away and name where the old file went. What comes back is the user's to write.
+    `test_every_copy_a_remedy_prints_is_built_here` pins both halves."""
+    keep = git_path(root, f"forkflow-config-{utc_stamp('%Y%m%d-%H%M%S')}.toml")
+    return (f"test ! -e {sh_arg(keep)} && cp -p -- {sh_arg(name)} {sh_arg(keep)}", keep)
+
+
+def variant_remedy(root: str, found: str) -> str:
+    """The way from `found`, a case variant of the config, to `.forkflow.toml` that loses
+    nothing - the second half of `load_config`'s refusal. Every printed command is followed
+    to the letter, so each one obeys three rules:
+
+    - it copies the working file aside FIRST (`keep_aside`), to a new path in the git
+      directory it names, whenever it overwrites, moves or deletes the file. On a
+      case-insensitive filesystem
+      the variant and `.forkflow.toml` are ONE file on disk, and the user may have edited it
+      - the outer messages used to invite that. `test ! -e` makes a second run of the same
+      line stop before it could copy the restored file over the saved one;
+    - it never commits on the trunk or the mirror: there the answer is an explanation and
+      no command (`no_commit_here`) - the fix is a branch off `origin/<trunk>`, shipped;
+    - nothing that git refuses and then suggests `-f` for: the index entries go with
+      `update-index --force-remove`, which touches no file and does not refuse in the middle
+      of a merge the way `git rm --cached` does.
+
+    By what git holds, not by the name:
+
+    - git holds no config under any case - untracked, this clone's own file: renamed to the
+      exact name (no commit, on any branch);
+    - `.forkflow.toml` is in HEAD - a sync brought upstream's variant in beside the fork's
+      own, or the file was renamed on disk: both names leave the index and the fork's copy
+      comes back from HEAD (with the index entry gone, checkout writes the file anew - under
+      the exact name - even when the bytes are the same);
+    - only a variant is tracked: `git mv` gives it the exact name, its content kept."""
+    tracked = tracked_config_names(root)
+    variants = [p for p in tracked if p != CONFIG_FILE]
+    rc, out, _ = git_rc("ls-tree", "-z", "--name-only", "HEAD", cwd=root)
+    in_head = config_name_in(out.split("\0")) if rc == 0 else None
+    save, keep = keep_aside(root, found)
+    kept = f"; the file as it is now is copied to `{keep}` first"
+    merging = merge_in_progress(root)               # its file may be upstream's
+    if not tracked and in_head is None and not merging:
+        return (f"git holds no `{CONFIG_FILE}` under any case here, so it is this clone's own: "
+                f"`{save} && mv -- {sh_arg(found)} {CONFIG_FILE}` gives it the exact name{kept}")
+    trunk = remote_trunk(root)
+    why = no_commit_here(root, trunk)
+    if why:
+        return (f"{why}, and nothing is committed on it: run forkflow on a branch off "
+                f"`origin/{trunk}` instead - if this refusal comes there too, commit the fix "
+                f"it names on that branch and ship it")
+    again = "then commit, and run the forkflow command again"
+    if in_head == CONFIG_FILE:
+        names = " ".join(sh_arg(p) for p in variants + [CONFIG_FILE])
+        return (f"This fork's own `{CONFIG_FILE}` is in HEAD: `{save} && git update-index "
+                f"--force-remove -- {names} && git checkout HEAD -- {CONFIG_FILE}` puts it "
+                f"back from there through the index{kept} - carry anything of yours over from "
+                f"that copy - {again}. Do not `rm`, `git rm` or rename `{found}`: on a "
+                f"case-insensitive filesystem it is the same file as `{CONFIG_FILE}`")
+    if variants:
+        return (f"`{save} && git mv -- {sh_arg(variants[0])} {CONFIG_FILE}` gives it the exact "
+                f"name, its content kept{kept} - {again}. If a sync brought it in, renaming "
+                f"it does not make it yours: that sync still treats it as upstream's - its "
+                f"`gate` is shown rather than run - and `--merge` is refused while the file "
+                f"is upstream's byte for byte, until you edit it yourself")
+    return ("No command is safe to name for what git holds of it here - a change staged by "
+            "hand, or a merge in progress whose copy is out of the index; `git status` shows "
+            "which")
+
+
 def load_config(root: str) -> dict:
-    """{} when absent. A config that is there but cannot be read is a hard failure."""
-    path = os.path.join(root, CONFIG_FILE)
-    if not os.path.exists(path):
+    """{} when absent. A config that is there but cannot be read is a hard failure.
+
+    Read only from a file listed under exactly its own name. On a case-insensitive
+    filesystem (the macOS and Windows default) opening `.forkflow.toml` opens a
+    `.ForkFlow.toml` just as well, while git matches paths case-exactly: `git show
+    <rev>:.forkflow.toml` and `ls-files` find nothing, so every check of what a sync merge
+    brought in reads "no config on either side" - and `gate`, arbitrary shell, came from
+    upstream. A case variant is refused rather than read or ignored: ignoring it would still
+    leave the file every tool but this one opens as the config."""
+    try:
+        names = os.listdir(root)
+    except OSError as exc:
+        raise Fail(f"{root} cannot be listed to look for {CONFIG_FILE}: {exc}")
+    found = config_name_in(names)
+    if found is None:
         return {}
+    if found != CONFIG_FILE:
+        raise Fail(f"`{found}` is not `{CONFIG_FILE}`: the names differ only in case, and "
+                   f"forkflow reads its config only from a file named exactly "
+                   f"`{CONFIG_FILE}` - on a case-insensitive filesystem that one name opens "
+                   f"both, while git tells them apart, so no check could see what it holds. "
+                   f"{variant_remedy(root, found)}", 2)
+    path = os.path.join(root, CONFIG_FILE)
     try:
         with open(path, "r", encoding="utf-8") as fh:
             text = fh.read()
@@ -291,11 +552,12 @@ class Ctx:
     upstream_url: str = ""
     upstream_branch: str = "main"
     trunk: str = DEFAULT_TRUNK
-    mirror: str = "main"
+    mirror: str = DEFAULT_MIRROR
     platform: str = "unknown"
     dry_run: bool = False
     sync_prefix: str = DEFAULT_SYNC_PREFIX
     backup_prefix: str = DEFAULT_BACKUP_PREFIX
+    # no `merge` here: the working tree's config is not where it is read - `fork_merge_mode`
 
     def up(self) -> str:
         return f"{self.upstream}/{self.upstream_branch}"
@@ -608,43 +870,264 @@ def resolve_ctx(cwd: str, args: Optional[argparse.Namespace] = None, need_upstre
 # so `sync` and `ship` record theirs here and `--continue` reads it back.
 # --------------------------------------------------------------------------- #
 
-def state_path(ctx: Ctx) -> str:
-    return git_path(ctx.root, STATE_FILE)
+# What a run of *this worktree* may resume (`sync`, `ship`) and what it published is kept per
+# worktree, beside its HEAD. What is waiting to land is not: a ship made in a linked worktree
+# lands where the trunk is checked out, which is usually the main one - so `pending` lives in
+# the git directory every worktree of the clone shares, and `land` and `status` see it from any.
+# It is a map keyed by branch: worktrees ship different branches at the same time, and one
+# record for the clone let each ship overwrite the other's (`record_pending`)
+SHARED_STATE = ("pending",)
 
 
-def read_state(ctx: Ctx) -> dict:
-    path = state_path(ctx)
-    if not path or not os.path.exists(path):
-        return {}
+def state_path(ctx: Ctx, shared: bool = False) -> str:
+    """The state file of this worktree, or with `shared` the one all its worktrees share
+    (`--git-common-dir`; the same file as the main worktree's own)."""
+    if not shared:
+        return git_path(ctx.root, STATE_FILE)
+    common = git("rev-parse", "--git-common-dir", cwd=ctx.root, check=False)
+    if not common:
+        return ""
+    return os.path.join(common if os.path.isabs(common) else os.path.join(ctx.root, common),
+                        STATE_FILE)
+
+
+def load_state(ctx: Ctx, shared: bool = False) -> Tuple[dict, str]:
+    """(what the state file holds, "") - or ({}, why it cannot be read at all).
+
+    The one parser, because "this file says nothing" and "this file cannot be read" are two
+    different facts and the difference decides things. An unparseable file used to answer
+    `{}` here and nowhere else, so a truncated write, a full disk or a hand edit was
+    indistinguishable from a clone that had never recorded anything: `upstream_configs` -
+    which is the only thing standing between a version upstream has withdrawn and the
+    `--merge` gate - was simply forgotten, in silence, and the next write put the file back
+    with one key in it so the record was gone for good (scratchpad `f10/repro15.py`).
+
+    So the two facts are told apart here and each caller decides what it costs.
+    `read_state` keeps the tolerant answer, because a command that does not depend on the
+    memory has no business failing over it; `change_state` will not write over a file it
+    cannot read, and `config_memory_unprovable` refuses `--merge`."""
+    path = state_path(ctx, shared)
+    if not path:
+        return ({}, f"git could not say where `{STATE_FILE}` lives")
+    if not os.path.exists(path):
+        return ({}, "")                    # never written here: no record to have lost
     try:
         with open(path, "r") as fh:
             data = json.load(fh)
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    except OSError as exc:
+        return ({}, f"`{path}` cannot be read ({exc.strerror or exc})")
+    except ValueError as exc:
+        return ({}, f"`{path}` is not the JSON object forkflow writes there ({exc})")
+    if not isinstance(data, dict):
+        return ({}, f"`{path}` holds a JSON {type(data).__name__} where forkflow writes an "
+                    f"object")
+    return (data, "")
 
 
-def save_state(ctx: Ctx, data: dict) -> None:
-    path = state_path(ctx)
+def read_state(ctx: Ctx, shared: bool = False) -> dict:
+    """What the state file holds, {} when it holds nothing this tool can read. Deliberately
+    tolerant: see `load_state`, and `state_unreadable` for the other half of the answer."""
+    return load_state(ctx, shared)[0]
+
+
+def state_unreadable(ctx: Ctx, shared: bool = False) -> str:
+    """Why the state file cannot be read, "" when it can be (or is not there at all)."""
+    return load_state(ctx, shared)[1]
+
+
+def save_state(ctx: Ctx, data: dict, shared: bool = False) -> str:
+    """Write `data`, and answer "" - or why it could not be written.
+
+    Written to a temporary file beside it and renamed over it: an interrupted write leaves
+    the old file whole, where writing in place left a truncated one that reads back as {}
+    and loses every record in it.
+
+    A failure used to be swallowed here, which made a state file that cannot be written -
+    a read-only git directory, a full disk, a `forkflow-state.json` that is not a file -
+    invisible: the run went on to report a branch as landable with no record of it
+    anywhere. Nothing here decides what that costs; each caller says what was lost."""
+    path = state_path(ctx, shared)
     if not path:
-        return
+        return f"git could not say where `{STATE_FILE}` lives"
+    tmp = f"{path}.{os.getpid()}.tmp"
     try:
-        with open(path, "w") as fh:
+        with open(tmp, "w") as fh:
             json.dump(data, fh, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+        return ""
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return f"{path}: {exc.strerror or exc}"
+
+
+class StateLocked(OSError):
+    """No lock on the state file: another run held it for longer than forkflow waits, or
+    this platform has no lock to take."""
+
+
+def state_lock_path(path: str) -> str:
+    return path + ".lock"
+
+
+def lock_exclusive(fd: int) -> bool:
+    """Take the operating system's exclusive lock on `fd` without waiting for it: True when
+    this run holds it, False while another run does, StateLocked when none can be taken here.
+
+    The KERNEL owns the lock, and that is the whole point of it. The lock belongs to the
+    open file description rather than to the pathname or to a record written in a file, so
+    it is released when this process exits or is KILLED. There is no staleness to judge, no
+    lock to steal, and no way for one run to release what another holds.
+
+    What this replaced created the lock file exclusively, called one older than ten minutes
+    the leftover of a run that had died, and unlinked it. Two reviews in a row found races
+    in that judgement and the third named the reason there will always be one: a stat and
+    an unlink are two statements about two different files, so the unlink lands on whatever
+    the path names by the time it runs - which can be the lock a third run has just taken.
+    No extra check fixes that, because the check is the thing that cannot be made atomic.
+
+    `fcntl.flock` on POSIX and `msvcrt.locking` on Windows, both standard library, both
+    released by the operating system when the holder goes. A platform with neither gets a
+    refusal and a plain reason, never an unserialised write.
+
+    On a NETWORK filesystem - NFS, SMB, some container overlays - neither call is dependable:
+    it may be a silent no-op, it may fail outright, or it may serialise only the runs on one
+    mount. forkflow builds no fallback for that, because every fallback is another staleness
+    judgement: a lock that cannot be taken is a refusal that says so, and a clone on such a
+    mount wants one forkflow at a time."""
+    if fcntl is not None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError as exc:
+            if exc.errno in HELD_ELSEWHERE:
+                return False
+            raise StateLocked(unlockable(exc))
+    if msvcrt is not None:
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError as exc:
+            if exc.errno in HELD_ELSEWHERE:
+                return False
+            raise StateLocked(unlockable(exc))
+    raise StateLocked(f"this Python has neither `fcntl` nor `msvcrt`, so `{STATE_FILE}` "
+                      f"cannot be locked and two forkflow runs writing it at once would "
+                      f"lose each other's records; nothing was written. Run forkflow on a "
+                      f"Python that has one of them - every supported platform ships one")
+
+
+def unlockable(exc: OSError) -> str:
+    """Why a lock the operating system was asked for could not be taken at all - a
+    filesystem that does not implement it (a network mount, an exotic overlay), never
+    another run holding it."""
+    return (f"this filesystem will not lock `{STATE_FILE}` ({exc.strerror or exc}), so two "
+            f"forkflow runs writing it at once cannot be kept apart; nothing was written. "
+            f"Run one forkflow at a time, or keep the clone where the operating system "
+            f"locks files")
+
+
+def take_state_lock(path: str) -> int:
+    """Hold the lock for `path` until `drop_state_lock` closes what this returns, waiting
+    up to `STATE_LOCK_WAIT` for whoever holds it; raise StateLocked when the wait runs out.
+
+    The lock file is created when it is not there and is NEVER removed: what keeps two runs
+    apart is the kernel's lock on the open descriptor and not the file's existence, so all
+    a finished run leaves behind is an empty file in the git directory that nobody holds.
+    Removing it is what the design before this one did, and removing it is exactly how one
+    run came to release another's lock.
+
+    A run that cannot get the lock writes NOTHING - `change_state` answers with this
+    failure and never falls through to the write."""
+    lock = state_lock_path(path)
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        raise StateLocked(f"{lock}: {exc.strerror or exc}")
+    deadline = time.monotonic() + STATE_LOCK_WAIT
+    while True:
+        try:
+            got = lock_exclusive(fd)
+        except StateLocked:
+            os.close(fd)
+            raise
+        if got:
+            return fd
+        if time.monotonic() >= deadline:
+            os.close(fd)
+            raise StateLocked(f"{lock} is held by another forkflow run (waited "
+                              f"{STATE_LOCK_WAIT:g}s); let that run finish and try again. "
+                              f"The lock is the operating system's, on that open file, and "
+                              f"it is released the moment the run holding it ends - even if "
+                              f"that run is killed - so there is never one left over for you "
+                              f"to clear away")
+        time.sleep(STATE_LOCK_POLL)
+
+
+def drop_state_lock(fd: int) -> None:
+    """Let go of what `take_state_lock` returned: closing the descriptor is what releases
+    the kernel's lock. The file itself stays, and is meant to."""
+    try:
+        os.close(fd)
     except OSError:
-        pass                    # a restore point that cannot be recorded is still a restore point
+        pass
 
 
-def write_state(ctx: Ctx, reason: str, entry: Optional[dict]) -> None:
-    """Record (or, with entry=None, forget) what a `--continue` of this kind may resume."""
+def change_state(ctx: Ctx, shared: bool, change) -> str:
+    """Read the state file, let `change` edit what it holds, write it back - all while
+    holding that file's lock. Answers "" when it was written, else why it was not.
+
+    The one writer, because read-modify-write is what every record here is: `os.replace`
+    makes each write whole for a READER, and does nothing about the window between a
+    caller's read and its own write. Two worktrees shipping at the same time both read the
+    `pending` map, each adds its branch, and the second write puts the map back as the
+    first found it - eight concurrent ships left ONE record, every time, and the ships
+    whose records went are landable by nothing the tool offers. The same window let a land
+    clearing its own record write back a map from before another worktree's ship.
+
+    A file that cannot be READ is not written over. Read-modify-write on an unparseable
+    file is read-as-{}-and-replace: one key goes in and every record that was in there -
+    including what this clone had written down of the original project's configs, which is
+    the whole defence against a withdrawn version - is gone, with nothing said. So this
+    answers with the reason instead, the callers say what was lost the way they already do
+    for a disk that is full, and `config_memory_unprovable` refuses `--merge` until the
+    user deals with the file. Nothing here deletes it: what is in it is the user's."""
+    path = state_path(ctx, shared)
+    if not path:
+        return f"git could not say where `{STATE_FILE}` lives"
+    try:
+        fd = take_state_lock(path)
+    except OSError as exc:
+        return str(exc)
+    try:
+        data, why = load_state(ctx, shared)
+        if why:
+            return (f"{why}, and writing over it would lose whatever is in there for good; "
+                    f"nothing was written. Look at that file - and if you accept losing "
+                    f"every record in it, including which `{CONFIG_FILE}`s the original "
+                    f"project has had, delete it")
+        change(data)
+        return save_state(ctx, data, shared)
+    finally:
+        drop_state_lock(fd)
+
+
+def write_state(ctx: Ctx, reason: str, entry: Optional[dict]) -> str:
+    """Record (or, with entry=None, forget) what a `--continue` of this kind may resume -
+    or, for a `SHARED_STATE` reason, what every worktree of the clone has to see. Answers
+    "" when it was written, else why it was not."""
     if ctx.dry_run:
-        return
-    data = read_state(ctx)
-    if entry is None:
-        data.pop(reason, None)
-    else:
-        data[reason] = entry
-    save_state(ctx, data)
+        return ""
+
+    def change(data: dict) -> None:
+        if entry is None:
+            data.pop(reason, None)
+        else:
+            data[reason] = entry
+
+    return change_state(ctx, reason in SHARED_STATE, change)
 
 
 def record_published(ctx: Ctx, branch: str, commit: str) -> None:
@@ -657,16 +1140,23 @@ def record_published(ctx: Ctx, branch: str, commit: str) -> None:
 
     Backups are left out - they are written once and never rewritten, so nothing ever has to
     prove one is ours - and the list keeps only the newest `PUBLISHED_KEEP` entries, so the
-    state file cannot grow without bound."""
+    state file cannot grow without bound.
+
+    A failure to write is not reported: the cost of forgetting a push is that a later ship
+    of the same branch refuses to force-push over it (exit 5, with the backup route), which
+    is the safe direction, and every caller here is in the middle of a push whose own
+    result is what the run is about."""
     if ctx.dry_run or not commit or branch.startswith(ctx.backup_prefix):
         return
-    data = read_state(ctx)
-    entries = data.get("published")
-    kept = [e for e in (entries if isinstance(entries, list) else [])
-            if isinstance(e, list) and len(e) == 2 and e != [branch, commit]]
-    kept.append([branch, commit])
-    data["published"] = kept[-PUBLISHED_KEEP:]
-    save_state(ctx, data)
+
+    def change(data: dict) -> None:
+        entries = data.get("published")
+        kept = [e for e in (entries if isinstance(entries, list) else [])
+                if isinstance(e, list) and len(e) == 2 and e != [branch, commit]]
+        kept.append([branch, commit])
+        data["published"] = kept[-PUBLISHED_KEEP:]
+
+    change_state(ctx, False, change)
 
 
 def published_here(ctx: Ctx, branch: str, commit: str) -> bool:
@@ -681,6 +1171,144 @@ def resumable(ctx: Ctx, reason: str, branch: str) -> dict:
     if isinstance(entry, dict) and entry.get("branch") == branch:
         return entry
     return {}
+
+
+PENDING_FIELDS = ("kind", "branch", "commit", "base")   # what `land` needs; `mr` is display
+
+
+def pending_shape(entry: object) -> bool:
+    """True for exactly the shape `record_pending` writes (`mr` may be absent)."""
+    return (isinstance(entry, dict)
+            and all(isinstance(entry.get(k), str) for k in PENDING_FIELDS)
+            and isinstance(entry.get("mr", ""), str))
+
+
+def pending_map(raw: object) -> dict:
+    """{branch: entry} from what the state file holds under `pending`.
+
+    Only entries of the written shape, each under its own branch's name: a state file edited
+    by hand is no state rather than a crash - the same defensive read as `resumable`. The
+    single bare entry an earlier build kept reads as a map of one, so a user who upgrades
+    between a ship and its landing keeps the record."""
+    if pending_shape(raw):
+        return {raw["branch"]: raw}
+    if not isinstance(raw, dict):
+        return {}
+    return {b: e for b, e in raw.items() if pending_shape(e) and e["branch"] == b}
+
+
+def record_pending(ctx: Ctx, kind: str, branch: str, base: str, url: str = "") -> dict:
+    """What is waiting to land, for `land` and `status`: the tip this run pushed on `branch`
+    and the `origin/<trunk>` it was built on, with the merge request's URL once known.
+    Returns the entry, which is what `--merge` lands - not whatever the file holds by then.
+
+    Written right after the push succeeds and before the merge request step, so a merge
+    request that fails to open still leaves a landable record, then rewritten with the URL.
+    One entry per branch, in the state file every worktree shares: a second ship of the same
+    branch replaces its entry, and ships of other branches - from other worktrees, at the
+    same time - keep theirs. Read, changed and written back under the file's lock
+    (`change_state`), so what another worktree records in between is kept rather than
+    written back over. A dry run writes nothing.
+
+    Nothing is said here about a write that failed: `report_pending` reads the file back
+    once, after the merge request step, and says what stands and what to run."""
+    entry = {"kind": kind, "branch": branch, "commit": rev(ctx.root, f"refs/heads/{branch}"),
+             "base": base, "mr": url}
+
+    def change(data: dict) -> None:
+        entries = pending_map(data.get("pending"))
+        entries[branch] = entry
+        data["pending"] = entries
+
+    if not ctx.dry_run:
+        change_state(ctx, True, change)
+    return entry
+
+
+def forget_pending(ctx: Ctx, entry: dict) -> bool:
+    """Clear `entry` once it has landed - only while the record under its branch is still
+    that one (the same branch and commit), read under the lock that the write then happens
+    under (`change_state`): another worktree may have shipped the branch again since, or
+    recorded a ship of its own, and neither is this run's to erase. False when another
+    record stands there now (or in a dry run); True when it was cleared, or there was
+    nothing under the branch to clear."""
+    if ctx.dry_run:
+        return False
+    cleared = [True]
+
+    def change(data: dict) -> None:
+        entries = pending_map(data.get("pending"))
+        now = entries.get(entry["branch"])
+        if not now:
+            return                                   # nothing of this branch's to clear
+        if now["commit"] != entry["commit"]:
+            cleared[0] = False                       # a newer ship of the same branch
+            return
+        del entries[entry["branch"]]
+        if entries:
+            data["pending"] = entries
+        else:
+            data.pop("pending", None)
+
+    change_state(ctx, True, change)
+    return cleared[0]
+
+
+def pending_entries(ctx: Ctx) -> dict:
+    """Every recorded `pending` entry, {branch: entry} ({} when there is none). Read from
+    the state every worktree shares (`SHARED_STATE`), so it is the same whichever asks."""
+    return pending_map(read_state(ctx, shared=True).get("pending"))
+
+
+def resume_unrecorded(ctx: Ctx, kind: str, why: str, backup_ref: str) -> None:
+    """Say so when the record that ties a `--continue` to this run's backup could not be
+    written. Nothing is undone by it: the backup is on origin under the name printed here,
+    and this run goes on. What is lost is only the resume - `ship --continue` refuses
+    without it, and names the command to run instead."""
+    if not why:
+        return
+    print(f"  WARNING: this run's `{kind}` resume record could not be written ({why}) - if "
+          f"this run stops on conflicts, resuming it with `--continue` will refuse and name "
+          f"the command to run in its place. The backup `{backup_ref}` is on "
+          f"`{ctx.origin}` either way.")
+
+
+def report_pending(ctx: Ctx, entry: dict, url: str) -> bool:
+    """True when the shared file holds this run's record; otherwise say so, and say what
+    to run instead of `forkflow land`.
+
+    The record is read back rather than trusted. A state file that could not be written was
+    silent, so a run whose push and merge request had both succeeded went on to print
+    "after the MR is merged, next: forkflow land" about a record that does not exist, and
+    `land` then answered "nothing pending" about a branch that is pushed with its request
+    open. A record another run replaced in the meantime is the same fact for this run.
+
+    Never fatal, and it undoes nothing: the push and the merge request have happened, and
+    what is needed is the truth about them and a way to finish by hand. The commands are
+    the ones `land` would have run - a fetch, a fast-forward of the LOCAL trunk onto what
+    origin has, and the branch deleted only once `-d` can see it is merged. Nothing here
+    commits, force-pushes or touches the trunk on origin.
+
+    `git checkout`, not the `switch` spelling: this project's floor is git 2.20 (README
+    *forkflow*), `switch` arrived in 2.23, and every command printed here is followed to
+    the letter - one that a supported git answers "unknown command" to is a dead end in the
+    middle of a recovery. `TestSourceInvariants` holds the whole script to that floor."""
+    branch = entry["branch"]
+    if ctx.dry_run or pending_entries(ctx).get(branch) == entry:
+        return True
+    where = (f"its merge request is open ({url})" if url
+             else "no merge request was opened by this run")
+    print(f"  WARNING: `{branch}` is pushed at {short(entry['commit'])} and {where}, "
+          f"but forkflow could not record that: "
+          f"`{state_path(ctx, shared=True) or STATE_FILE}` holds no such entry, so "
+          f"`{land_cmd()}` will answer \"nothing pending\" for it.")
+    print(f"    Nothing is lost - the branch and the request are as this run left them. "
+          f"Once the request is merged, finish it by hand:")
+    print(f"      git fetch {sh_arg(ctx.origin)}")
+    print(f"      git checkout {sh_arg(ctx.trunk)}")
+    print(f"      git merge --ff-only {sh_arg(ctx.origin + '/' + ctx.trunk)}")
+    print(f"      git branch -d {sh_arg(branch)}   # refuses while it is not on the trunk")
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -722,7 +1350,7 @@ def name_status(ctx: Ctx, *args: str) -> list:
 
 
 def step(label: str, cmd: str, result: str, dry: bool = False) -> None:
-    prefix = "  would: " if dry else "  "
+    prefix = f"  {DRY_PREFIX}" if dry else "  "
     print(f"{prefix}{label}  $ {cmd}  -> {result}")
 
 
@@ -767,13 +1395,13 @@ def upstream_tracked(ctx: Ctx, files: Sequence[str]) -> list:
 
 def divergence(ctx: Ctx) -> Tuple[Optional[int], Optional[int]]:
     """(files changed on origin/<trunk> since it left upstream, how many are upstream-tracked)."""
-    trunk_ref = f"{ctx.origin}/{ctx.trunk}"
-    if not rev(ctx.root, trunk_ref) or not rev(ctx.root, ctx.up()):
+    trunk_name = f"{ctx.origin}/{ctx.trunk}"
+    if not rev(ctx.root, trunk_name) or not rev(ctx.root, ctx.up()):
         return (None, None)
-    mb = git("merge-base", ctx.up(), trunk_ref, cwd=ctx.root, check=False)
+    mb = git("merge-base", ctx.up(), trunk_name, cwd=ctx.root, check=False)
     if not mb:
         return (None, None)
-    files = diff_names(ctx, mb, trunk_ref)
+    files = diff_names(ctx, mb, trunk_name)
     return (len(files), len(upstream_tracked(ctx, files)))
 
 
@@ -968,26 +1596,83 @@ def header(ctx: Ctx, sub: str, server: Optional[str] = None) -> None:
         print(f"  divergence: {n_files} files, {n_tracked} upstream-tracked")
 
 
+def fetch_preview(ctx: Ctx, remotes: Sequence[str],
+                  refs: Sequence[str]) -> Tuple[int, str, str, str, list]:
+    """What a fetch would have found, for a `--dry-run` that must write nothing.
+
+    The fifth field is the refs the server has MOVED PAST - the ones this run would have
+    fetched and did not. A caller that then CONCLUDES something from a ref on that list is
+    concluding it from bytes it already knows are out of date, which is what the "already
+    in sync" answer did (`cmd_sync`). The refs NOT on it are the same here as on the
+    server, so what is read off one of those is as true as a fetch would have made it -
+    which is why this is a list of refs and not one flag for the whole preview.
+
+    `git ls-remote` asks the same server over the same transport in one round trip and
+    writes nothing at all - no `FETCH_HEAD`, no remote-tracking ref, no object - so each
+    named ref can be reported as it is HERE and as it is on the remote. What the rest of the
+    run then reasons from is the refs on disk, unchanged, which is why the line says so
+    rather than reading like a fetch that happened. With no ref named there is nothing to
+    compare, so nothing is asked of the network either.
+
+    A failure to reach the remote is the caller's to handle exactly as a failed fetch is:
+    the dry run of a command that could not have run is not a dry run that passed."""
+    shown, moved, stale = [], [], []
+    for ref in refs:
+        remote, _, branch = ref.partition("/")     # the callers name `<remote>/<branch>`
+        if not branch or remote not in remotes:
+            continue
+        cmd = f"git ls-remote {sh_arg(remote)} {sh_arg('refs/heads/' + branch)}"
+        shown.append(cmd)
+        rc, out, err = git_rc("ls-remote", remote, "refs/heads/" + branch, cwd=ctx.root)
+        if rc != 0:
+            return (rc, cmd, "", err, [])
+        here, there = rev(ctx.root, ref), (out.split("\t")[0] if out.strip() else "")
+        moved.append(f"{ref} {short(here) or '-'} here"
+                     + ("" if here == there else
+                        f", {short(there) or 'gone'} on {remote}"))
+        if here != there:
+            stale.append(ref)
+    if not shown:
+        args = ["fetch"] + (["--multiple"] if len(remotes) > 1 else []) + list(remotes)
+        return (0, "git " + " ".join(sh_arg(a) for a in args),
+                "not run (dry run): the refs on disk are as the last fetch left them",
+                "", [])
+    tail = (" - NOT fetched (dry run): everything below is judged from the refs on disk"
+            if stale else " (nothing to fetch)")
+    return (0, " && ".join(shown), ", ".join(moved) + tail, "", stale)
+
+
 def fetch(ctx: Ctx, remotes: Sequence[str],
-          refs: Sequence[str] = ()) -> Tuple[int, str, str, str]:
-    """Refresh `remotes` and say what moved: (returncode, command, result, stderr).
+          refs: Sequence[str] = ()) -> Tuple[int, str, str, str, list]:
+    """Refresh `remotes` and say what moved: (returncode, command, result, stderr, stale).
+
+    `stale` is the refs nothing may be concluded from. After a real fetch it is always
+    empty - the fetch has just made every named ref the server's - and in a dry run it is
+    what `fetch_preview` found the server had moved past.
 
     `result` is the `step()` line a successful fetch deserves - one `<ref> <old>..<new>` (or
     `<ref> unchanged`) per named ref, or "remote-tracking refs refreshed" when the caller
     names none. Nothing is printed and nothing is raised here: whether a failure stops the run
-    or is only reported is the caller's, and `status` still has the refs on disk to report."""
+    or is only reported is the caller's, and `status` still has the refs on disk to report.
+
+    A dry run does not fetch (`fetch_preview`): `git fetch` rewrites `FETCH_HEAD`, moves
+    remote-tracking refs and brings objects in - three writes in the one command every
+    `--dry-run` path used to run before it promised to write nothing."""
+    if ctx.dry_run:
+        return fetch_preview(ctx, remotes, refs)
     args = ["fetch"] + (["--multiple"] if len(remotes) > 1 else []) + list(remotes)
     cmd = "git " + " ".join(sh_arg(a) for a in args)
     before = dict((r, rev(ctx.root, r)) for r in refs)
     rc, _, err = git_rc(*args, cwd=ctx.root)
     if rc != 0:
-        return (rc, cmd, "", err)
+        return (rc, cmd, "", err, [])
     moved = []
     for r in refs:
         now = rev(ctx.root, r)
         moved.append(f"{r} unchanged" if now == before[r]
                      else f"{r} {short(before[r])}..{short(now)}")
-    return (0, cmd, ", ".join(moved) if moved else "remote-tracking refs refreshed", err)
+    return (0, cmd, ", ".join(moved) if moved else "remote-tracking refs refreshed",
+            err, [])
 
 
 def upstream_server_tip(ctx: Ctx) -> Tuple[Optional[str], str]:
@@ -1036,7 +1721,7 @@ def push(ctx: Ctx, branch: str, lease: Optional[str] = None, backup_ref: str = "
         if not backup_ref:
             raise Fail(f"refusing to force-push `{branch}` without a confirmed backup: "
                        f"rule 4 allows a rewrite only behind a restore point on "
-                       f"{ctx.origin}", 5)
+                       f"{ctx.origin}", EXIT_UNSAFE)
         args.append(f"--force-with-lease={branch}:{lease}")
     if not has_ref(ctx.root, f"refs/remotes/{ctx.origin}/{branch}"):
         args.append("-u")
@@ -1050,11 +1735,11 @@ def push(ctx: Ctx, branch: str, lease: Optional[str] = None, backup_ref: str = "
                             cwd=ctx.root)
         if rc != 0 or f"refs/heads/{backup_ref}" not in out:
             raise Fail(f"the backup `{backup_ref}` is not on {ctx.origin}: refusing to "
-                       f"force-push `{branch}` without a restore point", 5)
+                       f"force-push `{branch}` without a restore point", EXIT_UNSAFE)
     rc, _, err = git_rc(*args, cwd=ctx.root)
     if rc != 0:
         step("push", cmd, "REJECTED")
-        raise Fail(f"push of `{branch}` was rejected by {ctx.origin}:\n{err.strip()}", 5)
+        raise Fail(f"push of `{branch}` was rejected by {ctx.origin}:\n{err.strip()}", EXIT_UNSAFE)
     # what a later `ship` reads back to know this tip is ours to replace, and not a teammate's
     record_published(ctx, branch, rev(ctx.root, f"refs/heads/{branch}"))
     step("push", cmd, "pushed")
@@ -1104,18 +1789,19 @@ def push_mirror(ctx: Ctx, target: str = "") -> str:
     rc, _, err = git_rc(*args, cwd=ctx.root)
     if rc != 0:
         step("mirror push", cmd, "REJECTED")
-        raise Fail(f"push of the mirror `{m}` was rejected by {ctx.origin}:\n{err.strip()}", 5)
+        raise Fail(f"push of the mirror `{m}` was rejected by {ctx.origin}:\n"
+                   f"{err.strip()}", EXIT_UNSAFE)
     step("mirror push", cmd, "pushed")
     return cmd
 
 
-def mirror_worktree(ctx: Ctx) -> str:
-    """Path of the worktree that has the mirror checked out, "" when none."""
+def branch_worktree(ctx: Ctx, branch: str) -> str:
+    """Path of the worktree that has `branch` checked out, "" when none."""
     rc, out, _ = git_rc("for-each-ref", "--format=%(worktreepath)",
-                        f"refs/heads/{ctx.mirror}", cwd=ctx.root)
+                        f"refs/heads/{branch}", cwd=ctx.root)
     if rc != 0:                     # git without %(worktreepath): only this worktree is visible
         cur = git("symbolic-ref", "-q", "--short", "HEAD", cwd=ctx.root, check=False)
-        return ctx.root if cur == ctx.mirror else ""
+        return ctx.root if cur == branch else ""
     return out.strip()
 
 
@@ -1125,13 +1811,23 @@ def advance_mirror(ctx: Ctx, target: str) -> Tuple[str, str]:
     old = rev(ctx.root, f"refs/heads/{m}")
     if old and old != target:
         rc, _, _ = git_rc("merge-base", "--is-ancestor", old, target, cwd=ctx.root)
+        if rc == 1 and ctx.dry_run:
+            # the target is `<upstream>/<branch>` as the LAST FETCH left it, and this run did
+            # not fetch (a dry run writes nothing). A teammate's sync legitimately puts the
+            # mirror ahead of a stale upstream ref, and calling that rule 6 would be a guess
+            raise Fail(f"this dry run did not fetch, so it cannot preview the sync: `{m}` is "
+                       f"not an ancestor of {short(target)}, which is `{ctx.up()}` as the "
+                       f"last fetch left it - the `fetch` line above says what "
+                       f"`{ctx.upstream}` has now. Run `git fetch {sh_arg(ctx.upstream)}` and "
+                       f"try again, or run the same command without `--dry-run`, which "
+                       f"fetches first")
         if rc == 1:
             raise Fail(f"`{m}` is not an ancestor of {short(target)}: the mirror only ever "
                        f"moves forward. {README_POINTER}")
         if rc != 0:
             raise Fail(f"cannot compare `{m}` with {short(target)}: "
                        f"run `git fetch {sh_arg(ctx.upstream)}`")
-    wt = mirror_worktree(ctx)
+    wt = branch_worktree(ctx, m)
     here = wt and os.path.realpath(wt) == os.path.realpath(ctx.root)
     if wt and not here:
         raise Fail(f"mirror `{m}` is checked out in {wt}: advance it there, "
@@ -1175,7 +1871,8 @@ def bootstrap_trunk(ctx: Ctx, target: str) -> None:
     if rc != 0:
         git("branch", "-D", t, cwd=ctx.root, check=False)
         step("trunk", cmd, "REJECTED")
-        raise Fail(f"push of the new trunk `{t}` was rejected by {ctx.origin}:\n{err.strip()}", 5)
+        raise Fail(f"push of the new trunk `{t}` was rejected by {ctx.origin}:\n"
+                   f"{err.strip()}", EXIT_UNSAFE)
     step("trunk", cmd, f"created at {short(target)} and pushed")
 
 
@@ -1228,7 +1925,7 @@ def backup(ctx: Ctx, reason: str, from_ref: str) -> str:
         git("branch", "-D", name, cwd=ctx.root, check=False)
         raise Fail(f"backup `{name}` is not on {ctx.origin} after the push"
                    f"{': ' + err.strip() if err.strip() else ''}: refusing to go on "
-                   f"without a confirmed restore point", 5)
+                   f"without a confirmed restore point", EXIT_UNSAFE)
     step("backup", confirm, "confirmed on origin")
     print(f"    rollback: git reset --hard {sh_arg(f'{ctx.origin}/{name}')}")
     if purpose:
@@ -1250,8 +1947,8 @@ def simulate_merge(ctx: Ctx, target: str) -> Optional[Tuple[bool, list]]:
     if git_version() < MERGE_TREE_GIT:
         step("simulate", cmd, "simulation needs git 2.38+, skipping")
         return None
-    rc, out, err = git_rc("merge-tree", "--write-tree", "--name-only",
-                          f"{ctx.origin}/{ctx.trunk}", target, cwd=ctx.root)
+    rc, out, err = merge_tree(ctx.root, "--write-tree", "--name-only",
+                              f"{ctx.origin}/{ctx.trunk}", target)
     if rc == 0:
         step("simulate", cmd, "merges clean")
         return (True, [])
@@ -1286,8 +1983,8 @@ def merge_button(ctx: Ctx, kind: str) -> str:
     if ctx.platform == "gitlab":
         return "merge it fast-forward"
     if ctx.platform == "github":
-        return ('merge it with "Rebase and merge", then delete the local branch - '
-                "GitHub rewrites the commit's SHA")
+        return ('merge it with "Rebase and merge" - GitHub rewrites the commit\'s SHA; '
+                f"`{land_cmd()}` recognises the patch and deletes the local branch")
     return "merge it fast-forward"
 
 
@@ -1347,9 +2044,31 @@ def mr_command(ctx: Ctx, branch: str, title: str, body_file: str) -> list:
     return []
 
 
+def run_tool(ctx: Ctx, cmd: Sequence[str]) -> Optional[subprocess.CompletedProcess]:
+    """Run a platform tool (glab, gh) and answer with its process; None when it cannot run.
+
+    stdin is closed: a prompt the flags did not cover fails fast as a non-zero exit, which
+    the caller reports with the tool's stderr, instead of waiting on a terminal nobody is
+    at. A tool that is not installed, or not executable, is an OSError rather than an exit
+    code; the callers say "unavailable" for it and still print the command, which is worth
+    running by hand. The one place the platform tools are run from - `open_mr` and the
+    merge step share it, and `TestSourceInvariants` pins it."""
+    try:
+        return subprocess.run(list(cmd), cwd=ctx.root, capture_output=True,
+                              stdin=subprocess.DEVNULL)
+    except OSError:
+        return None
+
+
 def open_mr(ctx: Ctx, branch: str, title: str, body: str, run_it: bool) -> str:
     """Print the MR command and, with --mr, run it. Never a failure: the branch is pushed,
-    the merge request is the only thing left to do."""
+    the merge request is the only thing left to do.
+
+    Answers the merge request's URL: the first stdout line of the tool that starts with
+    `http` - what both glab and gh print - and "" when the tool was not run, could not run
+    or failed. It is kept for the `pending` record and for display only: nothing parses it,
+    the merge step addresses the MR by its branch. The command as shown is not answered
+    with it - it is printed here, on the `mr` line, which is where the tests read it."""
     path = "<description file>" if ctx.dry_run else write_temp(body, "mr-body.md")
     cmd = mr_command(ctx, branch, title, path)
     if not cmd:
@@ -1361,29 +2080,26 @@ def open_mr(ctx: Ctx, branch: str, title: str, body: str, run_it: bool) -> str:
         if not ctx.dry_run:
             print(f"    description: {path}")
         return ""
-    shown = " ".join(shlex.quote(c) for c in cmd)
+    shown = shown_argv(cmd)
     if ctx.dry_run:
         step("mr", shown, "not run (dry run)", dry=True)
-        return shown
+        return ""
     if not run_it:
         step("mr", shown, "not run (add --mr to run it)")
         print(f"    description: {path}")
-        return shown
-    try:
-        # stdin closed: a prompt the flags did not cover fails fast as a non-zero exit,
-        # reported below with its stderr, instead of waiting on a terminal nobody is at
-        p = subprocess.run(cmd, cwd=ctx.root, capture_output=True, stdin=subprocess.DEVNULL)
-    except OSError as exc:
-        step("mr", shown, f"{cmd[0]} unavailable ({exc.strerror or exc})")
+        return ""
+    p = run_tool(ctx, cmd)
+    if p is None:
+        step("mr", shown, f"{cmd[0]} unavailable (not installed, or not runnable)")
         print(f"    description: {path}")
-        return shown
+        return ""
     out = p.stdout.decode("utf-8", "replace").strip()
     if p.returncode != 0:
         step("mr", shown, f"FAILED (exit {p.returncode}) - open it yourself")
         for line in tail_lines(p.stderr.decode("utf-8", "replace"), TAIL_LINES):
             print(f"      {line}")
         print(f"    description: {path}")
-        return shown
+        return ""
     step("mr", shown, "created")
     for line in out.splitlines():
         print(f"    {line}")
@@ -1391,7 +2107,82 @@ def open_mr(ctx: Ctx, branch: str, title: str, body: str, run_it: bool) -> str:
         os.unlink(path)          # the description is on the platform now; nobody needs the file
     except OSError:
         pass
-    return shown
+    return next((ln.strip() for ln in out.splitlines() if ln.strip().startswith("http")), "")
+
+
+def merge_command(ctx: Ctx, kind: str, branch: str, head: str) -> list:
+    """The platform's merge command for the merge request `branch` opened, [] when the fork
+    cannot be named (see `mr_target`).
+
+    The merge request is addressed by its source branch - both tools accept that in place
+    of a number, and the run already has it; the URL is never parsed. `--repo` names the
+    fork for the same reason `mr_command` gives it. The method is the one rule 5 requires:
+    on GitLab the project's own `merge_method` decides (`setup`'s report insists on `ff`), so
+    glab gets neither `--squash` nor `--rebase`; GitHub has no project-level method, so gh is
+    told per call - `--merge` for a sync (its tip is the merge commit, the "merge" button
+    keeps it) and `--rebase` for a ship (the "rebase and merge" button, a fast-forward of one
+    commit - a gh flag, not a git verb). The head-commit guard is always on: `--sha` /
+    `--match-head-commit` merge only the exact commit this run pushed, never whatever the
+    branch points at by then - rule 4's spirit. `--auto-merge=false` is what makes glab
+    merge *now*: by default it arms merge-when-pipeline-succeeds and `land` finds nothing."""
+    target, _ = mr_target(ctx)
+    if not target:                    # `mr_target` names a fork on gitlab or github only
+        return []
+    if ctx.platform == "gitlab":
+        return ["glab", "mr", "merge", branch, "--repo", target, "--sha", head,
+                "--auto-merge=false", "--remove-source-branch", "--yes"]
+    return ["gh", "pr", "merge", branch, "--repo", target, "--match-head-commit", head,
+            "--merge" if kind == "sync" else "--rebase"]
+
+
+def merge_mr(ctx: Ctx, kind: str, branch: str, url: str) -> None:
+    """Merge the merge request `open_mr` just opened on `branch`, or exit 6.
+
+    Runs after the push and after the `pending` record has the merge request's URL, so any
+    failure here leaves a landable state: the branch is on origin, the merge request is
+    open, and `forkflow land` finishes the job once it is merged by hand - which is what
+    the exit-6 message says. A merge request that was never created (the tool failed, was
+    missing, or printed no URL) is the same exit: there is nothing *this run opened* to
+    merge - which includes a request already open for the branch, whose `create` fails;
+    `--merge` merges only what it opened. A dry run shows the merge and the landing it
+    would chain into and runs neither. `merge_gate` has made sure the fork can be named,
+    so `merge_command` always has a command here.
+
+    `merge = "self"` is asked again first (`fork_merge_mode`), for a fresh run and a
+    resumed one alike: the gate read `origin/<trunk>` before this run's fetch moved it and
+    before the sync merge touched the tree, and this is the last point where not merging
+    costs nothing - the request stays open for a person to merge, which is exit 6."""
+    head = "<pushed head>" if ctx.dry_run else rev(ctx.root, f"refs/heads/{branch}")
+    cmd = merge_command(ctx, kind, branch, head)
+    shown = shown_argv(cmd)
+    if ctx.dry_run:
+        step("merge", shown, "not run (dry run)", dry=True)
+        step("land", land_cmd(), "not run (dry run)", dry=True)
+        return
+    if fork_merge_mode(ctx) != MERGE_SELF:
+        step("merge", shown, "NOT RUN: this fork's config does not say merge = \"self\" now")
+        raise Fail(f"--merge needs `merge = \"self\"` in this fork's own config - "
+                   f"{fork_merge_source(ctx)} - and after this run's fetch and merge it does "
+                   f"not say that: the branch is pushed and the merge request is open; have "
+                   f"it merged by hand, then: {land_cmd()}", EXIT_NOT_MERGED)
+    if not url:
+        raise Fail(f"the merge request was not created by this run (or one was already open "
+                   f"for `{branch}`) - the branch is pushed; open or find it and merge it by "
+                   f"hand, then: {land_cmd()}", EXIT_NOT_MERGED)
+    p = run_tool(ctx, cmd)
+    if p is None:
+        step("merge", shown, f"NOT MERGED ({cmd[0]} unavailable: not installed, or not runnable)")
+    elif p.returncode != 0:
+        step("merge", shown, f"NOT MERGED (exit {p.returncode})")
+        for line in tail_lines(p.stderr.decode("utf-8", "replace"), TAIL_LINES):
+            print(f"      {line}")
+    else:
+        step("merge", shown, "merged")
+        for line in p.stdout.decode("utf-8", "replace").strip().splitlines():
+            print(f"    {line}")
+        return
+    raise Fail(f"the merge request was not merged - the branch is pushed; merge it by hand "
+               f"({url}), then: {land_cmd()}", EXIT_NOT_MERGED)
 
 
 # --------------------------------------------------------------------------- #
@@ -1408,7 +2199,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     server = None
     server_step = None
     if getattr(args, "fetch", False):
-        rc, cmd, result, err = fetch(ctx, (ctx.origin, ctx.upstream))
+        rc, cmd, result, err, _ = fetch(ctx, (ctx.origin, ctx.upstream))
         tail = err.strip().splitlines()[-1] if err.strip() else "see git output"
         fetch_step = (cmd, result if rc == 0
                       else f"FAILED, reporting the refs on disk: {tail}")
@@ -1427,7 +2218,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             server = sha
             server_step = (cmd, f"server at {short(sha)}, fetched {short(fetched)} - upstream moved "
                                 f"since the last fetch: `status --fetch` for the numbers, "
-                                f"`forkflow sync` to take it")
+                                f"`{rerun_cmd('sync', None)}` to take it")
         else:
             server = sha
             server_step = (cmd, f"server at {short(sha)}, not fetched here yet: `status --fetch`")
@@ -1468,6 +2259,10 @@ def cmd_status(args: argparse.Namespace) -> int:
           f"ff-only: {ctx.trunk} {'yes' if ff_trunk else 'no'}, "
           f"{ctx.mirror} {'yes' if ff_mirror else 'no'}")
 
+    entries = pending_entries(ctx)
+    for branch in sorted(entries):
+        print(pending_line(ctx, branch, entries[branch]))
+
     todo = []
     if not has_ref(ctx.root, f"refs/remotes/{ctx.origin}/{ctx.trunk}"):
         todo.append(f"trunk `{ctx.trunk}` is not on origin")
@@ -1497,17 +2292,27 @@ def gate_commands(ctx: Ctx) -> list:
     return [c for c in (ctx.cfg.get("gate") or []) if c.strip()]
 
 
-def config_text(ctx: Ctx, revision: Optional[str] = None) -> Optional[str]:
-    """`.forkflow.toml` as of `revision`, or from the working tree when `revision` is None.
-    None when it is not there at all."""
-    if revision is None:
-        try:
-            with open(os.path.join(ctx.root, CONFIG_FILE), "r", encoding="utf-8") as fh:
-                return fh.read()
-        except (OSError, UnicodeDecodeError):
-            return None
-    rc, out, _ = git_rc("show", f"{revision}:{CONFIG_FILE}", cwd=ctx.root)
+def config_text(ctx: Ctx, revision: str) -> Optional[str]:
+    """`.forkflow.toml` as of `revision`; None when it is not there at all. (The working
+    tree's is `load_config`'s alone, which refuses a case variant.)
+
+    A committed file whose name differs from `.forkflow.toml` only in case counts as it
+    (the exact name wins where a case-sensitive clone holds both): it is the file a
+    case-insensitive checkout opens under that name, so "what did the merge bring in" has to
+    see it - git's own `<rev>:<path>` matches case-exactly and would read it as absent."""
+    name = config_name_at(ctx, revision)
+    if name is None:
+        return None
+    rc, out, _ = git_rc("show", f"{revision}:{name}", cwd=ctx.root)
     return out if rc == 0 else None
+
+
+def config_name_at(ctx: Ctx, revision: str) -> Optional[str]:
+    """The name `.forkflow.toml` has in `revision`'s tree under any case of it (see
+    `config_text`), None when the tree holds none - and the exact name when the tree cannot
+    be listed, so the caller's `git show` gives the answer."""
+    rc, out, _ = git_rc("ls-tree", "-z", "--name-only", revision, cwd=ctx.root)
+    return config_name_in(out.split("\0")) if rc == 0 else CONFIG_FILE
 
 
 def gate_at(ctx: Ctx, revision: str) -> Optional[list]:
@@ -1609,25 +2414,25 @@ def run_check(ctx: Ctx, touched: Optional[Sequence[str]] = None,
         failures.append(f"gate `{cmd}` exited {rc}")
         break                                 # the first failure is the one to fix
 
-    trunk_ref = f"{ctx.origin}/{ctx.trunk}"
-    tip_cmd = f"git merge-base --is-ancestor {sh_arg(trunk_ref)} HEAD"
+    trunk_name = f"{ctx.origin}/{ctx.trunk}"
+    tip_cmd = f"git merge-base --is-ancestor {sh_arg(trunk_name)} HEAD"
     if current_branch(ctx) == ctx.trunk:
         step("tip", tip_cmd, f"skipped (on the trunk `{ctx.trunk}`)")
     else:
-        rc, _, err = git_rc("merge-base", "--is-ancestor", trunk_ref, "HEAD", cwd=ctx.root)
+        rc, _, err = git_rc("merge-base", "--is-ancestor", trunk_name, "HEAD", cwd=ctx.root)
         if rc == 0:
-            step("tip", tip_cmd, f"on {trunk_ref}'s tip")
+            step("tip", tip_cmd, f"on {trunk_name}'s tip")
         elif rc == 1:
-            ahead, behind = ahead_behind(ctx, "HEAD", trunk_ref)
+            ahead, behind = ahead_behind(ctx, "HEAD", trunk_name)
             where = f"behind by {behind}, ahead by {ahead}"
-            step("tip", tip_cmd, f"not on {trunk_ref}'s tip ({where})")
-            failures.append(f"not on {trunk_ref}'s tip ({where})")
+            step("tip", tip_cmd, f"not on {trunk_name}'s tip ({where})")
+            failures.append(f"not on {trunk_name}'s tip ({where})")
         else:
-            raise Fail(f"cannot compare HEAD with {trunk_ref}: {err.strip()}")
+            raise Fail(f"cannot compare HEAD with {trunk_name}: {err.strip()}")
 
     if failures:
         print("  check    FAILED: " + "; ".join(failures))
-        return 3
+        return EXIT_CHECK
     print("  check    ok")
     return 0
 
@@ -1643,15 +2448,19 @@ def sync_branch(ctx: Ctx) -> str:
     return f"{ctx.sync_prefix}{ctx.upstream}-{utc_stamp()}"
 
 
-def fetch_both(ctx: Ctx) -> None:
-    """Refresh both remotes and report what moved; every later step reads these refs."""
-    rc, cmd, result, err = fetch(ctx, (ctx.origin, ctx.upstream),
-                                 [ctx.up(), f"{ctx.origin}/{ctx.trunk}",
-                                  f"{ctx.origin}/{ctx.mirror}"])
+def fetch_both(ctx: Ctx) -> list:
+    """Refresh both remotes and report what moved; every later step reads these refs.
+
+    Answers with the refs a dry run did NOT fetch and the server has moved past, for the
+    one caller that goes on to draw a CONCLUSION rather than a preview out of them."""
+    rc, cmd, result, err, stale = fetch(ctx, (ctx.origin, ctx.upstream),
+                                        [ctx.up(), f"{ctx.origin}/{ctx.trunk}",
+                                         f"{ctx.origin}/{ctx.mirror}"])
     if rc != 0:
         step("fetch", cmd, "FAILED")
         raise Fail(f"fetch failed: {err.strip()}")
     step("fetch", cmd, result)
+    return stale
 
 
 def blob(ctx: Ctx, ref: str, path: str) -> Optional[str]:
@@ -1776,7 +2585,8 @@ def both_sides_survived(ctx: Ctx, ours: str, theirs: str) -> list:
     return rows
 
 
-def sync_branch_is_free(ctx: Ctx, name: str, force: bool) -> None:
+def sync_branch_is_free(ctx: Ctx, name: str, force: bool,
+                        args: Optional[argparse.Namespace] = None) -> None:
     """Refuse a sync branch that already exists, locally or on origin. Checked before the
     backup as well as inside `make_sync_branch`, so a rerun on the same day leaves no orphan
     backup on origin.
@@ -1784,18 +2594,20 @@ def sync_branch_is_free(ctx: Ctx, name: str, force: bool) -> None:
     origin is asked with `ls-remote`, as `free_sync_name` does and for the same reason: this
     runs before the fetch, and another clone's sync counts too. A branch that is only on
     origin gets the `--force` answer, not the `--continue` one - there is no local branch to
-    resume, so `--continue` cannot get past the push that would be rejected at the end."""
+    resume, so `--continue` cannot get past the push that would be rejected at the end. The
+    commands named carry this run's `--merge`/`--mr` (`rerun_cmd`)."""
     if force:
         return
     if has_ref(ctx.root, f"refs/heads/{name}"):
-        raise Fail(f"branch `{name}` already exists: resume it with `forkflow sync --continue`, "
-                   f"or recreate it from {ctx.origin}/{ctx.trunk} with `forkflow sync --force`")
+        raise Fail(f"branch `{name}` already exists: resume it with "
+                   f"`{continue_cmd('sync', args)}`, or recreate it from "
+                   f"{ctx.origin}/{ctx.trunk} with `{rerun_cmd('sync', args, ' --force')}`")
     rc, out, _ = git_rc("ls-remote", "--heads", ctx.origin, f"refs/heads/{name}", cwd=ctx.root)
     if rc == 0 and f"refs/heads/{name}" in out:
         raise Fail(f"`{name}` is already on {ctx.origin} and this clone has no local copy: a "
                    f"published sync branch is never rebased or force-pushed (rule 5). Close "
-                   f"its merge request and rerun with `forkflow sync --force`, which publishes "
-                   f"the next free `{name}-N`")
+                   f"its merge request and rerun with `{rerun_cmd('sync', args, ' --force')}`, "
+                   f"which publishes the next free `{name}-N`")
 
 
 def free_sync_name(ctx: Ctx, name: str) -> str:
@@ -1828,12 +2640,13 @@ def free_sync_name(ctx: Ctx, name: str) -> str:
                f"{ctx.origin}: delete the stale sync branches there first")
 
 
-def make_sync_branch(ctx: Ctx, name: str, force: bool) -> None:
+def make_sync_branch(ctx: Ctx, name: str, force: bool,
+                     args: Optional[argparse.Namespace] = None) -> None:
     """Create the sync branch off `origin/<trunk>` and switch to it. Never off the local trunk:
     the MR has to apply to what is published."""
     base = f"{ctx.origin}/{ctx.trunk}"
     cmd = f"git checkout --no-track -b {sh_arg(name)} {sh_arg(base)}"
-    sync_branch_is_free(ctx, name, force)
+    sync_branch_is_free(ctx, name, force, args)
     exists = has_ref(ctx.root, f"refs/heads/{name}")
     if ctx.dry_run:
         step("branch", cmd, f"would {'recreate' if exists else 'create'} it off {base}", dry=True)
@@ -1860,7 +2673,15 @@ def untracked_in_the_way(ctx: Ctx, target: str) -> list:
 
     `--no-renames` because git detects renames by default (2.9+) and reports the new path as
     `R`, not `A`: an upstream commit that moves a file onto a path this fork holds untracked
-    is exactly the collision this answers, and rename detection hid it."""
+    is exactly the collision this answers, and rename detection hid it.
+
+    A name the merge writes collides with an untracked file of another case too, when the
+    filesystem makes the two one file (macOS and Windows by default): upstream's
+    `.ForkFlow.toml` lands on this fork's untracked `.forkflow.toml`, and git refuses that
+    merge just the same - after the backup, had only exact names been compared. The
+    filesystem is asked (`samefile`), not `core.ignorecase`: git's own refusal comes from an
+    `lstat` of the path it is about to write. The name reported is the one on disk - the
+    file the user knows as theirs."""
     base = f"{ctx.origin}/{ctx.trunk}"
     added = set(diff_names(ctx, "--no-renames", "--diff-filter=A", base, target))
     merge_base = git("merge-base", base, target, cwd=ctx.root, check=False)
@@ -1868,11 +2689,113 @@ def untracked_in_the_way(ctx: Ctx, target: str) -> list:
         added &= set(diff_names(ctx, "--no-renames", "--diff-filter=A", merge_base, target))
     if not added:
         return []
-    others = git("ls-files", "--others", "--exclude-standard", "-z", cwd=ctx.root, check=False)
-    return sorted(added & {f for f in others.split("\0") if f})
+    out = git("ls-files", "--others", "--exclude-standard", "-z", cwd=ctx.root, check=False)
+    others = [f for f in out.split("\0") if f]
+    # an IGNORED untracked file is one git writes over without a word - it counts ignored
+    # files as expendable - and a fork keeping setup's `.forkflow.toml` in `info/exclude`
+    # lost its `merge`, `gate` and branch names that way. The config lives at the top of the
+    # tree, so the listing there is asked, whatever the ignore rules say
+    try:
+        names = os.listdir(ctx.root)
+    except OSError:
+        names = []
+    tracked = set(tracked_config_names(ctx.root))
+    others += [n for n in names if n.casefold() == CONFIG_FILE.casefold()
+               and n not in tracked and n not in others]
+    blocked = added & set(others)
+    by_fold: dict = {}
+    for f in others:
+        by_fold.setdefault(f.casefold(), []).append(f)
+    for path in added - blocked:
+        for mine in by_fold.get(path.casefold(), []):
+            if same_file(ctx.root, path, mine):
+                blocked.add(mine)
+    return sorted(blocked)
 
 
-def merge_upstream(ctx: Ctx, name: str, target: str, commits: Sequence[str]) -> None:
+def same_file(root: str, a: str, b: str) -> bool:
+    """Do the two names open one file here? False when either is not there at all."""
+    try:
+        return os.path.samefile(os.path.join(root, a), os.path.join(root, b))
+    except OSError:
+        return False
+
+
+def in_the_way_advice(ctx: Ctx, paths: Sequence[str], rerun: str,
+                      args: Optional[argparse.Namespace]) -> str:
+    """What to do about untracked files a sync merge would write over - never "delete them".
+
+    The config is its own answer: `setup` leaves `.forkflow.toml` untracked, and it is this
+    fork's - a gate, the branch names, `merge`. It goes into the trunk the way everything
+    does (a branch, `ship`), and the next sync then meets upstream's copy as a tracked file,
+    where the merge shows the two side by side. That ship is `--mr`, not `--merge`: once the
+    file is committed on a branch it is neither untracked nor on `origin/<trunk>`, so
+    `fork_merge_mode` has no `merge = "self"` to read until a person has merged it. Any
+    other file is moved out of the tree: on a case-insensitive filesystem the name git lists
+    may be another spelling of one of the user's own files, so a removal can take a file
+    that was never upstream's."""
+    trunk = f"{ctx.origin}/{ctx.trunk}"
+    if any(p.casefold() == CONFIG_FILE.casefold() for p in paths):
+        ship = rerun_cmd("ship", argparse.Namespace(mr=bool(getattr(args, "mr", False))))
+        mine = (f"`{CONFIG_FILE}` is this fork's own config, untracked (as `forkflow setup` "
+                f"leaves it)")
+        here = working_config_text(ctx)
+        note = ""
+        if config_is_upstreams(ctx, here):
+            # not the fork's: bytes the original project has. Committed and shipped it puts
+            # those on the trunk, where `merge` is still not this fork's word - so the
+            # sentence that names the ship says so too. WHERE they were found is
+            # `config_match_note`'s to say, at the end: this used to assert a sync brought
+            # them in, which it cannot know - a teammate's fork of this fork carries this
+            # fork's own config and reads exactly the same way
+            mine = (f"the `{CONFIG_FILE}` here is the original project's own file, byte for "
+                    f"byte - not one this fork wrote, so `--merge` stays refused until you "
+                    f"edit it yourself (any edit of your own makes it this fork's)")
+            note = config_match_note(ctx, here)
+        return (f"{mine}, and upstream tracks a `{CONFIG_FILE}` - under that name or "
+                f"another case of it, which a case-insensitive filesystem makes the same "
+                f"file. Do not delete or rename it: commit it on a branch off `{trunk}` and "
+                f"`{ship}` it, have that merged, so it is on `{trunk}`; then {rerun}.{note}")
+    return (f"Move them out of the working tree (they are not deleted that way - on a "
+            f"case-insensitive filesystem a name git lists can be another spelling of a file "
+            f"of yours), or get them into `{trunk}` first (commit them on a branch and "
+            f"`{rerun_cmd('ship', args)}` it); then {rerun}")
+
+
+def rerun_cmd(kind: str, args: Optional[argparse.Namespace], extra: str = "") -> str:
+    """A `forkflow <kind>` this run tells the user to run, carrying the flag that decides
+    how this run was to end: printed without `--merge` (or `--mr`), a command that is
+    followed to the letter opens or merges nothing this run was asked to. `extra` is the
+    rest of the command line (` --force`, ` --continue`). Every printed `forkflow sync` and
+    `forkflow ship` is built here or in `continue_cmd` - `TestSourceInvariants` holds it."""
+    if getattr(args, "merge", False):
+        flag = " --merge"
+    elif getattr(args, "mr", False):
+        flag = " --mr"
+    else:
+        flag = ""
+    return f"forkflow {kind}{extra}{flag}"
+
+
+def continue_cmd(kind: str, args: Optional[argparse.Namespace]) -> str:
+    """The `--continue` that resumes this run - see `rerun_cmd`."""
+    return rerun_cmd(kind, args, " --continue")
+
+
+def land_cmd(branch: str = "", force: bool = False) -> str:
+    """A `forkflow land` this run tells the user to run. `rerun_cmd`'s problem, for the
+    other subcommand that takes arguments: spelled out by hand, the `--force` or the branch
+    that makes the command the right one is dropped at one site after another, and the two
+    sites that print both have to agree where `--force` sits. The branch is quoted as every
+    printed argument is (`sh_arg`); "" leaves it out, which is what a run landing several
+    records prints. Every printed `forkflow land` is built here - `TestSourceInvariants`
+    holds that, as it holds it for `forkflow sync` and `forkflow ship`."""
+    return ("forkflow land" + (" --force" if force else "")
+            + (f" {sh_arg(branch)}" if branch else ""))
+
+
+def merge_upstream(ctx: Ctx, name: str, target: str, commits: Sequence[str],
+                   args: Optional[argparse.Namespace] = None) -> None:
     """One `--no-ff` merge commit, so `git log --merges <trunk>` is the record of every sync."""
     text = (f"Merge {ctx.mirror} (mirror of {ctx.up()}) into {name}\n\n"
             + "\n".join(commits))
@@ -1895,16 +2818,19 @@ def merge_upstream(ctx: Ctx, name: str, target: str, commits: Sequence[str]) -> 
             # the preflight in `cmd_sync` answers this before the backup; this is what is
             # left if the tree changed under the run. `{name}` exists by now, so plain
             # `forkflow sync` would refuse it and send the user to `--continue`, which has no
-            # merge to resume: `--force` is the only rerun that is not a closed loop
+            # merge to resume: `--force` is the only rerun that is not a closed loop. git lists
+            # each path it would write on a line of its own, indented by a tab
+            paths = [ln.strip() for ln in text.splitlines() if ln.startswith("\t")]
+            advice = in_the_way_advice(
+                ctx, paths, f"rerun the sync with `{rerun_cmd('sync', args, ' --force')}` "
+                            f"(`{name}` was already created, and only `--force` recreates it)",
+                args)
             raise Fail(f"the merge would overwrite untracked file(s) in the working tree, "
-                       f"which git refuses outright - remove them, or get them into "
-                       f"`{ctx.origin}/{ctx.trunk}` first, then rerun the sync with "
-                       f"`forkflow sync --force` (`{name}` was already created, and only "
-                       f"`--force` recreates it):\n{text}")
+                       f"which git refuses outright. {advice}:\n{text}")
         raise Fail(f"merge of {short(target)} failed:\n{text}")
     report_paths("merge", cmd, unmerged, "conflicting file(s)")
     raise Fail(f"resolve the conflicts on `{name}`, `git add` them, "
-               f"then run `forkflow sync --continue`", 4)
+               f"then run `{continue_cmd('sync', args)}`", EXIT_CONFLICT)
 
 
 def sync_body(ctx: Ctx, commits: Sequence[str], both: Sequence[Tuple[str, str]],
@@ -1933,9 +2859,9 @@ def sync_body(ctx: Ctx, commits: Sequence[str], both: Sequence[Tuple[str, str]],
     return "\n".join(lines)
 
 
-def merge_in_progress(ctx: Ctx) -> bool:
+def merge_in_progress(root: str) -> bool:
     """True while a merge is resolved but not committed (`MERGE_HEAD` still there)."""
-    path = git_path(ctx.root, "MERGE_HEAD")
+    path = git_path(root, "MERGE_HEAD")
     return bool(path) and os.path.exists(path)
 
 
@@ -1944,16 +2870,49 @@ def unmerged_paths(ctx: Ctx) -> list:
     return diff_names(ctx, "--diff-filter=U")
 
 
-def check_failure_hint(ctx: Ctx, name: str) -> str:
+def check_failure_hint(ctx: Ctx, name: str, args: Optional[argparse.Namespace]) -> str:
     """What to do about a failed `check` on a sync branch - which is not the same answer
     for the two invariants it checks."""
     rc, _, _ = git_rc("merge-base", "--is-ancestor", f"{ctx.origin}/{ctx.trunk}", "HEAD",
                       cwd=ctx.root)
     if rc != 0:
         return (f"  `{ctx.origin}/{ctx.trunk}` moved on: this sync has to be redone against "
-                f"the new tip - `forkflow sync --force` recreates `{name}` (a sync MR is "
-                f"never rebased)")
-    return ("  fix that on this branch and commit it, then: forkflow sync --continue")
+                f"the new tip - `{rerun_cmd('sync', args, ' --force')}` recreates `{name}` "
+                f"(a sync MR is never rebased)")
+    return f"  fix that on this branch and commit it, then: {continue_cmd('sync', args)}"
+
+
+def publish(ctx: Ctx, args: argparse.Namespace, kind: str, branch: str, base: str,
+            title: str, body: str) -> int:
+    """The tail `finish_sync` and `finish_ship` share, from the pushed branch onwards:
+    record what is pending, open the merge request, record its URL, and - with `--merge` -
+    merge it and land it in this run.
+
+    The record is written before `open_mr` and rewritten after it, so a merge request step
+    that fails still leaves something `forkflow land` can finish; `write_state(..., None)`
+    then says this run has nothing to resume. Only `kind`, the branch and the two texts
+    differ between a sync and a ship, and every round of review that touched one of these
+    tails had to touch the other.
+
+    `report_pending` runs exactly where the user is left to finish the landing themselves -
+    instead of the `next: forkflow land` line, and on the way out of a `--merge` that did
+    not land - so a record that could not be written is never a "next" that cannot work."""
+    entry = record_pending(ctx, kind, branch, base)   # landable even if the MR step fails
+    url = open_mr(ctx, branch, title, body, bool(getattr(args, "mr", False)))
+    if url:
+        entry = record_pending(ctx, kind, branch, base, url)
+    write_state(ctx, kind, None)                      # this run is done: nothing to resume
+    if getattr(args, "merge", False):
+        try:
+            merge_mr(ctx, kind, branch, url)          # exit 6 leaves the record above
+            land_after_merge(ctx, entry)
+        except Fail:
+            report_pending(ctx, entry, url)
+            raise
+        return 0
+    if report_pending(ctx, entry, url):
+        print(f"  after the MR is merged, next: {land_cmd()}")
+    return 0
 
 
 def finish_sync(ctx: Ctx, args: argparse.Namespace, name: str, commits: Sequence[str],
@@ -1968,15 +2927,23 @@ def finish_sync(ctx: Ctx, args: argparse.Namespace, name: str, commits: Sequence
     # It is raised with what this run already did and the way out: the merge commit, the sync
     # branch, the mirror push and the backup are all made by now, and a bare parse error left
     # the user with a half-done sync and nothing said about either
+    resume = continue_cmd("sync", args)
     if not ctx.dry_run:
         try:
             ctx = replace(ctx, cfg=load_config(ctx.root))
         except Fail as exc:
+            # a case variant has its own way out, above, which copies the file aside before
+            # it touches it: an invitation to edit the file first is not repeated for it
+            try:
+                variant = config_name_in(os.listdir(ctx.root)) not in (None, CONFIG_FILE)
+            except OSError:
+                variant = False
+            then = (f"follow the step above on `{name}`" if variant else
+                    f"fix `{CONFIG_FILE}` on `{name}` and commit it")
             raise Fail(f"the merge brought a `{CONFIG_FILE}` that cannot be read: {exc}\n"
                        f"  the merge commit and `{name}` are made and the backup is on "
                        f"origin; this run checked nothing and opened no merge request\n"
-                       f"  fix `{CONFIG_FILE}` on `{name}` and commit it, then: "
-                       f"forkflow sync --continue", 2)
+                       f"  {then}, then: {resume}", 2)
 
     # `.forkflow.toml` names the branches every safety check depends on and holds `gate`,
     # which is run with `sh -c`: a sync that brings it in from the original project is a
@@ -1990,26 +2957,1401 @@ def finish_sync(ctx: Ctx, args: argparse.Namespace, name: str, commits: Sequence
 
     if ctx.dry_run:
         step("check", "forkflow check", "not run (dry run)", dry=True)
-    elif run_check(ctx, config_merged=gate_merged) == 3:
-        print(check_failure_hint(ctx, name))
-        return 3
+    elif run_check(ctx, config_merged=gate_merged) == EXIT_CHECK:
+        print(check_failure_hint(ctx, name, args))
+        return EXIT_CHECK
 
+    base = rev(ctx.root, f"{ctx.origin}/{ctx.trunk}")   # what the merge was built on
     try:
         push(ctx, name)
     except Fail as exc:
-        if exc.code == 5:
-            print("  fix that, then: forkflow sync --continue")
+        if exc.code == EXIT_UNSAFE:
+            print(f"  fix that, then: {resume}")
         raise
-
     title = (getattr(args, "title", None)
              or f"sync: {ctx.up()} {utc_stamp()} ({len(commits)} commits)")
-    open_mr(ctx, name, title, sync_body(ctx, commits, rows, mirror_move, backup_ref),
-            bool(getattr(args, "mr", False)))
-    write_state(ctx, "sync", None)                     # this sync is done: nothing to resume
-    print(f"  after the MR is merged: git fetch {sh_arg(ctx.origin)} "
-          f"&& git switch {sh_arg(ctx.trunk)} "
-          f"&& git merge --ff-only {sh_arg(f'{ctx.origin}/{ctx.trunk}')}")
-    return 0
+    return publish(ctx, args, "sync", name, base, title,
+                   sync_body(ctx, commits, rows, mirror_move, backup_ref))
+
+
+def land_after_merge(ctx: Ctx, entry: dict) -> None:
+    """`--merge`'s closing step: the request is merged, so `land` runs in this process -
+    on `entry`, the record this run wrote. Read back from the shared file it could be one
+    another worktree wrote in the meantime, and this run would land (or fail on) that.
+
+    A catch-up that cannot run is its own exit 2, but the message has to open with what
+    did happen - the merge request *is* merged - so nobody reads a non-zero exit as
+    "nothing happened": the branch is on the trunk, and `forkflow land` finishes the rest
+    once the reason is dealt with. A dry run wrote no record and `merge_mr` has already
+    shown `would: land`, so there is nothing to run here. A tool that answered "merged"
+    while nothing reached the trunk is `land_pending`'s exit 6, passed on as it is: that
+    merge request is *not* merged, and saying it was would be the one wrong sentence."""
+    if ctx.dry_run:
+        return
+    try:
+        land_pending(ctx, after_merge=True, entry=entry)
+    except Fail as exc:
+        if exc.code == EXIT_NOT_MERGED:
+            raise
+        raise Fail(f"the merge request was merged; the local catch-up did not run: {exc}",
+                   exc.code)
+
+
+def sync_merge_commit(ctx: Ctx) -> str:
+    """The sync merge on the branch HEAD is on, "" when there is none (or it is uncommitted).
+
+    The merge does not have to be at HEAD: fixing what `check` refused means a commit on
+    top of it, and that must not turn `--continue` into "nothing to continue". The sync
+    merge is the *first* commit on the branch, so it is the last line here - `-n 1` took
+    the newest instead, and a `git merge` the user made on the branch afterwards then stood
+    in for it, which handed upstream's unread `gate` to `run_check` as this fork's own.
+    `--first-parent` keeps merges carried in on the second-parent side of such a merge out."""
+    merges = git("rev-list", "--merges", "--first-parent", "HEAD", "--not",
+                 f"{ctx.origin}/{ctx.trunk}", cwd=ctx.root, check=False).split()
+    return merges[-1] if merges else ""
+
+
+def merge_mode_in(text: Optional[str], where: str) -> Optional[str]:
+    """`merge` as a `.forkflow.toml`'s bytes set it: the default when there is no file
+    (`text` is None), None when the file cannot be read. `where` names it in the error.
+
+    The text rather than a revision, because the caller that has to know whose file it is
+    reads the same text for that (`written_by_upstream`), and two `git show`s of one path
+    are two answers about two different files the moment the ref moves between them."""
+    if text is None:
+        return MERGE_MANUAL
+    try:
+        cfg = parse_config(text, where)
+    except Fail:
+        return None
+    return cfg.get("merge") or MERGE_MANUAL
+
+
+def config_fingerprint(text: str) -> str:
+    """A `.forkflow.toml`'s bytes as provenance compares them.
+
+    Line endings and trailing whitespace are normalised away: a checkout that rewrote the
+    line endings, or an editor that trimmed a trailing space or dropped the last newline, is
+    not this fork *writing* the file, and reading it as one would open the `--merge` gate on
+    the original project's settings. Everything else is compared literally - one character
+    of the fork's own is what makes the file the fork's.
+
+    ONE LINE DOES BOTH, and this used to be described as two. `str.splitlines` already
+    splits on `\r\n` and on a lone `\r`, so the join over it is what undoes the line
+    endings; the `rstrip` inside it and the `strip` after it are what undo the whitespace.
+    The explicit `replace` ahead of them changes nothing that reaches the comparison - a
+    mutant that deletes it passes the whole suite because it is EQUIVALENT, not because the
+    line is untested, and it is kept only because reading the two questions apart is easier
+    than reading them out of `splitlines`. The half that IS load-bearing had no test of its
+    own until one was added: with `return text` in place of that line, upstream's config
+    with a trailing space, a trailing tab, a missing final newline or an extra one stops
+    reading as upstream's (`q1/fp2.py`).
+
+    This is also why `text` and `eol` are not among `CONFIG_RENDER_ATTRS`: both do line
+    endings and nothing else, so both are undone here before anything is compared."""
+    body = text.replace("\r\n", "\n").replace("\r", "\n")   # equivalent to what
+    return "\n".join(line.rstrip()                              # `splitlines` does below
+                     for line in body.splitlines()).strip("\n")
+
+
+def config_digest(text: str) -> str:
+    """A `.forkflow.toml`'s bytes as provenance compares them, and as the state file writes
+    them down: a sha256 over `config_fingerprint`'s normalised form, so what is remembered
+    is a hash and never anybody's file."""
+    return hashlib.sha256(config_fingerprint(text).encode("utf-8")).hexdigest()
+
+
+def config_record_ok(kept) -> bool:
+    """Is what the state file holds under `upstream_configs` a shape it can be read from?
+
+    Either shape: the {repository: [digest]} record written now, or the flat [digest] list
+    earlier runs of this branch wrote before the record carried where each came from.
+    Anything else is damaged or hand-edited, and `config_memory_unprovable` refuses `--merge`
+    rather than reading a memory that is short by an unknown amount."""
+    if isinstance(kept, list):
+        return all(isinstance(d, str) for d in kept)
+    if isinstance(kept, dict):
+        return all(isinstance(rid, str) and isinstance(ds, list)
+                   and all(isinstance(d, str) for d in ds) for rid, ds in kept.items())
+    return False
+
+
+def remembered_config_record(ctx: Ctx) -> dict:
+    """What this clone has written down of the original project's `.forkflow.toml`s, as
+    {the `repo_id` of the repository it came from: [digests], oldest first} - {} when it has
+    written down none.
+
+    "" is the key of a flat list an earlier run of this branch wrote, which did not record
+    where each digest came from; those are kept and always counted, because dropping them
+    would be forgetting, and the next write puts what it writes under a repository."""
+    kept = read_state(ctx, shared=True).get("upstream_configs")
+    if isinstance(kept, list):
+        return {"": [d for d in kept if isinstance(d, str)]}
+    if not isinstance(kept, dict):
+        return {}
+    return {rid: [d for d in ds if isinstance(d, str)]
+            for rid, ds in kept.items()
+            if isinstance(rid, str) and isinstance(ds, list)}
+
+
+def remembered_upstream_configs(ctx: Ctx) -> list:
+    """The `config_digest`s of the original project's `.forkflow.toml`s this clone has
+    written down AND still has a remote for, oldest first ([] when there are none).
+
+    Written down under the repository each came from, and counted only while some remote of
+    this clone still names that repository. A record of what SOME remote once carried was a
+    trap: a teammate's fork of this fork, or the fork's own second host, added as a remote
+    for an afternoon, put this fork's OWN config in as the original project's and refused
+    `--merge` for good - `git remote remove` and a prune changed nothing, and the only way
+    back anybody found was deleting the state file (`q2/A2.sh`, `q1/colleague.py`,
+    `q1/mem2.py n03`).
+
+    NOTHING IS DROPPED to make that work. The record keeps every digest it was ever given,
+    so re-adding the remote answers exactly as before; it is what the record is READ for
+    that follows the remotes this clone has now.
+
+    This gives nothing away where the memory matters. The memory exists to answer a version
+    the original project has WITHDRAWN from every ref, and the remote that version came from
+    is the upstream remote - which upstream cannot take away, because remotes are local git
+    config. For that repository this counts exactly as an unconditional record would."""
+    record = remembered_config_record(ctx)
+    here = {rid for _name, rid, _refs in foreign_remote_groups(ctx) if rid}
+    return [d for rid, ds in record.items() if rid == "" or rid in here for d in ds]
+
+
+def remember_upstream_configs(ctx: Ctx, by_repo: dict) -> Tuple[set, str]:
+    """Write down each digest in `by_repo` - {the `repo_id` of the repository whose
+    history carried it: its digests} - that this clone has not written down under that
+    repository before, and answer everything it now remembers; or why it could not be
+    written, which is a refusal.
+
+    YOU CANNOT PROVE ABSENCE FROM A HISTORY YOU NO LONGER HOLD. Upstream force-pushes the
+    branch, withdraws it, or this fork prunes, and the version that reached this working
+    tree is gone from every ref a walk can reach while the rest of upstream's history is
+    still there - so the walk's answer is short by exactly the version in question, the
+    empty-baseline refusal does not fire, and upstream's own bytes read as this fork's.
+    Nothing read out of the repository closes that, because the repository is the thing
+    that no longer holds it.
+
+    So the fork REMEMBERS, in the one place upstream cannot write - `.git/forkflow-state.json`,
+    through the one locked writer (`change_state`), as hashes and never as contents.
+
+    WHAT THE PROMISE ACTUALLY IS, because it used to be written here as an absolute - "what
+    was once the original project's stays the original project's, and a withdrawal changes
+    nothing at all". It holds for a version a `--merge` run SAW on a walked ref: that one is
+    written down, and a withdrawal after it changes nothing. A version that reached this
+    working tree and left every walked ref again with no `--merge` run in between was never
+    seen here, so nothing about it is written down, and the live walk is then all there is.
+
+    What covers most of that gap is not this record. It is the fork's own MIRROR, which rule
+    6 keeps a fast-forward-only copy of the original project's history: a version that
+    arrived through a sync is still in it, so the withdrawal route stays closed even in a
+    fresh clone with no memory at all. `upstream_tag_versions` covers the rest of what this
+    clone still physically holds. A fork that takes a config straight off
+    `upstream/<branch>` without a sync, holds it under no tag, and never runs `--merge`
+    before the project withdraws it, has none of the three - `q1/withdraw.py` case A - and
+    that is the honest scope of this.
+
+    WHAT IS WRITTEN DOWN CARRIES WHERE IT CAME FROM: the `repo_id` of the repository whose
+    history the walk read it out of (`foreign_remote_groups`), which is why removing a
+    remote takes its digests back out of the answer - see `remembered_upstream_configs` for
+    why that is not a way to make this forget anything that matters. The frame is the
+    remotes, and upstream cannot add, move or remove one. The refs the CONFIG names widen
+    the answer for the run that reads them and are never written down at all, because a
+    config naming this fork's own trunk would otherwise write the fork's own bytes in.
+
+    A fork that ADOPTS a config of upstream's and then edits it is not trapped: edited bytes
+    are different bytes with a different digest, in no remembered set, and that is the way
+    back every refusal here prints.
+
+    NOTHING IS DROPPED, AND NOTHING IS REFUSED FOR BEING TOO MUCH. There is no bound here,
+    and getting to that took two goes at the same wrong idea.
+
+    First the memory was bounded oldest-first-out at 500, which handed the EVICTION to the
+    attacker: HOW MANY versions get published is the original project's choice, not this
+    fork's. Publish enough and the digest of the version sitting untracked in this working
+    tree falls out; withdraw that version from every ref and the walk's answer is still not
+    empty, so no fail-closed condition fires and upstream's own file reads as this fork's own
+    (scratchpad `f10/repro15.py`).
+
+    Then the bound was kept and reaching it made a permanent refusal instead - which handed
+    the attacker a DENIAL OF SERVICE for the same effort. A reviewer published 501 versions
+    of one small file in 8.3 seconds of scripted commits, and every fork that fetched that
+    upstream lost `--merge` for good; the way out the refusal printed did not work, because
+    deleting the state file only made the next run re-walk the refs and re-arm the flag
+    (`q1/mem.py m03`, `q1/mem2.py n04`). A number upstream chooses cannot be the thing this
+    refuses on.
+
+    So there is no count. A digest is about 70 bytes: 500 of them is 35KB, and a project that
+    publishes a million versions of its `.forkflow.toml` has cost its forks 70MB of state
+    file - a disk cost, not a decision about whose config this is. And refusing on size would
+    be dishonest as well as exploitable: the LIVE WALK still covers every version the refs
+    carry today, so a clone with a large record is not a clone that cannot answer.
+
+    A `CONFIG_MEMORY_FULL` flag an earlier run of this branch wrote is not read any more, so
+    a clone that was refused by the old bound answers normally again.
+
+    What is remembered is what the tool has SEEN. A version that reached this clone and left
+    it again with no provenance walk in between was never seen here - which is why the walk
+    runs twice per `--merge` run, before the push and again after the run's own fetch.
+
+    A dry run writes nothing (the no-write contract) and answers with the memory plus what
+    was just walked."""
+    record = remembered_config_record(ctx)
+    known = set(remembered_upstream_configs(ctx))
+    seen = {d for ds in by_repo.values() for d in ds}
+    fresh = {rid: [d for d in sorted(ds) if d not in set(record.get(rid, ()))]
+             for rid, ds in by_repo.items()}
+    fresh = {rid: new for rid, new in fresh.items() if new}
+    if not fresh or ctx.dry_run:
+        return (known | seen, "")
+
+    def change(data: dict) -> None:
+        now = data.get("upstream_configs")
+        if isinstance(now, list):                  # what an earlier run of this branch
+            now = {"": [d for d in now if isinstance(d, str)]}    # wrote, with no source
+        elif isinstance(now, dict):
+            now = {rid: [d for d in ds if isinstance(d, str)]
+                   for rid, ds in now.items()
+                   if isinstance(rid, str) and isinstance(ds, list)}
+        else:
+            now = {}
+        for rid, new in fresh.items():
+            there = now.setdefault(rid, [])
+            have = set(there)
+            there.extend(d for d in new if d not in have)
+        data["upstream_configs"] = now
+
+    why = change_state(ctx, True, change)
+    if why:
+        return (set(), f"this clone cannot write down which `{CONFIG_FILE}`s the original "
+                       f"project has ({why}), and a version it has since stopped being able "
+                       f"to see in any ref would then read as one the project never had. "
+                       f"Nothing else is refused: fix that and run this again, or run the "
+                       f"same command without `--merge` and have the merge request merged "
+                       f"by hand")
+    return (known | seen, "")
+
+
+def config_memory_unprovable(ctx: Ctx) -> str:
+    """"" when this clone's memory of the original project's `.forkflow.toml`s can be
+    trusted, otherwise why it cannot - and then `--merge` is REFUSED.
+
+    The memory (`remember_upstream_configs`) is the only thing that answers a version
+    upstream has since withdrawn from every ref, so a memory that has been made to forget is
+    an open gate. Two ways it can have been:
+
+    - the state file is there and cannot be READ - truncated by an interrupted write,
+      half-written by a full disk, edited by hand into something that is not an object, or
+      unreadable outright. That used to answer `{}` and nothing else: the memory was simply
+      gone, in silence, and upstream's own file - brought in by a sync, untracked by hand,
+      and withdrawn upstream since - read as this fork's own with `merge = "self"` in it
+      (scratchpad `f10/repro15.py`). The refusal names the file and says what deleting it
+      costs, because deleting it is a real choice and it is the user's to make - and here
+      deleting it WORKS, which is the whole difference from the refusal that used to stand
+      beside it: a full memory refused permanently and printed the same remedy, which put
+      the record back and re-armed the refusal on the next run. There is no bound now
+      (`remember_upstream_configs`), so that refusal is gone rather than reworded;
+    - `upstream_configs` is there but is not a record of digests. Same fact, by hand.
+
+    Only `--merge` is refused. Everything else in this tool goes on working with an
+    unreadable state file: `read_state` answers `{}` on purpose, a `land` that finds no
+    `pending` says so, and `change_state` refuses to write over the file rather than making
+    the damage permanent. A corrupt state file is a reason not to trust a provenance answer,
+    not a reason for the tool to stop."""
+    why = state_unreadable(ctx, shared=True)
+    if why:
+        return (f"{why}, and that file is where this clone writes down which `{CONFIG_FILE}`s "
+                f"the original project has had. Without it a version the project has since "
+                f"withdrawn from every branch reads as one it never had, so `--merge` cannot "
+                f"be proven here. Look at that file; if you accept losing every record in it "
+                f"you can delete it, and this clone starts remembering again from what its "
+                f"refs carry today. Or run the same command without `--merge` and have the "
+                f"merge request merged by hand")
+    data = read_state(ctx, shared=True)
+    kept = data.get("upstream_configs")
+    if kept is not None and not config_record_ok(kept):
+        return (f"`{state_path(ctx, shared=True)}` holds an `upstream_configs` that is not a "
+                f"record of digests, so what this clone has written down of the original "
+                f"project's `{CONFIG_FILE}`s cannot be read and a version the project has "
+                f"since withdrawn would read as one it never had. Put that key back as a "
+                f"list of strings, or delete the file and accept losing every record in it - "
+                f"or run the same command without `--merge` and have the merge request "
+                f"merged by hand")
+    return ""
+
+
+def same_repo_remotes(ctx: Ctx) -> list:
+    """The remotes of this clone, other than `origin`, whose URL resolves to the REPOSITORY
+    `origin` names - an ssh/https alias of the fork, a `fork` or `mirror` remote kept for
+    backups, the fork's own second host.
+
+    `repo_id` is the fold `setup` and the generated hook already use, so what counts as one
+    repository is one rule in every place that asks it."""
+    if not ctx.origin_url:
+        return []
+    ours = repo_id(ctx.origin_url, ctx.root)
+    return [name for name in git("remote", cwd=ctx.root, check=False).splitlines()
+            if name and name != ctx.origin
+            and repo_id(git("remote", "get-url", name, cwd=ctx.root, check=False),
+                        ctx.root) == ours]
+
+
+def foreign_remote_groups(ctx: Ctx) -> list:
+    """[(remote name, the `repo_id` of its URL - "" when no remote answers to that name any
+    more, its remote-tracking refs)], for every remote of some OTHER repository.
+
+    The one frame in this clone the original project cannot write, and so the basis of every
+    provenance answer. Remotes are local git config: upstream cannot add one here, cannot
+    move a ref under one, and cannot make this clone forget one.
+
+    `origin` stays out - its branches carry the fork's OWN configs, which is what upstream's
+    are compared against - AND SO DOES EVERY OTHER NAME FOR THE SAME REPOSITORY. "Not
+    `origin`" was standing in for "the original project", and the two are not one question:
+    a second remote for the fork itself - `git remote add fork <the same repository over
+    ssh>`, a backup mirror, the fork's own second host - made this fork's own reviewed
+    `merge = "self"` read as the original project's, byte for byte, with nobody else
+    involved at all (scratchpad `q2/A4.sh`, `q1/mem2.py n03`). That remote IS the fork; its
+    refs carry the very bytes being compared, and a thing is not evidence against itself.
+    What decides is `repo_id`, off `origin`'s own URL - local git config, which upstream
+    cannot write - so this narrowing is not one a `.forkflow.toml` can reach.
+
+    A remote of some OTHER repository that happens to carry the same bytes - a teammate's
+    fork of this fork - is NOT excluded. That stays a refusal, and it is the direction this
+    walk fails in on purpose: the scope has to be a superset the config cannot narrow. What
+    changed is that the refusal is no longer PERMANENT. The refs are grouped by the
+    repository they came from, the memory is written down under that repository, and a
+    digest is counted only while this clone still has a remote for it - so
+    `git remote remove` gives `--merge` back, which is the way back the refusal now prints.
+
+    A ref under `refs/remotes/` that no current remote answers to - what an interrupted
+    removal can leave behind - is grouped by its first path segment with no repository at
+    all. It is still walked, because a ref this clone holds is still evidence; it is simply
+    not written down, since there is no repository to write it down under and so nothing
+    that undoing could ever take it out again.
+
+    A broken symref (`<remote>/HEAD` after its target is deleted) is not listed by
+    `for-each-ref` at all, so nothing here has to filter one out."""
+    ours = set([ctx.origin] + same_repo_remotes(ctx))
+    names = sorted((n for n in git("remote", cwd=ctx.root, check=False).splitlines() if n),
+                   key=len, reverse=True)   # a remote may be named `a/b`: the longest wins
+    groups: dict = {}
+    order = []
+    for ref in git("for-each-ref", "--format=%(refname)", "refs/remotes/",
+                   cwd=ctx.root, check=False).splitlines():
+        if not ref:
+            continue
+        who = next((n for n in names if ref.startswith(f"refs/remotes/{n}/")), None)
+        if who in ours:
+            continue
+        key = who if who is not None else ref[len("refs/remotes/"):].split("/")[0]
+        if key not in groups:
+            groups[key] = (who, [])
+            order.append(key)
+        groups[key][1].append(ref)
+    out = []
+    for key in order:
+        who, refs = groups[key]
+        out.append((key, repo_id(git("remote", "get-url", who, cwd=ctx.root, check=False),
+                                 ctx.root) if who else "", refs))
+    return out
+
+
+def foreign_remote_refs(ctx: Ctx) -> list:
+    """Every remote-tracking ref that belongs to a remote of some OTHER repository, flat.
+
+    `foreign_remote_groups` is the same frame with the repository each ref came from still
+    attached, which is what the memory is written down under; this is the one answer the
+    callers that only need the SCOPE ask for."""
+    return sorted(ref for _name, _rid, refs in foreign_remote_groups(ctx) for ref in refs)
+
+
+def config_match_note(ctx: Ctx, text: Optional[str]) -> str:
+    """Where these `.forkflow.toml` bytes were found, as a sentence a refusal can carry -
+    and, where that is a remote other than the one this fork takes the original project
+    from, the way back removing it gives. "" when they are in no history and no record this
+    clone holds.
+
+    The refusals used to say "A sync brought it in", and they could not know that. The bytes
+    are in SOME history here; WHICH one decides what the user should do about it, and naming
+    the wrong cause sends somebody to fix what is not broken - a teammate's fork of this
+    fork, added as a remote for an afternoon, carries this fork's own config and reads
+    exactly like a sync that took the original project's file (`q2/A2.sh`).
+
+    Walked per remote, and only on the way to a refusal: the happy path never asks."""
+    if text is None:
+        return ""
+    digest = config_digest(text)
+    for name, _rid, refs in foreign_remote_groups(ctx):
+        found, why = config_versions_in(ctx, refs)
+        if why or digest not in found:
+            continue
+        if name == ctx.upstream:
+            return (f" Those bytes are in the history of `{name}`, the remote this fork "
+                    f"takes the original project from.")
+        return (f" Those bytes are in the history of the remote `{name}`, which is not "
+                f"`{ctx.upstream}` - the remote this fork takes the original project from. "
+                f"If `{name}` is another fork and not the original project, "
+                f"`git remote remove {sh_arg(name)}` and run this again: what this clone "
+                f"wrote down of a repository it has no remote for is not counted.")
+    if digest in remembered_upstream_configs(ctx):
+        return (f" Those bytes are in what this clone wrote down of the original project's "
+                f"versions (`{state_path(ctx, shared=True) or STATE_FILE}`) on an earlier "
+                f"run, while a remote here still carried them.")
+    return ""
+
+
+def upstream_scope_refs(ctx: Ctx) -> list:
+    """The refs `upstream_config_digests` walks - chosen without asking the `.forkflow.toml`
+    whose provenance is the whole question.
+
+    The scope used to be the refs the CONFIG names: `<upstream>/<branch>` and the mirror,
+    both read off the working tree's `.forkflow.toml`. That let the file being judged
+    choose the evidence against it - upstream's own config naming an `upstream_branch` of
+    upstream's that never carried a config, and a `mirror` naming the fork's trunk, left
+    the comparison set empty, so upstream's bytes matched nothing and read as the fork's
+    own. That was the seventh route into the `--merge` gate, and the lesson of all seven:
+    what the gate depends on has to come from somewhere upstream cannot write.
+
+    So the baseline is the frame upstream cannot write - `foreign_remote_refs`. On top of
+    it, three additions that can only WIDEN the set: the mirror on origin and here (rule 6
+    keeps it a pristine copy of upstream; its name is the config's, which is why it is an
+    addition and never a subtraction), the same for the upstream branch's name, and
+    `MERGE_HEAD` while a sync merge is being resolved.
+
+    A SUPERSET is the safe direction. An extra ref can only make MORE bytes count as
+    upstream's, never fewer: the cost is a refusal, and every refusal here prints the same
+    way back - one character of the fork's own in the file makes the file the fork's."""
+    refs = foreign_remote_refs(ctx)
+    seen = set(refs)
+
+    def add(ref: str) -> None:
+        if ref not in seen and has_ref(ctx.root, ref):
+            seen.add(ref)
+            refs.append(ref)
+
+    for name in (ctx.mirror, ctx.upstream_branch):
+        add(f"refs/remotes/{ctx.origin}/{name}")
+        add(f"refs/heads/{name}")
+    if merge_in_progress(ctx.root):
+        refs.append("MERGE_HEAD")
+    return refs
+
+
+def history_unprovable(ctx: Ctx) -> str:
+    """"" when this clone can be read for what `.forkflow.toml`s the original project has
+    had, otherwise why it cannot - and then `--merge` is REFUSED.
+
+    A version the walk cannot see is not a version upstream never had, and the difference
+    decides whether upstream's own file reads as this fork's. Each of these hides history:
+
+    - a SHALLOW clone simply does not have the commits before its cut;
+    - a PARTIAL clone has the commits and not the blobs, fetched on demand - and the fetch
+      that would get one needs a server this run may not be able to reach;
+    - `refs/replace/*` and a grafts file make git answer with a history that is not the one
+      the original project published;
+    - and a clone with no remote-tracking ref outside `origin` (`foreign_remote_refs`) holds
+      no history of the original project's at all, so the only refs left to walk would be
+      the ones the config names - which is the hole `upstream_scope_refs` exists to close.
+
+    Every one of them turns "upstream never had these bytes" into a lie, and that lie opens
+    the gate on upstream's `merge` and so on upstream's `gate`, which this tool runs as
+    shell. So each is a refusal with the condition named and a way out of it: the clone can
+    be completed, or the merge request can be merged by a person, which is what a fork
+    without `merge = "self"` does anyway."""
+    if not foreign_remote_refs(ctx):
+        return (f"this clone holds no remote-tracking ref outside `{ctx.origin}` - nothing "
+                f"of the original project's is fetched here, so there is nothing to compare "
+                f"a `{CONFIG_FILE}` against: `git fetch {sh_arg(ctx.upstream)}`, then run "
+                f"this again")
+    if git("rev-parse", "--is-shallow-repository", cwd=ctx.root, check=False) == "true":
+        return (f"this clone is shallow, so the `{CONFIG_FILE}` versions before its cut are "
+                f"not in it to compare against - `git fetch --unshallow "
+                f"{sh_arg(ctx.upstream)}`, then run this again")
+    replaced = [r for r in git("for-each-ref", "--format=%(refname)", "refs/replace/",
+                               cwd=ctx.root, check=False).splitlines() if r]
+    if replaced:
+        return (f"{len(replaced)} `refs/replace/*` entry/entries rewrite what this clone's "
+                f"history shows (`git replace -l` lists them), so what a walk of it reads "
+                f"is not what the original project published")
+    grafts = git_path(ctx.root, os.path.join("info", "grafts"))
+    if grafts and os.path.exists(grafts):
+        return (f"`{grafts}` grafts this clone's history, so what a walk of it reads is not "
+                f"what the original project published")
+    partial = git("config", "--get", "extensions.partialclone", cwd=ctx.root, check=False)
+    promisors = [ln.split()[0] for ln in
+                 git("config", "--get-regexp", r"^remote\..*\.promisor$",
+                     cwd=ctx.root, check=False).splitlines()
+                 if ln.split()[-1:] == ["true"]]
+    which = (f"extensions.partialclone={partial}" if partial
+             else ", ".join(f"{key}=true" for key in promisors))
+    if partial or promisors:
+        return (f"this clone is partial ({which}): objects are fetched on demand, so a "
+                f"`{CONFIG_FILE}` the original project had can be absent here and read as "
+                f"one it never had - clone it again without `--filter` (git 2.36 and "
+                f"newer can also refill one in place), or have the merge request merged "
+                f"by hand")
+    return ""
+
+
+def upstream_tag_versions(ctx: Ctx) -> Tuple[set, str]:
+    """(every `.forkflow.toml` a TAG in this clone carries that the fork's OWN repository
+    does not reach, as `config_digest`s; "" - or why this clone cannot be read for them,
+    which is a refusal).
+
+    `refs/tags/*` was in no scope at all, and a tag is a ref like any other: the original
+    project's config version can sit under a tag this clone fetched while every branch that
+    carried it has moved on, and nothing walked it (`q1/withdraw.py` case B).
+
+    WHAT THE FORK'S OWN REPOSITORY REACHES IS TAKEN OUT, and that is the whole of the care
+    this needs. Tags are one flat namespace: the project's fetched tags and the fork's own
+    release tags sit side by side under it with nothing to tell them apart by name, so a
+    plain `refs/tags/*` would read a fork's own release tag as the original project's and
+    refuse `--merge` to every fork that tags a release with its own config committed. `--not`
+    over `origin` (and over every other name for that same repository) and over this clone's
+    branches tells them apart inside the walk, at no extra reads. It cannot be narrowed by
+    a `.forkflow.toml`: what it names is `origin` and `--branches`, never the mirror or the
+    trunk the config names.
+
+    A tag on a commit no branch and no `origin` ref reaches - tagged, then the branch deleted
+    - is counted as the original project's. That is the fail-closed direction, and it costs a
+    refusal with a way back rather than a gate.
+
+    One `--glob` rather than a list of refs, because a clone with 20,000 tags must not turn
+    into 20,000 `git show`s; and it is a WALK only - a tag's tree is never checked out, so
+    the tip-by-name reading `config_versions_in` does for a case-folding spelling has
+    nothing to do here. With no tags at all the glob simply matches nothing.
+
+    Walked and never written down: a tag is not a remote, so there is no repository to write
+    it down under and so nothing that undoing could ever take out again."""
+    mine = [f"--glob=refs/remotes/{name}/*"
+            for name in [ctx.origin] + same_repo_remotes(ctx)]
+    return config_versions_walked(ctx, ["--glob=refs/tags/*", "--not", *mine, "--branches"])
+
+
+def config_versions_walked(ctx: Ctx, args: Sequence[str]) -> Tuple[set, str]:
+    """(every `.forkflow.toml` version a `git rev-list` over `args` reaches, as
+    `config_digest`s; "" - or why this clone cannot be read for them, which is a refusal
+    wherever it is asked).
+
+    The one place a walk's blobs are turned into digests, so the FAIL-CLOSED reading is
+    written once and every scope that walks gets it: a walk git refuses, and a blob that
+    cannot be read, are each answered with the reason instead of a short set, because
+    neither is evidence that the original project never had those bytes and each, read as
+    absence, is an open gate."""
+    rc, listing, err = git_rc("rev-list", "--objects", "--full-history", *args, "--",
+                              f":(icase){CONFIG_FILE}", cwd=ctx.root)
+    if rc != 0:
+        why = tail_lines(err, 1)
+        return (set(), f"this clone's history cannot be walked for `{CONFIG_FILE}` "
+                       f"({why[0] if why else 'git gave no reason'}) - complete the clone, "
+                       f"or have the merge request merged by hand")
+    fold = CONFIG_FILE.casefold()
+    blobs = set()
+    for line in listing.splitlines():
+        sha, _, name = line.partition(" ")
+        if name.casefold() == fold:           # commits and trees come with no name at all
+            blobs.add(sha)
+    digests = set()
+    for sha in sorted(blobs):
+        rc, text, _ = git_rc("cat-file", "blob", sha, cwd=ctx.root)
+        if rc != 0:
+            return (set(), f"the `{CONFIG_FILE}` this clone's history lists at {short(sha)} "
+                           f"cannot be read - the object is not here (a filtered or damaged "
+                           f"clone), and a version the original project had would be read "
+                           f"as one it never had; complete the clone, or have the merge "
+                           f"request merged by hand")
+        digests.add(config_digest(text))
+    return (digests, "")
+
+
+def config_versions_in(ctx: Ctx, refs: Sequence[str]) -> Tuple[set, str]:
+    """(every `.forkflow.toml` any of `refs` has EVER carried, as `config_digest`s; "" - or
+    why this clone cannot be read for them, which is a refusal wherever it is asked).
+
+    HISTORIES, not tips. For each ref every version of the file its history has carried,
+    not only the one at the tip.
+
+    Sampling the tips was the first shape of this and it left the gate open on a delay.
+    Upstream's file, brought in by a sync and left on disk untracked, was refused while
+    upstream still had those bytes at a tip; once upstream edited its own config and the
+    mirror moved past, the stale bytes in the working tree matched nothing sampled and a
+    file this fork never wrote read as "the fork's own". A version upstream has retired is
+    still upstream's, however long ago it retired it, so the question is asked of the whole
+    history.
+
+    Two git calls per REF read, plus one per DISTINCT version ever committed: `rev-list
+    --objects --full-history <refs> -- :(icase)<name>` lists the commits that changed the
+    path and, beside each, the blob it holds there, so the versions are read once each
+    however many commits carry them; `--full-history` follows every parent of a merge, so a
+    version that exists only on a side branch or only in a merge's own resolution is listed
+    too. The pathspec keeps the walk's output to the file and the file alone, so the width
+    of the scope costs far less than it looks: 100,000 commits over 17 refs and four
+    remotes, 200 distinct versions of the file, is 1.0s, of which the walk itself is 30ms
+    and the rest is one `cat-file` per version. `--merge` runs reach this and nothing else
+    does, twice each (the gate, then `merge_mr` after the fetch).
+
+    The tips are read separately, and by name rather than through `config_text`: `:(icase)`
+    matches ASCII case only, so a tip spelling the name with a character that merely
+    case-FOLDS to one of these (the Kelvin sign) is caught here. In a history such a
+    spelling is not - `load_config` refuses to read any such file in the working tree, so
+    it cannot be the file whose provenance is in question.
+
+    FAIL CLOSED, everywhere the reading can fail. A tip that cannot be read is answered
+    with the reason instead of a short set here, and the walk's own failures the same way in
+    `config_versions_walked` - none of them is evidence that upstream never had those bytes,
+    and treated as absence each one is an open gate. On top of the whole-repository
+    conditions `history_unprovable` names."""
+    if not refs:
+        return (set(), "")
+    digests = set()
+    for revision in refs:
+        name = config_name_at(ctx, revision)  # None: no file in its tree; the exact name
+        if name is None:                      # when the tree cannot be listed, so `show` says
+            continue
+        rc, text, err = git_rc("show", f"{revision}:{name}", cwd=ctx.root)
+        if rc != 0:
+            why = tail_lines(err, 1)
+            return (set(), f"`{revision}:{name}` is in this clone's refs and cannot be read "
+                           f"({why[0] if why else 'git gave no reason'}) - a version the "
+                           f"original project has may be missing here; complete the clone, "
+                           f"or have the merge request merged by hand")
+        digests.add(config_digest(text))
+    walked, why = config_versions_walked(ctx, refs)
+    return (set(), why) if why else (digests | walked, "")
+
+
+def config_path_names(root: str, listed: Sequence[str]) -> list:
+    """Every path in this working tree that answers to the config's name: the name itself,
+    any case variant beside it on disk, and every variant git tracks.
+
+    A case-insensitive filesystem makes them one file, so an attribute set on
+    `.ForkFlow.toml` reaches the file forkflow reads - which is why the question is asked of
+    all of them and not of `.forkflow.toml` alone."""
+    fold = CONFIG_FILE.casefold()
+    return sorted({CONFIG_FILE} | {n for n in listed if n.casefold() == fold}
+                  | set(tracked_config_names(root)))
+
+
+def config_render_unprovable(ctx: Ctx) -> str:
+    """"" when nothing is rendering the `.forkflow.toml` in this working tree RIGHT NOW,
+    otherwise why the file read from it is not the same kind of thing as the blobs it would
+    be compared against - and then `--merge` is REFUSED.
+
+    Asked only where the decision reads the working tree (`fork_config_state`), never for a
+    config committed on the trunk, which is read as a blob and which no attribute can reach.
+
+    What is set now is HALF the question, and the other half is two other functions':
+    `config_rendered_before` (these bytes were judged rendered here once, and turning the
+    attribute off does not un-render the file on disk) and `config_history_render_unprovable`
+    (the original project's history ever rendered this path, so an untracked file at it can
+    be one git wrote).
+
+    The comparison has two sides and they are not the same kind of thing by themselves: one
+    is the file as this working tree renders it (`working_config_text`, a plain read of the
+    path), the other is the blob as git STORES it (`cat-file blob`). In an ordinary clone
+    those are the same bytes. The repository can make them differ, and the repository is
+    something the original project writes:
+
+    - a SYMLINK under the config's name. What git stores there is the link TARGET, a short
+      path; what reading the path gives is another file's contents. Upstream keeping its
+      settings in `theirs.toml` and a link at `.forkflow.toml` means every blob upstream
+      ever stored under that name is the string "theirs.toml", so upstream's own settings -
+      read through the link - match nothing and pass as this fork's own.
+    - a `.gitattributes` upstream controls. `filter` runs a program over the file on
+      checkout, `ident` expands `$Id$` into the blob's own hash, and
+      `working-tree-encoding` holds the working tree in another encoding entirely. Each one
+      makes the rendered file differ from every blob that could have produced it, in a way
+      nothing on the reading side puts back.
+
+    Both were reproduced against the gate (scratchpad `f9/repro1.py`): upstream's config,
+    with `merge = "self"` and a `gate` in it, read as `untracked_own` and opened `--merge`.
+
+    `text`, `eol` and `diff` are deliberately NOT refused, and that matters more than it
+    looks: `* text=auto` is in an enormous number of repositories, and refusing it would
+    take `--merge` away from ordinary forks that are doing nothing unusual at all. They are
+    safe for two different reasons.
+
+    - `text` and `eol` change LINE ENDINGS and nothing else, and both sides of the
+      comparison already have their line endings taken off them: `working_config_text`
+      reads the file in text mode, where Python turns CRLF and CR into LF before anything
+      here sees it, and `config_fingerprint` does the same to the blob. Upstream's own
+      config, checked out through `eol=crlf` with CRLF really on disk, still compares equal
+      to the blob it came from and is still caught as upstream's - measured both ways
+      round (LF stored / CRLF on disk, and CRLF stored / LF on disk) in scratchpad
+      `f10/repro4.py` and held by
+      `test_line_endings_are_normalised_so_text_and_eol_are_safe_to_allow`.
+    - `diff` names a diff driver, and a diff driver's `textconv` is run to produce DIFF
+      OUTPUT. It is never part of a checkout, so the bytes on disk are the blob's either
+      way - also measured in `f10/repro4.py`, with a `textconv` that rewrites `self`.
+
+    If either reason ever stops holding - a `text` that did more than line endings, a
+    `diff` that reached the working tree - the attribute belongs back in
+    `CONFIG_RENDER_ATTRS`, and the tests above are what would say so.
+
+    forkflow does not try to REPRODUCE git's rendering rules to compare like with like -
+    that is a moving target, and a version of it that is subtly wrong is an open gate. It
+    refuses, which is the direction this gate has taken at every other turn. Both conditions
+    are ones an ordinary fork never meets, both are ones a user can end, and the refusal
+    names the link or the attribute so they can.
+
+    NEITHER REMEDY PRODUCES CONFIG BYTES, and that is the correction of what both of them
+    did when they were first written. The symlink one ended `cp <the copy> .forkflow.toml`,
+    so the link target's contents became a real config; the attribute one turned the
+    attribute off for future reads and left the already-converted file exactly where it
+    was. Run as printed, each one turned the original project's `merge = "self"` - with the
+    original project's `gate` behind it - into this fork's own declaration, because the
+    bytes that landed at the config's path were bytes no `.forkflow.toml` blob has ever
+    held and so matched nothing in `upstream_config_digests` (reproduced in scratchpad
+    `f10/repro23.py`: `unprovable` before the remedy, `untracked_own` and `self` after it).
+    So both remedies now have the same shape - take the obstacle away, copy what was there
+    aside into the git directory (`keep_aside`) and name the copy, and leave the user to
+    WRITE THEIR OWN config. `test_the_symlink_remedy_leaves_no_config_behind` and
+    `test_the_attribute_remedy_leaves_no_config_behind` run each one exactly as printed and
+    say what the fork looks like afterwards.
+
+    Asked of every path that case-folds to the config's name - the one on disk, any case
+    variant beside it, and every variant git tracks - because a case-insensitive filesystem
+    makes them one file, and an attribute set on `.ForkFlow.toml` would otherwise reach the
+    file forkflow reads without being looked at. Failing to read the attributes at all is a
+    refusal too: it is not evidence that none is set."""
+    root = ctx.root
+    try:
+        listed = os.listdir(root)
+    except OSError as exc:
+        return (f"`{root}` cannot be listed to see what `{CONFIG_FILE}` is ({exc.strerror or exc})")
+    names = config_path_names(root, listed)
+    for name in names:
+        full = os.path.join(root, name)
+        if not os.path.islink(full):
+            continue
+        try:
+            target = os.readlink(full)
+        except OSError:
+            target = "?"
+        save, keep = keep_aside(root, name)
+        return (f"`{name}` is a symbolic link (to `{target}`), so what git stores under that "
+                f"name is the link's target and what reading the path gives is another "
+                f"file's contents - two different things, and comparing them reads the "
+                f"original project's own config as one it never had. Take the link away: "
+                f"`{save} && rm -- {sh_arg(name)}` copies what the link reads as now into "
+                f"`{keep}` first and then removes the link - nothing of yours is lost, and "
+                f"the file the link pointed at is left alone. Then WRITE YOUR OWN "
+                f"`{CONFIG_FILE}` there. Nothing puts one back for you, and that is "
+                f"deliberate: the bytes on the other end of that link are whatever the file "
+                f"it points at holds, no `{CONFIG_FILE}` git stores has ever been those "
+                f"bytes, and a config made out of them would read as this fork's own "
+                f"declaration while being the original project's settings. `{keep}` is there "
+                f"to read, not to copy back")
+    rc, out, err = git_rc("check-attr", "-z", *CONFIG_RENDER_ATTRS, "--", *names, cwd=root)
+    if rc != 0:
+        why = tail_lines(err, 1)
+        return (f"git cannot say what attributes are set on `{CONFIG_FILE}` "
+                f"({why[0] if why else 'git gave no reason'}), and an attribute that rewrites "
+                f"the file between the working tree and the object store would make the "
+                f"original project's own config read as one it never had")
+    fields = out.split("\0")
+    for i in range(0, len(fields) - 2, 3):
+        where, attr, value = fields[i], fields[i + 1], fields[i + 2]
+        if value in ("unspecified", "unset"):
+            continue                              # not set, or set OFF: nothing is rendered
+        attrs = git_path(root, os.path.join("info", "attributes"))
+        off = f"{where} " + " ".join("-" + a for a in CONFIG_RENDER_ATTRS)
+        turn_off = f"printf '%s\\n' {sh_arg(off)} >> {sh_arg(attrs)}"
+        why = (f"`{attr}` is set on `{where}` (to `{value}`), by a `.gitattributes` this "
+               f"fork does not have to own, and git renders a file with that attribute "
+               f"differently from the bytes it stores it as - so the config read here and "
+               f"every stored `{CONFIG_FILE}` are two different kinds of thing, and the "
+               f"original project's own config can compare as bytes it never stored. "
+               f"`git check-attr -a -- {sh_arg(where)}` shows every attribute on it. Two "
+               f"things end it, and neither of them writes a `{CONFIG_FILE}`. First, turn "
+               f"the attribute off for that one path in a file only this clone has: "
+               f"`{turn_off}` - git reads `info/attributes` in the git directory before any "
+               f"`.gitattributes` in the tree, and nothing of yours is overwritten.")
+        if CONFIG_FILE not in listed:
+            return why + (f" Second, there is nothing to undo on disk - no `{CONFIG_FILE}` "
+                          f"is there - so write your own, and `--merge` reads that")
+        save, keep = keep_aside(root, CONFIG_FILE)
+        tracked = (f" Git tracks a `{CONFIG_FILE}` here, so the removal shows as a deletion "
+                   f"until your own file is in its place: commit that on a branch off "
+                   f"`origin/{remote_trunk(root)}` and ship it, never on the trunk itself."
+                   if tracked_config_names(root) else "")
+        return why + (f" Second, take the file that attribute already rewrote OFF disk: "
+                      f"`{save} && rm -- {CONFIG_FILE}` copies what is there now into "
+                      f"`{keep}` first. Turning the attribute off fixes what git does NEXT "
+                      f"time; the file sitting there was written by git's conversion and "
+                      f"not by this fork, and while it stays it reads as this fork's own "
+                      f"with the original project's settings in it. Nothing puts one back "
+                      f"for you: WRITE YOUR OWN `{CONFIG_FILE}`, and `--merge` reads that. "
+                      f"`{keep}` is there to read, not to copy back.") + tracked
+    return ""
+
+def remembered_rendered_configs(ctx: Ctx) -> list:
+    """The `config_digest`s of working-tree `.forkflow.toml`s this clone has judged
+    unprovable for a RENDERING reason ([] when it has judged none)."""
+    kept = read_state(ctx, shared=True).get(RENDERED_CONFIGS)
+    return [d for d in (kept if isinstance(kept, list) else []) if isinstance(d, str)]
+
+
+def remember_rendered_config(ctx: Ctx, text: Optional[str]) -> str:
+    """Write down that the file at the config's path, as it reads now, was judged unprovable
+    because something renders it. "" when there was nothing to write down or it was written;
+    otherwise why it could not be, which the refusal that called this then says out loud.
+
+    THE ATTRIBUTE IS A FACT ABOUT NOW AND THE CONVERSION HAPPENED AT CHECKOUT. `check-attr`
+    answers what is set this second; the file git already converted stays exactly where it
+    is once the attribute stops being reported. So the refusal could be ended with the
+    converted file still on disk, two ways, neither of them needing anything clever:
+
+    - the user runs only the FIRST of the two commands the refusal prints - the one the
+      message itself labels "First,", which turns the attribute off for that path in
+      `info/attributes`. `check-attr` then says `unset`, the loop passes over it, NO refusal
+      is produced, and the `ident`-expanded bytes of the original project's config read as
+      `untracked_own` with `merge = "self"` in them (scratchpad `q1/render2.py` case A;
+      `q1/E4.sh` runs it end to end and upstream's `gate` runs as shell);
+    - the original project deletes the `.gitattributes` that set it and the fork syncs. The
+      converted file is untracked, so the sync leaves it there and takes the attribute away
+      (`q1/render2.py` case B, `q1/E3.sh`). No user action at all beyond the untracking.
+
+    A point-in-time question cannot answer "were these bytes produced by a conversion", so
+    the VERDICT is remembered rather than re-derived: these BYTES were judged unprovable in
+    this clone, and nothing set or unset afterwards changes what they are. A digest, never
+    the file, in the one place the original project cannot write (the state file, through
+    `change_state`).
+
+    The way back is the way back everywhere else in this gate - the bytes decide. A file
+    with one character of the fork's own in it is a different digest, in no remembered set,
+    and provable again. That is what keeps the printed remedy working, because the remedy
+    takes the converted file OFF disk and leaves the user to write their own; a HALF-followed
+    remedy, which leaves that file exactly where it was, stays refused.
+
+    Nothing here is the original project's to grow: a digest is written only when this clone
+    refuses, and only about the one file in this working tree. Compare
+    `remember_upstream_configs`, whose size IS the project's choice, which is why that one
+    has a bound and this one needs none."""
+    if text is None or ctx.dry_run:      # nothing on disk / the no-write contract
+        return ""
+    digest = config_digest(text)
+    if digest in remembered_rendered_configs(ctx):
+        return ""
+
+    def change(data: dict) -> None:
+        now = [d for d in (data.get(RENDERED_CONFIGS) or []) if isinstance(d, str)]
+        if digest not in now:
+            now.append(digest)
+        data[RENDERED_CONFIGS] = now
+
+    why = change_state(ctx, True, change)
+    return (f"; this clone could not write that verdict down ({why}), so ending the "
+            f"condition would end this refusal with that same file still on disk" if why
+            else "")
+
+
+def config_rendered_before(ctx: Ctx) -> str:
+    """"" unless the file at the config's path holds bytes this clone has ALREADY judged
+    unprovable for a rendering reason - and then `--merge` is REFUSED, whatever
+    `check-attr` says today. `remember_rendered_config` is why."""
+    text = working_config_text(ctx)
+    if text is None or config_digest(text) not in remembered_rendered_configs(ctx):
+        return ""
+    save, keep = keep_aside(ctx.root, CONFIG_FILE)
+    return (f"the `{CONFIG_FILE}` in this working tree holds bytes this clone has already "
+            f"judged unprovable because something rendered them - a `filter`, `ident` or "
+            f"`working-tree-encoding` attribute on that path, or a symbolic link at it - and "
+            f"the verdict is written down in "
+            f"`{state_path(ctx, shared=True) or STATE_FILE}`. An attribute is a fact about "
+            f"NOW and the conversion happened at CHECKOUT, so turning it off - or the "
+            f"original project deleting the `.gitattributes` that set it - leaves that file "
+            f"exactly where it was: this is a verdict about these bytes, not about what is "
+            f"set today. Take the file off disk: `{save} && rm -- {CONFIG_FILE}` copies what "
+            f"is there now into `{keep}` first. Then WRITE YOUR OWN `{CONFIG_FILE}` - "
+            f"nothing puts one back for you - and `--merge` reads that; one character of "
+            f"your own makes it a different file. `{keep}` is there to read, not to copy "
+            f"back. Or run the same command without `--merge` and have the merge request "
+            f"merged by hand")
+
+
+def attrs_render_the_config(ctx: Ctx, refs: Sequence[str]) -> Tuple[str, str]:
+    """(what ever set a rendering attribute on the config's path anywhere in the histories
+    of `refs`, "" when nothing ever did; or ("", why this clone cannot be asked that).
+
+    The question `config_render_unprovable` asks of the working tree, asked of HISTORY the
+    way `config_versions_in` asks about the config - because "is the attribute set now"
+    cannot answer "were these bytes produced by a conversion". A `.gitattributes` the
+    original project has since deleted converted every file checked out under it, and those
+    files are still on disk.
+
+    Only a ROOT `.gitattributes` can reach a file at the root, and the rooted pathspec lists
+    exactly those, so nothing under a directory has to be read.
+
+    Asked with GIT'S OWN MATCHER rather than one written here: each version is laid down as
+    the only `.gitattributes` of an empty scratch repository and `check-attr` is asked there.
+    Patterns, macros, precedence and case are then git's answer instead of a
+    re-implementation of them - and a re-implementation that was subtly wrong would either
+    refuse ordinary forks (`*.png filter=lfs` must not) or miss a real one (`*.toml ident`
+    must not). The scratch tree is empty and its `core.attributesFile` points at nothing, so
+    what is answered is what THAT version says and nothing else: not this clone's
+    `info/attributes` (which the printed remedy appends to) and not the working tree's own
+    `.gitattributes`.
+
+    FAIL CLOSED wherever the reading can fail - a walk git refuses, a blob that is not here,
+    a scratch repository that cannot be made. None of them is evidence that the original
+    project never set one."""
+    if not refs:
+        return ("", "")
+    fold = ATTRS_FILE.casefold()
+    rc, listing, err = git_rc("rev-list", "--objects", "--full-history", *refs, "--",
+                              f":(icase){ATTRS_FILE}", cwd=ctx.root)
+    if rc != 0:
+        tail = tail_lines(err, 1)
+        return ("", f"this clone's history cannot be walked for `{ATTRS_FILE}` "
+                    f"({tail[0] if tail else 'git gave no reason'}) - complete the clone, or "
+                    f"have the merge request merged by hand")
+    blobs = set()
+    for line in listing.splitlines():
+        sha, _, name = line.partition(" ")
+        if name.casefold() == fold:           # commits and trees come with no name at all
+            blobs.add(sha)
+    if not blobs:
+        return ("", "")
+    try:
+        listed = os.listdir(ctx.root)
+    except OSError:
+        listed = []
+    names = config_path_names(ctx.root, listed)
+    scratch = tempfile.mkdtemp(prefix="forkflow-attrs-")
+    try:
+        rc, _, err = git_rc("init", "-q", scratch)
+        if rc != 0:
+            tail = tail_lines(err, 1)
+            return ("", f"the `{ATTRS_FILE}` versions this clone's history carries cannot be "
+                        f"read for what they set on `{CONFIG_FILE}` "
+                        f"({tail[0] if tail else 'git gave no reason'})")
+        for sha in sorted(blobs):
+            rc, text, _ = git_rc("cat-file", "blob", sha, cwd=ctx.root)
+            if rc != 0:
+                return ("", f"the `{ATTRS_FILE}` this clone's history lists at {short(sha)} "
+                            f"cannot be read - the object is not here (a filtered or damaged "
+                            f"clone), and an attribute the original project set would read "
+                            f"as one it never set; complete the clone, or have the merge "
+                            f"request merged by hand")
+            with open(os.path.join(scratch, ATTRS_FILE), "w", encoding="utf-8",
+                      newline="") as fh:
+                fh.write(text)
+            rc, out, err = git_rc("-c", "core.attributesFile="
+                                  + os.path.join(scratch, "no-such-attributes"),
+                                  "check-attr", "-z", *CONFIG_RENDER_ATTRS, "--", *names,
+                                  cwd=scratch)
+            if rc != 0:
+                tail = tail_lines(err, 1)
+                return ("", f"git cannot say what the `{ATTRS_FILE}` at {short(sha)} sets on "
+                            f"`{CONFIG_FILE}` "
+                            f"({tail[0] if tail else 'git gave no reason'})")
+            fields = out.split("\0")
+            for i in range(0, len(fields) - 2, 3):
+                where, attr, value = fields[i], fields[i + 1], fields[i + 2]
+                if value in ("unspecified", "unset"):
+                    continue                  # not set, or set OFF: nothing is rendered
+                return (f"`{attr}` is set on `{where}` (to `{value}`) by the `{ATTRS_FILE}` "
+                        f"this clone's history carries at {short(sha)}", "")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    return ("", "")
+
+
+def config_history_render_unprovable(ctx: Ctx) -> str:
+    """"" when no `.gitattributes` in the history this clone holds of the original project's
+    ever rendered the config's path, otherwise why an UNTRACKED config cannot answer for
+    `merge` here - and then `--merge` is REFUSED.
+
+    An untracked `.forkflow.toml` is the one state where a file git itself wrote can pass
+    for one this fork wrote: git converts a file it CHECKS OUT, the fork then untracks it by
+    hand (`git rm --cached`, committed on a sync branch), and what is left on disk is byte
+    for byte the shape `setup` leaves this fork's own template in. Once the attribute is
+    gone - turned off, or deleted upstream - nothing on disk tells the two apart, and
+    converted bytes are in no upstream digest set, so they read as this fork's own
+    declaration with the original project's `merge` and the original project's `gate` in
+    them.
+
+    A config COMMITTED on the trunk is exposed to none of this: it is read with
+    `git show <origin/trunk>:<name>`, blob against blobs, and the working tree is never
+    consulted (`fork_config_state`). That is why the way forward this prints is a real one
+    and not a shrug - and it is the state this tool recommends anyway."""
+    found, why = attrs_render_the_config(ctx, upstream_scope_refs(ctx))
+    if why:
+        return why
+    if not found:
+        return ""
+    return (f"{found}, and git renders a file with that attribute differently from the bytes "
+            f"it stores it as. The attribute does not have to be set NOW: the conversion "
+            f"happens at CHECKOUT and the converted file stays when the `{ATTRS_FILE}` goes "
+            f"- so an untracked `{CONFIG_FILE}` in this working tree can be one git wrote "
+            f"out of the original project's own blob rather than one you wrote, and nothing "
+            f"on disk tells the two apart. While that is so, an untracked config cannot "
+            f"answer for `merge` here. One that CAN: a `{CONFIG_FILE}` committed on "
+            f"`{ctx.origin}/{ctx.trunk}` - that one is read as a blob, straight out of the "
+            f"object store, and no attribute can reach it. Put yours there the way "
+            f"everything else gets there: commit it on a branch off "
+            f"`{ctx.origin}/{ctx.trunk}` and ship it, have that merge request merged, and "
+            f"`--merge` works here. Or run the same command without `--merge` and have the "
+            f"merge request merged by hand")
+
+
+def upstream_config_digests(ctx: Ctx) -> Tuple[set, str]:
+    """(every `.forkflow.toml` the original project has EVER had, as `config_digest`s; "" -
+    or why this clone cannot be asked that at all, which is a refusal, see
+    `fork_config_state`).
+
+    Three parts, and each is there because of a route that was open without it:
+
+    - what the refs upstream cannot choose carry NOW, read over their whole histories and
+      GROUPED by the repository each came from (`foreign_remote_groups`,
+      `config_versions_in`) - grouped because the group is what the memory is written down
+      under, and so what removing a remote can take back out of it;
+    - what a TAG here carries that the fork's own repository does not reach
+      (`upstream_tag_versions`) - walked, and not written down, because a tag belongs to no
+      remote;
+    - what this clone has WRITTEN DOWN of upstream's, from every earlier run
+      (`remember_upstream_configs`) - because a version that is gone from every ref is not
+      a version upstream never had, and nothing read out of the repository can say so. A
+      memory that has been made to forget - a state file that cannot be read - is a refusal
+      and not a short answer (`config_memory_unprovable`). It cannot be made to forget by
+      SIZE: there is no bound on it, because how many versions get published is the original
+      project's choice and any count this refused on would be a count upstream could reach;
+
+    Whether the file being JUDGED is the same kind of thing as these blobs is not asked
+    here, and that is deliberate. This answers what the original project's configs are -
+    raw blobs, read out of the object store - and the question of rendering is about the
+    other side of the comparison. Asked here it reached the `trunk_*` states too, where the
+    config is read with `git show <origin/trunk>:<name>` and the working tree is never
+    consulted: a fork in the state this tool RECOMMENDS was refused by any `filter` or
+    `ident` on the config's path, and told to delete its own reviewed config for a condition
+    that could not change the answer. It is asked where the answer is read off the working
+    tree instead (`fork_config_state`).
+    - and what the refs the CONFIG names carry, which only ever WIDENS the answer
+      (`upstream_scope_refs`) and is deliberately never written down: a config that names
+      this fork's own trunk would otherwise put the fork's own bytes into the memory for
+      good, and no later edit of the config could take them out again.
+
+    The walks are `rev-list`s over sets that mostly overlap; the walk itself is the cheap
+    half (30ms of the 1.0s measured in `config_versions_in`), and the expensive half - one
+    `cat-file` per distinct version - is paid once per version in each. One walk per foreign
+    remote rather than one for all of them is what carries the grouping, and a fork has one
+    such remote: the ordinary cost is what it was."""
+    blind = history_unprovable(ctx) or config_memory_unprovable(ctx)
+    if blind:
+        return (set(), blind)
+    groups = foreign_remote_groups(ctx)
+    theirs = set()
+    by_repo: dict = {}
+    for _name, rid, refs in groups:
+        found, why = config_versions_in(ctx, refs)
+        if why:
+            return (set(), why)
+        theirs |= found
+        if rid:                      # a ref no remote answers to has no repository to be
+            by_repo.setdefault(rid, set()).update(found)   # written down under
+    known, why = remember_upstream_configs(ctx, by_repo)
+    if why:
+        return (set(), why)
+    walked = {ref for _name, _rid, refs in groups for ref in refs}
+    named = [ref for ref in upstream_scope_refs(ctx) if ref not in walked]
+    wider, why = config_versions_in(ctx, named)
+    if why:
+        return (set(), why)
+    tagged, why = upstream_tag_versions(ctx)
+    if why:
+        return (set(), why)
+    return (known | theirs | wider | tagged, "")
+
+
+def config_is_upstreams(ctx: Ctx, text: Optional[str],
+                        upstreams: Optional[set] = None) -> bool:
+    """Are these the bytes of a `.forkflow.toml` the original project has?
+
+    The one question every `--merge` provenance decision asks, and it is asked of the
+    CONTENT, because nothing else answers it:
+
+    - the path's HISTORY lies in both directions. `git log -1 <rev> -- <path>` names this
+      fork's commit when the file was re-added under another name - which is what the
+      case-variant `git mv` remedy this tool prints does to upstream's file - and names
+      upstream's commit when a sync merge kept upstream's side, because history
+      simplification follows the parent the content came from;
+    - INDEX MEMBERSHIP lies too: upstream's file, brought in by a sync and untracked by
+      hand (`git rm --cached`, committed on a sync branch), is absent from the index, from
+      HEAD and from MERGE_HEAD - exactly the state `setup` leaves this fork's template in.
+
+    The bytes lie in neither direction. A `.forkflow.toml` is this fork's own precisely
+    when it differs from every `.forkflow.toml` upstream has (`upstream_config_digests`),
+    so any edit the fork makes to the file makes it the fork's - the way back every
+    refusal prints. None (there is no file) is not upstream's: nothing came from there.
+
+    `upstreams` is that set when the caller has already read it - `fork_config_state` asks
+    this question of up to two files and would otherwise walk upstream's history twice for
+    one decision. It is a value passed down WITHIN one decision, never a cache kept across
+    calls: `fork_merge_mode` runs twice per `--merge` run on purpose, the second time after
+    the run's own fetch, and each of those reads upstream's history as it stands then."""
+    if text is None:
+        return False
+    if upstreams is None:
+        upstreams, _ = upstream_config_digests(ctx)  # the refusal is `fork_config_state`'s
+    return config_digest(text) in upstreams
+
+
+def working_config_text(ctx: Ctx) -> Optional[str]:
+    """The working tree's `.forkflow.toml` as it stands, None when no file is listed under
+    exactly that name (a case variant is not it - `load_config` refuses those) or it cannot
+    be read. The bytes, not the settings: provenance is about the file.
+
+    Read in TEXT mode on purpose: Python turns CRLF and CR into LF here, which is half of
+    why a `text` or `eol` attribute cannot make upstream's config read as this fork's
+    (`config_render_unprovable`). `config_fingerprint` is the other half."""
+    try:
+        if CONFIG_FILE not in os.listdir(ctx.root):
+            return None
+        with open(os.path.join(ctx.root, CONFIG_FILE), "r", encoding="utf-8") as fh:
+            return fh.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def written_by_upstream(ctx: Ctx, text: Optional[str],
+                        upstreams: Optional[set] = None) -> bool:
+    """True when `text` - the `.forkflow.toml` a revision holds - is one the original
+    project has, by its bytes (`config_is_upstreams`), or when there was none to read.
+
+    That is the trunk a fresh fork bootstraps: `origin/<trunk>` starts as a copy of
+    upstream, and an upstream that tracks the file hands this fork its `merge` with nobody
+    here having written or reviewed it - which stays so through every later ship that does
+    not touch the file, and through a sync merge resolved in upstream's favour. It asked
+    `git log -1 <revision> -- <path>` who last wrote the path until that answer was found
+    to be wrong in both directions; see `config_is_upstreams`. `upstreams` is that helper's
+    set when the caller has already read it, and is passed no further than this decision."""
+    if text is None:
+        return True                 # there but unreadable: upstream's is the safe answer
+    return config_is_upstreams(ctx, text, upstreams)
+
+
+def own_untracked_config(ctx: Ctx, upstreams: Optional[set] = None) -> bool:
+    """True when the working tree's `.forkflow.toml` is this fork's own untracked file - the
+    one `setup` leaves: listed under exactly that name, held by git nowhere here (the index,
+    HEAD, the MERGE_HEAD of a merge in progress), and holding bytes no `.forkflow.toml` of
+    the original project's holds (`config_is_upstreams`).
+
+    The last condition is the one that matters. A fork that never chose `merge` can end up
+    with upstream's file sitting untracked on disk - a sync brings it in and the user
+    untracks it by hand - and that is byte for byte the state `setup` leaves its own
+    template in. Where git holds the file cannot tell the two apart; the bytes can.
+    `upstreams` is that set when the caller has already read it (`config_is_upstreams`)."""
+    text = working_config_text(ctx)
+    if text is None:
+        return False
+    if tracked_config_names(ctx.root):
+        return False
+    revisions = ["HEAD"] + (["MERGE_HEAD"] if merge_in_progress(ctx.root) else [])
+    if any(config_name_at(ctx, rev) is not None for rev in revisions):
+        return False
+    return not config_is_upstreams(ctx, text, upstreams)
+
+
+def fork_config_state(ctx: Ctx) -> Tuple[str, Optional[str], str]:
+    """Which `.forkflow.toml` speaks for this fork's `merge`, the bytes of it, and - when
+    the question cannot be answered at all - why not.
+
+    `fork_merge_mode` reads the mode out of the two states that carry a declaration of
+    this fork's own - `trunk_own` and `untracked_own` - and `fork_merge_refusal` names the
+    state the user is in. The two asked these questions separately, in the same order,
+    with nothing tying them together: a state added to one fell silently into the other's
+    "generic". The states, in the order they are decided:
+
+    - `trunk_own` / `trunk_upstreams` - a config is committed on `origin/<trunk>`, and
+      whose bytes those are (`written_by_upstream`) decides whether it is this fork's
+      reviewed declaration or upstream's, adopted whole by a trunk bootstrapped from a
+      project that tracks the file;
+    - `branch_own` / `branch_upstreams` - none is committed on the trunk and one is in the
+      index: a config the CHECKED-OUT BRANCH carries is read for `merge` nowhere, on a
+      branch it is neither untracked nor on the trunk, and a sync branch carries
+      upstream's file;
+    - `untracked_own` - the fork's own untracked `.forkflow.toml`, where `setup` leaves
+      it: own by its bytes, not by where git holds it (`own_untracked_config`);
+    - `untracked_upstreams` - upstream's file, untracked by hand after a sync brought it
+      in, which is byte for byte the state `setup` leaves the fork's own template in;
+    - `none` - no readable file anywhere it would be read from.
+
+    Before any of them, `unprovable`: `upstream_config_digests` could not be asked what the
+    original project's configs are (a shallow, partial, grafted or replaced clone, an
+    object that is not here, a walk git refused), or what this clone wrote down of the
+    project's own configs cannot be trusted (a state file that cannot be read, or an
+    `upstream_configs` that is not a record of digests - `config_memory_unprovable`). Every state
+    below it is a statement about
+    a set that would then be short, and a short set reads upstream's own file as this
+    fork's - so the answer is the reason, and `--merge` is refused with it. It is decided
+    first because it is a fact about the clone, true whichever file is being judged.
+
+    WHERE THE RENDERING QUESTIONS ARE ASKED IS PART OF THE ANSWER. They are about the file
+    on DISK - whether what reading the path gives is the same kind of thing as the blobs it
+    is compared against - so they are asked below the `trunk_*` states and nowhere above
+    them: a config committed on the trunk is read with `git show <origin/trunk>:<name>`,
+    blob against blobs, and no symlink, filter or `ident` can reach it. Asked above, they
+    refused the state this tool recommends and printed an `rm` of the fork's own reviewed
+    config for a condition that could not change the decision. Three of them, in order:
+    what is set NOW (`config_render_unprovable`), what these BYTES were already judged to be
+    (`config_rendered_before` - an attribute can be turned off and the converted file stays),
+    and, for an untracked config only, what the original project's own history ever set on
+    that path (`config_history_render_unprovable` - the file git wrote is still there after
+    the `.gitattributes` that rewrote it is deleted).
+
+    The text is whatever the state was read from, None when there is none; the third field
+    is that reason, "" in every other state.
+
+    What upstream's configs are is read ONCE here and handed to each question this one
+    decision asks - the states below ask it of up to two files, and the walk behind it
+    (`upstream_config_digests`) would otherwise be repeated for one answer. Nothing keeps it
+    beyond this call: `fork_merge_mode` runs twice per `--merge` run on purpose."""
+    upstreams, blind = upstream_config_digests(ctx)
+    if blind:
+        return ("unprovable", working_config_text(ctx), blind)
+    trunk_name = f"{ctx.origin}/{ctx.trunk}"
+    if has_ref(ctx.root, f"refs/remotes/{trunk_name}") and config_name_at(ctx, trunk_name):
+        # one read, two questions: whose the file is and what it says have to be asked of
+        # the same bytes. The two calls a `--merge` run makes stay two reads on purpose -
+        # the second, in `merge_mr`, is after this run's fetch moved the ref
+        text = config_text(ctx, trunk_name)
+        return ("trunk_upstreams" if written_by_upstream(ctx, text, upstreams)
+                else "trunk_own", text, "")
+    # below this line the answer is read off the WORKING TREE, and only below it can the
+    # way this clone renders that file change what the answer is
+    here = working_config_text(ctx)
+    blind = config_render_unprovable(ctx)
+    if blind:
+        # ... and the verdict is written down, because the condition can be ENDED without
+        # the rendered file going anywhere: `remember_rendered_config`
+        return ("unprovable", here, blind + remember_rendered_config(ctx, here))
+    blind = config_rendered_before(ctx)
+    if blind:
+        return ("unprovable", here, blind)
+    if tracked_config_names(ctx.root):
+        return ("branch_upstreams" if config_is_upstreams(ctx, here, upstreams)
+                else "branch_own", here, "")
+    if own_untracked_config(ctx, upstreams):
+        # the one state where a file GIT wrote can pass for one this fork wrote, so it is
+        # also the only one that has to ask what the original project's history renders
+        blind = config_history_render_unprovable(ctx)
+        return (("unprovable", here, blind) if blind else ("untracked_own", here, ""))
+    if config_is_upstreams(ctx, here, upstreams):
+        return ("untracked_upstreams", here, "")
+    return ("none", here, "")
+
+
+def fork_merge_mode(ctx: Ctx) -> str:
+    """This fork's `merge`, "self" or "manual" - the one reader every `--merge` decision goes
+    through: `merge_gate` before anything is pushed, and `merge_mr` again right before the
+    merge command runs.
+
+    Read only from where the original project cannot write it:
+
+    - the config committed on `origin/<trunk>` - this fork's reviewed state - unless its
+      bytes are a `.forkflow.toml` upstream has (`fork_config_state`: `trunk_own`);
+    - while none is committed there, the fork's own untracked `.forkflow.toml`, where
+      `setup` leaves it (`untracked_own`).
+
+    Never from the checked-out branch's committed tree, nor from a tree a sync merge has
+    touched: a sync branch carries upstream's `.forkflow.toml`, and reading `merge` from the
+    working tree let upstream's `merge = "self"` merge a reviewed fork's sync four ways -
+    on `--continue`, under a case variant of the name, and from a sync branch left checked
+    out. Every other state - no file, a file that cannot be read, one only the branch or
+    only upstream carries, and a clone that cannot be asked whose a file is at all
+    (`unprovable`) - is "manual"."""
+    state, text, _ = fork_config_state(ctx)
+    if state == "trunk_own":
+        where = f"{ctx.origin}/{ctx.trunk}:{CONFIG_FILE}"
+        return merge_mode_in(text, where) or MERGE_MANUAL
+    if state == "untracked_own":
+        return load_config(ctx.root).get("merge") or MERGE_MANUAL
+    return MERGE_MANUAL
+
+
+def fork_merge_source(ctx: Ctx) -> str:
+    """Where `fork_merge_mode` reads it, for the messages that refuse `--merge`."""
+    return (f"the `{CONFIG_FILE}` committed on `{ctx.origin}/{ctx.trunk}` - or, while none "
+            f"is committed there, an untracked `{CONFIG_FILE}` in the working tree")
+
+
+def fork_merge_refusal(ctx: Ctx) -> str:
+    """Why `--merge` is refused here and the way back - the rest of `merge_gate`'s message
+    after "--merge needs `merge = "self"` in this fork's own config - ".
+
+    The state is `fork_config_state`'s, the same answer `fork_merge_mode` just decided on
+    - this used to re-derive it, so a state added there reached a message written for
+    another one. The user can see which state they are in, so the message names it:
+
+    - this clone cannot be asked the question at all (`unprovable`), which is about the
+      clone and not about any file, so the message is the condition and the way round it;
+    - the config on the trunk is one the original project has, byte for byte;
+    - the checked-out branch carries one, which is read nowhere until it is on the trunk;
+    - the untracked config in the working tree is one the original project has;
+    - or there simply is no `merge = "self"` this fork wrote.
+
+    The upstream-bytes states used to add "A sync brought it in and it was taken whole",
+    which this cannot know: a teammate's fork of this fork, added as a remote, carries this
+    fork's own config and reads exactly the same way. What it CAN say is where the bytes
+    were found, and `config_match_note` says that instead - with, where the answer is a
+    remote that is not the original project's, the way back removing it gives.
+
+    The upstream-bytes states used to print the last one's wording, and a user looking at
+    a file that plainly reads `merge = "self"` read that as a bug in the tool. Each state
+    leaves a way forward, and where the file is upstream's it is the same one: an edit of
+    the fork's own makes the file the fork's. A `{ship}` is named only for a config that
+    already is this fork's - printed commands are followed to the letter, and shipping
+    upstream's bytes to the trunk changes nothing about whose word `merge` is."""
+    trunk_name = f"{ctx.origin}/{ctx.trunk}"
+    ship = rerun_cmd("ship", argparse.Namespace(mr=True))
+    theirs = (f"is a `{CONFIG_FILE}` the original project has, byte for byte, so what it "
+              f"says about `merge` is not this fork's word - whatever you read in it")
+    yours = (f"Make it this fork's: edit it - with `merge = \"self\"` set by you - ")
+    generic = (f"{fork_merge_source(ctx)}; a `{CONFIG_FILE}` the checked-out branch carries "
+               f"is not read for it. This fork's merge requests are merged by hand.")
+    state, text, blind = fork_config_state(ctx)
+    if state == "unprovable":
+        # nothing about the file: this clone cannot be asked what upstream's configs are,
+        # so no answer about whose the file is would mean anything. The way forward is the
+        # one every fork without `merge = "self"` uses, and it needs no clone at all
+        return (f"and whether any `{CONFIG_FILE}` here is this fork's own cannot be decided "
+                f"in this clone: {blind}. Until it can, `--merge` is refused whatever the "
+                f"file says - a version the original project had that this clone cannot see "
+                f"reads as one it never had, which is upstream's `merge` (and upstream's "
+                f"`gate`, which this tool runs as shell) taken for this fork's word. "
+                f"Nothing else is refused: run the same command without `--merge` and have "
+                f"the merge request merged by hand.")
+    if state == "trunk_own":
+        return generic                  # this fork's own file; it just does not say "self"
+    if state == "trunk_upstreams":
+        return (f"the `{CONFIG_FILE}` committed on `{trunk_name}` {theirs}."
+                f"{config_match_note(ctx, text)} {yours}on a branch off `{trunk_name}`, "
+                f"commit it there and `{ship}` it; once that merge request is merged, "
+                f"`--merge` works here.")
+    if state == "branch_upstreams":
+        # upstream's file, on the branch: no command - shipping it puts upstream's bytes
+        # on the trunk, where `merge` is still upstream's word and this refusal returns
+        return (f"the `{CONFIG_FILE}` this branch carries {theirs}, and a config the "
+                f"checked-out branch carries is not read for `merge` in any case - only "
+                f"the one on `{trunk_name}`, and only while it is this fork's own."
+                f"{config_match_note(ctx, text)} Edit the file in your fork, with "
+                f"`merge = \"self\"` set by you, and get that onto `{trunk_name}` the way "
+                f"everything else gets there.")
+    if state == "branch_own":
+        return (f"{fork_merge_source(ctx)}; the `{CONFIG_FILE}` this branch carries is not "
+                f"read for it - committed on a branch it is neither untracked nor on "
+                f"`{trunk_name}`. Get it onto the trunk first: `{ship}`, have that merge "
+                f"request merged, then: {land_cmd()}. A `merge = \"self\"` it carries "
+                f"counts from then on.")
+    if state == "untracked_upstreams":
+        return (f"the untracked `{CONFIG_FILE}` in the working tree {theirs}."
+                f"{config_match_note(ctx, text)} {yours}and run this again; nothing has to "
+                f"be committed, an untracked config is read while none is on "
+                f"`{trunk_name}`.")
+    # `untracked_own` that does not say "self", and `none`: no declaration to point at
+    return generic
 
 
 def cmd_sync_continue(ctx: Ctx, args: argparse.Namespace) -> int:
@@ -2027,22 +4369,31 @@ def cmd_sync_continue(ctx: Ctx, args: argparse.Namespace) -> int:
     if unmerged:
         report_paths("continue", "git diff --name-only --diff-filter=U", unmerged,
                      "file(s) still unmerged")
-        raise Fail("resolve the conflicts and `git add` them, "
-                   "then run `forkflow sync --continue` again")
+        raise Fail(f"resolve the conflicts and `git add` them, "
+                   f"then run `{continue_cmd('sync', args)}` again")
 
-    merging = merge_in_progress(ctx)
-    # the merge does not have to be at HEAD: fixing what `check` refused means a commit on
-    # top of it, and that must not turn `--continue` into "nothing to continue". The sync
-    # merge is the *first* commit on the branch, so it is the last line here - `-n 1` took
-    # the newest instead, and a `git merge` the user made on the branch afterwards then stood
-    # in for it, which handed upstream's unread `gate` to `run_check` as this fork's own.
-    # `--first-parent` keeps merges carried in on the second-parent side of such a merge out
-    merges = git("rev-list", "--merges", "--first-parent", "HEAD", "--not",
-                 f"{ctx.origin}/{ctx.trunk}", cwd=ctx.root, check=False).split()
-    merge_sha = merges[-1] if merges else ""
+    # a conflict on upstream's `.ForkFlow.toml` resolved with `git rm` takes the one file a
+    # case-insensitive filesystem holds for both names: the fork's `.forkflow.toml` stays in
+    # the index and is gone from the tree, and this run would go on with no config - no gate
+    staged = config_name_in(tracked_config_names(ctx.root))
+    try:
+        on_disk = config_name_in(os.listdir(ctx.root))
+    except OSError:
+        on_disk = staged
+    if staged and on_disk is None:
+        raise Fail(f"`{staged}` is in the index but not in the working tree - removed by hand, "
+                   f"maybe as another case of its name, which a case-insensitive filesystem "
+                   f"makes the same file - and without it this sync would check nothing. Put "
+                   f"it back from the index with `git checkout -- {sh_arg(staged)}` (nothing is "
+                   f"there for it to overwrite), then run `{continue_cmd('sync', args)}` again")
+
+    merging = merge_in_progress(ctx.root)
+    merge_sha = sync_merge_commit(ctx)
     if not merging and not merge_sha:
-        raise Fail(f"nothing to continue: `{name}` carries no sync merge - "
-                   f"run `forkflow sync`")
+        # a branch under today's sync name is one plain `sync` refuses ("already exists -
+        # resume it with --continue"), which is this very message: only `--force` recreates it
+        again = rerun_cmd("sync", args, " --force" if name == sync_branch(ctx) else "")
+        raise Fail(f"nothing to continue: `{name}` carries no sync merge - run `{again}`")
     if merging:
         cmd = "git commit --no-edit"
         if ctx.dry_run:
@@ -2075,9 +4426,37 @@ def cmd_sync_continue(ctx: Ctx, args: argparse.Namespace) -> int:
                        resumable(ctx, "sync", name).get("backup", ""), merge_sha)
 
 
+def merge_gate(ctx: Ctx, args: argparse.Namespace, resume_sync: bool = False) -> None:
+    """`--merge` refused, or nothing - before the fetch, the backup and any push.
+
+    Config AND flag: the fork declares once, in `.forkflow.toml`, that its merge requests are
+    merged by whoever opened them (`merge = "self"`), and the flag asks for it per run. Either
+    alone does nothing, so a reviewed fork can never be merged by accident. The declaration
+    is the fork's own - `fork_merge_mode`, never the checked-out tree, which on a sync branch
+    or a resumed sync holds upstream's file. The second check is knowable now too: a merge
+    command addresses the fork by URL (`mr_target`), and an origin that names no project
+    would otherwise be a push followed by a failure. A branch name both tools would read as
+    a merge request number is `ship_preflight`'s, with the other names `ship` will not
+    take: it is a fact about the branch, not about this fork's config."""
+    if not getattr(args, "merge", False):
+        return
+    if fork_merge_mode(ctx) != MERGE_SELF:
+        # a resumed sync has a merge made and a branch to finish: the resume named keeps
+        # `--mr` (which `--merge` implies), so it still opens the request the reviewer merges
+        by_hand = (f" Resume without it - `{continue_cmd('sync', argparse.Namespace(mr=True))}`"
+                   f" - and have the merge request merged by hand." if resume_sync else "")
+        raise Fail(f"--merge needs `merge = \"self\"` in this fork's own config - "
+                   f"{fork_merge_refusal(ctx)}{by_hand}")
+    target, reason = mr_target(ctx)
+    if not target:
+        raise Fail(f"--merge: `{ctx.origin_url or '-'}` names no project to merge on "
+                   f"({reason})")
+
 def cmd_sync(args: argparse.Namespace) -> int:
     ctx = resolve_ctx(args.dir, args, need_upstream=True, need_trunk=True, strict_mirror=True)
     header(ctx, "sync")
+    # before `--continue`: a conflicted sync resumes with it, from a tree that is the merge
+    merge_gate(ctx, args, resume_sync=bool(getattr(args, "cont", False)))
     if getattr(args, "cont", False):
         return cmd_sync_continue(ctx, args)
 
@@ -2088,13 +4467,15 @@ def cmd_sync(args: argparse.Namespace) -> int:
         raise Fail("the working tree has uncommitted changes: commit or stash them first")
     name = sync_branch(ctx)
     force = bool(getattr(args, "force", False))
-    sync_branch_is_free(ctx, name, force)     # before the backup: no orphan backup on a rerun
+    sync_branch_is_free(ctx, name, force, args)   # before the backup: none orphaned on a rerun
     if force:
         name = free_sync_name(ctx, name)      # a published sync branch is never pushed over
-    print(f"  leaving `{branch}`, switching to `{name}` "
-          f"(you stay on it when this finishes; the trunk is never touched)")
+    tail = (f" unless --merge lands it - then you are on `{ctx.trunk}`"
+            if getattr(args, "merge", False) else "; the trunk is never touched")
+    print(f"  leaving `{branch}`, switching to `{name}` (you stay on it when this "
+          f"finishes{tail})")
 
-    fetch_both(ctx)
+    stale = fetch_both(ctx)
     target = rev(ctx.root, ctx.up())
     if not target:
         raise Fail(f"`{ctx.up()}` does not resolve after the fetch: is `{ctx.upstream}` right?")
@@ -2109,6 +4490,21 @@ def cmd_sync(args: argparse.Namespace) -> int:
     trunk_ref = f"refs/remotes/{ctx.origin}/{ctx.trunk}"
     rc, _, _ = git_rc("merge-base", "--is-ancestor", target, trunk_ref, cwd=ctx.root)
     if rc == 0:
+        if ctx.dry_run and ctx.up() in stale:
+            # `target` is `<upstream>/<branch>` as the LAST FETCH left it and this run did
+            # not fetch, so "already in sync" is being said about a commit the server has
+            # already moved past. It is a CONCLUSION and not a preview: it returns 0, and
+            # everything the dry run exists to run - the merge simulation, the
+            # untracked-in-the-way and case-collision preflights - is below it and does
+            # not run. `advance_mirror` and `judge_landings` say this where they would
+            # otherwise conclude from a ref the fetch line has just called stale
+            raise Fail(f"this dry run did not fetch, so it cannot tell whether this fork "
+                       f"is in sync: from the refs on disk {ctx.origin}/{ctx.trunk} "
+                       f"already contains {short(target)}, which is `{ctx.up()}` as the "
+                       f"last fetch left it - the `fetch` line above says what "
+                       f"`{ctx.upstream}` has now, and none of the checks below this ran. "
+                       f"Run `git fetch {sh_arg(ctx.upstream)}` and try again, or run the "
+                       f"same command without `--dry-run`, which fetches first")
         print(f"  already in sync: {ctx.origin}/{ctx.trunk} already contains {short(target)} "
               f"(the mirror was advanced and pushed above if it was behind)")
         return 0
@@ -2121,11 +4517,10 @@ def cmd_sync(args: argparse.Namespace) -> int:
     if blocked:
         report_paths("untracked", "git ls-files --others --exclude-standard", blocked,
                      "untracked file(s) this sync would write over")
-        raise Fail(f"git refuses a merge that would overwrite an untracked file. "
-                   f"`forkflow setup` writes `{CONFIG_FILE}` untracked and an upstream that "
-                   f"uses forkflow too tracks it, which is this collision. Remove the "
-                   f"file(s), or get them into `{ctx.origin}/{ctx.trunk}` first (commit them "
-                   f"on a branch and `forkflow ship` it), then run `forkflow sync` again")
+        raise Fail(f"git refuses a merge that would overwrite an untracked file, and nothing "
+                   f"was backed up or branched for this sync. "
+                   + in_the_way_advice(ctx, blocked, f"run `{rerun_cmd('sync', args)}` again",
+                                       args))
 
     log = git("log", "--oneline", "--no-decorate", f"{ctx.origin}/{ctx.trunk}..{target}",
               cwd=ctx.root, check=False)
@@ -2136,9 +4531,10 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print(f"    {line}")
 
     backup_ref = backup(ctx, "pre-sync", f"{ctx.origin}/{ctx.trunk}")
-    make_sync_branch(ctx, name, force=force)
-    write_state(ctx, "sync", {"branch": name, "backup": backup_ref})
-    merge_upstream(ctx, name, target, commits)
+    make_sync_branch(ctx, name, force, args)
+    resume_unrecorded(ctx, "sync", write_state(ctx, "sync", {"branch": name,
+                                                             "backup": backup_ref}), backup_ref)
+    merge_upstream(ctx, name, target, commits, args)
 
     if ctx.dry_run:
         step("verify", "git diff HEAD^1 / HEAD^2", "not run (dry run)", dry=True)
@@ -2174,16 +4570,17 @@ def rebasing_branch(ctx: Ctx) -> str:
     return ""
 
 
-def ship_preflight(ctx: Ctx) -> str:
+def ship_preflight(ctx: Ctx, args: Optional[argparse.Namespace] = None) -> str:
     """The branch `ship` may rewrite, or Fail(2). Everything else is refused by name:
     ship rebases and squashes what it is on, and only a feature branch may be rewritten."""
     if rebase_in_progress(ctx):
         # `--continue` only resumes a ship *this clone* started: naming it after a rebase
         # that is not one (a `git pull --rebase` this run's own advice asked for, say) sends
-        # the user to a command that refuses them
+        # the user to a command that refuses them. Either way it carries `--merge`/`--mr`:
+        # followed to the letter, a resume without it opens or merges nothing
         being = rebasing_branch(ctx)
-        resume = ("forkflow ship --continue" if being and resumable(ctx, "ship", being)
-                  else "forkflow ship")
+        resume = (continue_cmd("ship", args) if being and resumable(ctx, "ship", being)
+                  else rerun_cmd("ship", args))
         raise Fail(f"a rebase is in progress: finish it with `git rebase --continue` and then "
                    f"`{resume}`, or start over with `git rebase --abort`")
     branch = current_branch(ctx)
@@ -2196,8 +4593,8 @@ def ship_preflight(ctx: Ctx) -> str:
         raise Fail(f"`{branch}` is the mirror: it only ever copies `{ctx.up()}` - "
                    f"switch to the feature branch you want to ship")
     if branch.startswith(ctx.sync_prefix):
-        raise Fail(f"`{branch}` is a sync branch: finish it with `forkflow sync --continue`; "
-                   f"a sync is merged, never squashed")
+        raise Fail(f"`{branch}` is a sync branch: finish it with "
+                   f"`{continue_cmd('sync', args)}`; a sync is merged, never squashed")
     if branch.startswith(ctx.backup_prefix):
         raise Fail(f"`{branch}` is a backup branch: it is a restore point, not a feature branch")
     if not valid_branch_name(branch):
@@ -2205,28 +4602,37 @@ def ship_preflight(ctx: Ctx) -> str:
         raise Fail(f"`{branch}` is a name forkflow will not push: git's refspec grammar does "
                    f"not read it as one branch (a leading `+` means force, a leading `-` an "
                    f"option) - rename it with `git branch -m <name>`")
+    if getattr(args, "merge", False) and re.fullmatch(r"#?[0-9]+", branch):
+        # `--merge` addresses the merge request by its source branch, and both tools read
+        # `123` (or `#123`) as a merge request *number* - some other request entirely.
+        # Here, with the other names this branch cannot be shipped under, and not in
+        # `merge_gate`, which answers for the fork's config and not for the branch
+        raise Fail(f"--merge: `{branch}` reads as a merge request number to glab and gh, "
+                   f"which is how the merge is addressed - rename the branch "
+                   f"(`git branch -m {sh_arg(branch)} <name>`) and ship again")
     if not clean_tree(ctx):
         raise Fail("the working tree has uncommitted changes: commit or stash them first")
     return branch
 
 
-def rebase_onto(ctx: Ctx, branch: str, trunk_ref: str) -> None:
+def rebase_onto(ctx: Ctx, branch: str, trunk_name: str,
+                args: Optional[argparse.Namespace] = None) -> None:
     """Rebase locally so the trunk can fast-forward: `rebase locally, merge globally`."""
-    cmd = f"git rebase {sh_arg(trunk_ref)}"
-    tip = rev(ctx.root, trunk_ref)
+    cmd = f"git rebase {sh_arg(trunk_name)}"
+    tip = rev(ctx.root, trunk_name)
     if ctx.dry_run:
         step("rebase", cmd, f"would replay `{branch}` onto {short(tip)}", dry=True)
         return
-    rc, out, err = git_rc("rebase", trunk_ref, cwd=ctx.root)
+    rc, out, err = git_rc("rebase", trunk_name, cwd=ctx.root)
     if rc == 0:
         step("rebase", cmd, f"`{branch}` now sits on {short(tip)}")
         return
     if not rebase_in_progress(ctx):
-        raise Fail(f"rebase of `{branch}` onto {trunk_ref} failed:\n{(err or out).strip()}")
+        raise Fail(f"rebase of `{branch}` onto {trunk_name} failed:\n{(err or out).strip()}")
     unmerged = unmerged_paths(ctx)
     report_paths("rebase", cmd, unmerged, "conflicting file(s)")
     raise Fail(f"resolve the conflicts, `git add` them, run `git rebase --continue`, "
-               f"then `forkflow ship --continue`", 4)
+               f"then `{continue_cmd('ship', args)}`", EXIT_CONFLICT)
 
 
 def commit_records(ctx: Ctx, base: str) -> list:
@@ -2295,13 +4701,14 @@ def squash(ctx: Ctx, base: str, message: str) -> str:
     if rc != 0:
         git("reset", "--soft", head_before, cwd=ctx.root)
         step("squash", cmd, "FAILED")
-        raise Fail(f"cannot commit the squashed change:\n{(err or out).strip()}", 5)
+        raise Fail(f"cannot commit the squashed change:\n{(err or out).strip()}", EXIT_UNSAFE)
     tree_after = git("rev-parse", "HEAD^{tree}", cwd=ctx.root)
     if tree_after != tree_before:
         git("reset", "--soft", head_before, cwd=ctx.root, check=False)   # leave no bad commit
         step("squash", cmd, "TREE MISMATCH")
         raise Fail(f"the squashed commit's tree {short(tree_after)} differs from "
-                   f"{short(tree_before)}: refusing to push a squash that changed the result", 5)
+                   f"{short(tree_before)}: refusing to push a squash that changed the "
+                   f"result", EXIT_UNSAFE)
     head = rev(ctx.root, "HEAD")
     step("squash", cmd, f"one commit {short(head)}, tree {short(tree_after)} unchanged")
     return head
@@ -2322,16 +4729,16 @@ def ship_body(ctx: Ctx, message: str, touched: Sequence[str]) -> str:
 def finish_ship(ctx: Ctx, args: argparse.Namespace, branch: str,
                 backup_ref: str, lease: str) -> int:
     """squash -> check -> push -> merge request: the tail both `ship` and `ship --continue` run."""
-    trunk_ref = f"{ctx.origin}/{ctx.trunk}"
+    trunk_name = f"{ctx.origin}/{ctx.trunk}"
     # here, not in `cmd_ship`: a rebase that dropped every commit (`git rebase --skip`) lands on
     # the trunk's tip too, and `--continue` resumes straight into this function
-    if not ctx.dry_run and rev(ctx.root, "HEAD") == rev(ctx.root, trunk_ref):
-        print(f"  nothing to ship: every commit of `{branch}` is already on {trunk_ref} "
+    if not ctx.dry_run and rev(ctx.root, "HEAD") == rev(ctx.root, trunk_name):
+        print(f"  nothing to ship: every commit of `{branch}` is already on {trunk_name} "
               f"(the backup `{backup_ref}` still holds the branch as it was)")
         return 0
-    mb = git("merge-base", trunk_ref, "HEAD", cwd=ctx.root)
+    mb = git("merge-base", trunk_name, "HEAD", cwd=ctx.root)
     records = commit_records(ctx, mb)
-    step("commits", f"git log --oneline {sh_arg(f'{trunk_ref}..HEAD')}",
+    step("commits", f"git log --oneline {sh_arg(f'{trunk_name}..HEAD')}",
          f"{len(records)} commit(s) to squash into one")
     for sha, subject, _ in records:
         print(f"    {short(sha)} {subject}")
@@ -2343,40 +4750,31 @@ def finish_ship(ctx: Ctx, args: argparse.Namespace, branch: str,
     try:
         squash(ctx, mb, message)
     except Fail as exc:
-        if exc.code == 5 and rollback:
+        if exc.code == EXIT_UNSAFE and rollback:
             print(rollback)
         raise
 
     if ctx.dry_run:
         warn_upstream_tracked(ctx, touched)      # the real run prints it after the squash
         step("check", "forkflow check", "not run (dry run)", dry=True)
-    elif run_check(ctx, touched) == 3:
+    elif run_check(ctx, touched) == EXIT_CHECK:
         if rollback:
             print(rollback)
         # the squash has already happened, so a plain rerun of `ship` starts from a branch whose
         # commits are no longer the published ones; `--continue` resumes this run instead
-        print(f"  fix that on `{branch}` and commit it, then: forkflow ship --continue")
-        return 3
+        print(f"  fix that on `{branch}` and commit it, then: {continue_cmd('ship', args)}")
+        return EXIT_CHECK
 
+    base = rev(ctx.root, trunk_name)                    # what the squash was built on
     try:
         push(ctx, branch, lease=lease or None, backup_ref=backup_ref)
     except Fail as exc:
-        if exc.code == 5 and rollback:
+        if exc.code == EXIT_UNSAFE and rollback:
             print(rollback)
         raise
-
     title = (getattr(args, "title", None)
              or (message.strip().splitlines() or [f"ship {branch}"])[0])
-    open_mr(ctx, branch, title, ship_body(ctx, message, touched),
-            bool(getattr(args, "mr", False)))
-    write_state(ctx, "ship", None)                     # this ship is done: nothing to resume
-    print(f"  after the MR is merged: git fetch {sh_arg(ctx.origin)} "
-          f"&& git switch {sh_arg(ctx.trunk)} "
-          f"&& git merge --ff-only {sh_arg(f'{ctx.origin}/{ctx.trunk}')}")
-    if ctx.platform == "github":
-        print(f"    then delete the local `{branch}`: "
-              f'"Rebase and merge" rewrites the commit, so the local branch is a stale copy')
-    return 0
+    return publish(ctx, args, "ship", branch, base, title, ship_body(ctx, message, touched))
 
 
 PUSH_REFLOG = "update by push"       # git's own message when *this* clone's push moved a
@@ -2465,8 +4863,9 @@ def published_is_ours(ctx: Ctx, branch: str, published: str) -> bool:
 def cmd_ship(args: argparse.Namespace) -> int:
     ctx = resolve_ctx(args.dir, args, need_upstream=True, need_trunk=True, strict_mirror=True)
     header(ctx, "ship")
-    branch = ship_preflight(ctx)
-    trunk_ref = f"{ctx.origin}/{ctx.trunk}"
+    branch = ship_preflight(ctx, args)
+    merge_gate(ctx, args)      # before `--continue`, the fetch, the backup and the push
+    trunk_name = f"{ctx.origin}/{ctx.trunk}"
 
     if getattr(args, "cont", False):
         # a ship in progress is one this clone started: its backup and the lease its fetch
@@ -2475,24 +4874,24 @@ def cmd_ship(args: argparse.Namespace) -> int:
         state = resumable(ctx, "ship", branch)
         if not state.get("backup"):
             raise Fail(f"no ship to continue on `{branch}`: `--continue` resumes the run that "
-                       f"made the pre-ship backup - run `forkflow ship`")
-        cmd = f"git merge-base --is-ancestor {sh_arg(trunk_ref)} HEAD"
-        rc, _, _ = git_rc("merge-base", "--is-ancestor", trunk_ref, "HEAD", cwd=ctx.root)
+                       f"made the pre-ship backup - run `{rerun_cmd('ship', args)}`")
+        cmd = f"git merge-base --is-ancestor {sh_arg(trunk_name)} HEAD"
+        rc, _, _ = git_rc("merge-base", "--is-ancestor", trunk_name, "HEAD", cwd=ctx.root)
         if rc != 0:
-            step("continue", cmd, f"`{branch}` is not on {trunk_ref}'s tip")
-            raise Fail("the rebase did not complete; run `forkflow ship` again")
+            step("continue", cmd, f"`{branch}` is not on {trunk_name}'s tip")
+            raise Fail(f"the rebase did not complete; run `{rerun_cmd('ship', args)}` again")
         step("continue", cmd, "the rebase completed - resuming at the squash")
         return finish_ship(ctx, args, branch, state["backup"], state.get("lease", ""))
 
-    rc, cmd, result, err = fetch(ctx, (ctx.origin,), [trunk_ref])
+    rc, cmd, result, err, _ = fetch(ctx, (ctx.origin,), [trunk_name])
     if rc != 0:
         step("fetch", cmd, "FAILED")
         raise Fail(f"fetch failed: {err.strip()}")
     step("fetch", cmd, result)
 
-    rc, _, _ = git_rc("merge-base", "--is-ancestor", "HEAD", trunk_ref, cwd=ctx.root)
+    rc, _, _ = git_rc("merge-base", "--is-ancestor", "HEAD", trunk_name, cwd=ctx.root)
     if rc == 0:
-        print(f"  nothing to ship: `{branch}` has no commits beyond {trunk_ref}")
+        print(f"  nothing to ship: `{branch}` has no commits beyond {trunk_name}")
         return 0
 
     # the lease is what the fetch just saw; the rebase and the squash come after it. A lease
@@ -2500,6 +4899,16 @@ def cmd_ship(args: argparse.Namespace) -> int:
     # already, or shipping would rewrite someone else's commits out of the branch.
     branch_ref = f"refs/remotes/{ctx.origin}/{branch}"
     lease = rev(ctx.root, branch_ref)
+    if lease and origin_has_branch(ctx, branch) is False:
+        # the fetch does not prune, so `origin/<branch>` can outlive the branch on origin -
+        # GitLab's `--remove-source-branch` after a merge, `land --force` keeping the branch.
+        # Offered as the lease it is refused ("stale info") on every later ship. Origin has
+        # nothing under that name, so there is nothing to force-push away and nothing whose
+        # ownership to prove: the push creates the branch, without a lease - and a plain
+        # push cannot replace what somebody publishes there in the meantime (it only ever
+        # fast-forwards). The backup is made as always
+        drop_stale_tracking(ctx, branch)
+        lease = ""
     if lease:
         cmd = f"git merge-base --is-ancestor {sh_arg(f'{ctx.origin}/{branch}')} HEAD"
         rc, _, _ = git_rc("merge-base", "--is-ancestor", branch_ref, "HEAD", cwd=ctx.root)
@@ -2514,21 +4923,543 @@ def cmd_ship(args: argparse.Namespace) -> int:
                          cwd=ctx.root, check=False)
             for line in theirs.splitlines():
                 print(f"    {line}")
-            keep = f"{ctx.backup_prefix}{utc_stamp('%Y%m%d-%H%M%S')}-theirs"
+            saved = f"{ctx.backup_prefix}{utc_stamp('%Y%m%d-%H%M%S')}-theirs"
             raise Fail(
                 f"`{ctx.origin}/{branch}` carries commits that `{branch}` does not and that "
                 f"this clone has no record of publishing: shipping would force-push them "
                 f"away. If they are somebody else's, take them in first "
                 f"(`git pull --rebase {sh_arg(ctx.origin)} {sh_arg(branch)}`). If they are "
-                f"yours from elsewhere, keep them first (`git branch {sh_arg(keep)} "
+                f"yours from elsewhere, keep them first (`git branch {sh_arg(saved)} "
                 f"{sh_arg(ctx.origin + '/' + branch)} && git push {sh_arg(ctx.origin)} "
-                f"{sh_arg('refs/heads/' + keep)}:{sh_arg('refs/heads/' + keep)}`), then ship "
-                f"again")
+                f"{sh_arg('refs/heads/' + saved)}:{sh_arg('refs/heads/' + saved)}`), then "
+                f"ship again")
 
     backup_ref = backup(ctx, "pre-ship", "HEAD")
-    write_state(ctx, "ship", {"branch": branch, "backup": backup_ref, "lease": lease})
-    rebase_onto(ctx, branch, trunk_ref)
+    resume_unrecorded(ctx, "ship", write_state(ctx, "ship", {"branch": branch,
+                                                             "backup": backup_ref,
+                                                             "lease": lease}), backup_ref)
+    rebase_onto(ctx, branch, trunk_name, args)
     return finish_ship(ctx, args, branch, backup_ref, lease)
+
+
+# --------------------------------------------------------------------------- #
+# land - the closing step: the merge request is merged, catch the local trunk up
+#
+# The only place this script moves the local trunk, and only by fast-forward (a merge, not a
+# ref move: `git branch -f` stays blocked by `TestSourceInvariants`). It neither pushes,
+# rebases nor commits: what `origin/<trunk>` holds after the platform merged the request
+# is taken as it is, and the branch that was merged is deleted locally.
+# --------------------------------------------------------------------------- #
+
+def landed(ctx: Ctx, entry: dict) -> Tuple[Optional[str], str]:
+    """Is the pending commit on `origin/<trunk>`? (the trunk commit it landed as, how).
+
+    Git only - no API call. Ancestry first: a fast-forward or a merge commit keeps the
+    SHA, so the recorded commit is simply reachable from the trunk ("ancestor"). A ship
+    the platform or a human rebased or squashed lands under a new SHA with the same patch,
+    so for a ship `git cherry` is asked, in the direction that names the trunk commit: which
+    commits in `<base>..origin/<trunk>` carry the shipped commit's patch-id ("rewritten"). That
+    survives other commits landing in between, which tree equality would not. A sync's tip
+    is the merge commit itself and only ever lands as an ancestor - rewritten, it would
+    have broken rule 5, which the caller says. (None, "") when nothing landed."""
+    trunk_ref = f"refs/remotes/{ctx.origin}/{ctx.trunk}"
+    commit, base = entry["commit"], entry["base"]
+    rc, _, _ = git_rc("merge-base", "--is-ancestor", commit, trunk_ref, cwd=ctx.root)
+    if rc == 0:
+        return (commit, "ancestor")
+    if rc != 1:
+        raise Fail(f"cannot verify the landing: {short(commit)} (the pushed `{entry['branch']}`) "
+                   f"is not in this clone any more (its branch deleted and pruned?) - there is "
+                   f"nothing to judge; `{land_cmd(force=True)}` catches the trunk up "
+                   f"unverified, "
+                   f"keeps the branch and forgets the record")
+    if entry["kind"] != "ship":
+        return (None, "")
+    # an empty ship (the squash allows one) has no patch: `git cherry` would match it with
+    # any empty commit on the trunk. Ancestry is its only landing
+    if git_ok("diff", "--quiet", base, commit, cwd=ctx.root):
+        return (None, "")
+    # `git cherry <upstream> <head> <limit>`: the commits in `<limit>..<head>` (here, what
+    # landed on the trunk since the base), each marked `-` when a commit reachable from
+    # `<upstream>` but not from `<head>` (here, exactly the shipped commit) has its patch
+    rc, out, _ = git_rc("cherry", commit, trunk_ref, base, cwd=ctx.root)
+    if rc != 0:
+        return (None, "")
+    for line in out.splitlines():
+        mark, _, sha = line.partition(" ")
+        if mark == "-" and sha.strip():
+            if not still_carries(ctx, trunk_ref, commit):
+                return (None, "")
+            return (sha.strip(), "rewritten")
+    return (None, "")
+
+
+def still_carries(ctx: Ctx, trunk_ref: str, commit: str) -> bool:
+    """Does the trunk's tip still have `commit`'s change? A patch-equivalent trunk commit is
+    no landing when a later commit reverted it - `git cherry` matches the patch, not the
+    result. Merging `commit` into the trunk (`merge-tree`, nothing written but objects) gives
+    back the trunk's own tree exactly when the change is there already. A conflict is not
+    "reverted" - later work on the same lines is the ordinary case - and git older than the
+    merge simulation needs cannot ask, so both keep `git cherry`'s answer."""
+    if git_version() < MERGE_TREE_GIT:
+        return True
+    rc, out, _ = merge_tree(ctx.root, "--write-tree", trunk_ref, commit)
+    merged = out.split()[:1]
+    if rc != 0 or not merged:
+        return True
+    return merged[0] == git("rev-parse", f"{trunk_ref}^{{tree}}", cwd=ctx.root)
+
+
+def pending_verdict(ctx: Ctx, entry: dict) -> str:
+    """`status`'s word on the pending entry, from the refs as they are: never raises.
+
+    Three states. `landed()` needs `origin/<trunk>` and the pending commit in this clone,
+    and `status` resolves with `need_trunk=False` - a fresh fork has no `origin/<trunk>`, and
+    a commit whose branch was deleted and pruned is gone; `landed()` raises for either (git
+    cannot resolve what it is asked to compare), which is "cannot verify here", not an
+    error. Git only, so the answer is the same under `--offline`; `--fetch` moves the refs it
+    is read from.
+
+    The landed verdict names the branch: plain `forkflow land` on a branch with a record of
+    its own lands that record only, so run from there it would answer "not merged yet" about
+    another request and never reach this one. Named, it lands this record from any branch
+    (and from a linked worktree gets a refusal that says where to run it)."""
+    try:
+        sha, _ = landed(ctx, entry)
+    except Fail:
+        return "cannot verify here"
+    return (f"landed: run {land_cmd(entry['branch'])}" if sha
+            else f"not on {ctx.origin}/{ctx.trunk} yet")
+
+
+def pending_line(ctx: Ctx, branch: str, entry: dict) -> str:
+    """A pending record as a report line: `status` prints one per record, and `land`
+    prints one for each it kept. status/SKILL.md and land/SKILL.md document it as one
+    format ("as `status` shows it"), so there is one place it is written."""
+    return (f"  pending  {entry['kind']} {branch} -> MR {entry.get('mr') or '-'} - "
+            f"{pending_verdict(ctx, entry)}")
+
+
+def trunk_worktree_elsewhere(ctx: Ctx) -> str:
+    """The other worktree the trunk is checked out in, or "" (none, or this one)."""
+    wt = branch_worktree(ctx, ctx.trunk)
+    return wt if wt and os.path.realpath(wt) != os.path.realpath(ctx.root) else ""
+
+
+def trunk_elsewhere(ctx: Ctx, resume: str = "") -> None:
+    """Fail(2) when the trunk is checked out in another worktree: it has to be checked out
+    and fast-forwarded there, as `advance_mirror` insists for the mirror.
+
+    That is a route that works: the `pending` records are shared by every worktree of the
+    clone (`SHARED_STATE`), so `resume` there finishes the run made here - it names the
+    branch when this run was landing one record, since HEAD there is on another branch.
+    Removing the other worktree is not offered - the main worktree cannot be removed, and
+    it is the usual one."""
+    wt = trunk_worktree_elsewhere(ctx)
+    if wt:
+        raise Fail(f"trunk `{ctx.trunk}` is checked out in {wt}: run "
+                   f"`{resume or land_cmd()}` there - "
+                   f"every worktree of this clone sees the same pending records")
+
+
+# `trunk_ref` is always the full `refs/remotes/<origin>/<trunk>` and `trunk_name` always the
+# short `<origin>/<trunk>` git also accepts and messages print. A wrong refspec here means "no
+# such ref", silently, so the two never share a name.
+def land_trunk(ctx: Ctx) -> Tuple[str, str]:
+    """Check the local trunk out and fast-forward it to `origin/<trunk>`. (old sha, new sha).
+
+    The checkout is unconditional: HEAD is usually on the branch about to be deleted, and
+    `land` leaves you on the trunk either way (`git checkout`, not `switch` - the git floor
+    is 2.20). The fast-forward is `merge --ff-only` - the second owner of that call after
+    `advance_mirror`, pinned by `TestSourceInvariants` - and never a ref move: the branch is
+    checked out, so its files have to follow. A local trunk with commits origin lacks is
+    refused before anything moves: this plugin never creates such commits (rule 2), so they
+    are someone's by-hand work and not this script's to lose. A trunk checked out in another
+    worktree is `land_preflight`'s, refused before anything moves."""
+    t = ctx.trunk
+    trunk_ref = f"refs/remotes/{ctx.origin}/{t}"
+    trunk_name = f"{ctx.origin}/{t}"
+    new = rev(ctx.root, trunk_ref)
+    if not new:
+        raise Fail(f"`{trunk_name}` does not resolve after the fetch: is the trunk still on "
+                   f"{ctx.origin}?")
+    old = rev(ctx.root, f"refs/heads/{t}")
+    if old and old != new:
+        rc, _, _ = git_rc("merge-base", "--is-ancestor", old, trunk_ref, cwd=ctx.root)
+        if rc != 0:
+            raise Fail(f"`{t}` has commits {ctx.origin} lacks - the plugin never creates "
+                       f"these; resolve by hand (`git log {sh_arg(f'{trunk_name}..{t}')}`), "
+                       f"then run `{land_cmd()}` again")
+    if not old:
+        cmd = f"git branch --no-track {sh_arg(t)} {sh_arg(trunk_name)}"
+        if ctx.dry_run:
+            step("trunk", cmd, f"would create {t} at {short(new)}", dry=True)
+        else:
+            git("branch", "--no-track", t, trunk_ref, cwd=ctx.root)
+            step("trunk", cmd, f"created at {short(new)} (no local `{t}` before)")
+    cmd = f"git checkout {sh_arg(t)}"
+    if ctx.dry_run:
+        step("checkout", cmd, f"would leave you on {t}", dry=True)
+    else:
+        rc, out, err = git_rc("checkout", t, cwd=ctx.root)
+        if rc != 0:
+            step("checkout", cmd, "FAILED")
+            raise Fail(f"cannot check out `{t}`:\n{(err or out).strip()}")
+        step("checkout", cmd, f"on {t}")
+    if not old or old == new:
+        step("trunk", f"git rev-parse {sh_arg(t)}", f"up to date at {short(new)}")
+        return (old or new, new)
+    cmd = f"git merge --ff-only {sh_arg(trunk_name)}"
+    if ctx.dry_run:
+        step("trunk", cmd, f"{short(old)} -> {short(new)}", dry=True)
+        return (old, new)
+    rc, out, err = git_rc("merge", "--ff-only", trunk_ref, cwd=ctx.root)
+    if rc != 0:                     # unreachable after the ancestor check, but git has the say
+        step("trunk", cmd, "REFUSED")
+        raise Fail(f"cannot fast-forward `{t}`:\n{(err or out).strip()}")
+    step("trunk", cmd, f"{short(old)} -> {short(new)}")
+    return (old, new)
+
+
+def land_preflight(ctx: Ctx, resume: str) -> None:
+    """What `land` cannot do from here, refused by name: a stopped rebase (before the tree -
+    it always leaves the tree dirty), uncommitted changes, the trunk checked out in another
+    worktree (where `resume` has to run)."""
+    if rebase_in_progress(ctx):
+        raise Fail("a rebase is in progress: finish it (`git rebase --continue`) or abort "
+                   "it (`git rebase --abort`) first")
+    if not clean_tree(ctx):
+        raise Fail("the working tree has uncommitted changes: commit or stash them first")
+    trunk_elsewhere(ctx, resume)
+
+
+def landed_others(ctx: Ctx, entry: dict) -> list:
+    """The branches of every other pending record that is on the trunk, as `landed` judges
+    it from the refs this run fetched; one it cannot judge here is left out."""
+    found = []
+    for name, other in sorted(pending_entries(ctx).items()):
+        if name == entry["branch"]:
+            continue
+        try:
+            sha, _ = landed(ctx, other)
+        except Fail:
+            continue
+        if sha:
+            found.append(name)
+    return found
+
+
+def pending_to_land(ctx: Ctx, entry: Optional[dict], branch: str, force: bool) -> list:
+    """The records this `land` acts on: `entry` when the caller holds it (`--merge` lands
+    the one its own run wrote); the one for `branch` when it is named; the one for the
+    branch HEAD is on; otherwise every record there is - ships from other worktrees wait in
+    the same file, and each that has landed is landed. `force` judges nothing, so it acts
+    on one record only: with several and none chosen, it needs the branch named."""
+    if entry is not None:
+        return [entry]
+    entries = pending_entries(ctx)
+    if not entries:
+        raise Fail(f"nothing pending: `{rerun_cmd('ship', None)}` or "
+                   f"`{rerun_cmd('sync', None)}` first - `land` finishes the run that pushed "
+                   f"a branch")
+    names = ", ".join(f"`{b}`" for b in sorted(entries))
+    if branch:
+        if branch not in entries:
+            raise Fail(f"nothing pending for `{branch}` - what is pending: {names}")
+        return [entries[branch]]
+    here = current_branch(ctx)
+    if here in entries:
+        return [entries[here]]
+    if force and len(entries) > 1:
+        raise Fail(f"`--force` lands one record unverified, and {len(entries)} are pending "
+                   f"({names}): name the one - `{land_cmd(force=True)} <branch>`")
+    return [entries[b] for b in sorted(entries)]
+
+
+def judge_landings(ctx: Ctx, chosen: Sequence[dict], force: bool, after_merge: bool,
+                   implicit: bool) -> list:
+    """Which of `chosen` are on `origin/<trunk>`: [(entry, the sha it landed as, how)].
+
+    One verdict per record (`landed`), printed as it is reached, and the refusals that
+    belong to the verdict rather than to the catch-up that follows it:
+
+    - one record that has not landed is exit 2, "not merged yet" - or exit 6 right after
+      `--merge`, where the tool reported the request merged and nothing reached the trunk
+      (a merge train, auto-merge, a required pipeline);
+    - one record whose commit is not in this clone raises out of `landed`, unless `force`,
+      which judges nothing and lands it with a sha of None: the trunk is caught up and the
+      branch is kept;
+    - with several, an unjudged record is listed and kept instead, and none of them landed
+      is the same exit 2, naming each with its merge request.
+
+    Rule 5 is reported here, not enforced: a shipped commit reachable only through a merge
+    commit's second parent is a WARNING beside its verdict."""
+    trunk_name = f"{ctx.origin}/{ctx.trunk}"
+    trunk_ref = f"refs/remotes/{trunk_name}"
+    several = len(chosen) > 1
+    landings = []                          # (entry, landed sha or None under --force, how)
+    waiting = []                           # (entry, why) - only with several
+    for e in chosen:
+        kind, commit = e["kind"], e["commit"]
+        label = f"`{e['branch']}` " if several else ""
+        ancestry = f"git merge-base --is-ancestor {sh_arg(short(commit))} {sh_arg(trunk_name)}"
+        try:
+            sha, how = landed(ctx, e)
+        except Fail:
+            if several:
+                step("landed?", ancestry, f"{label}cannot verify here - {short(commit)} is "
+                                          f"not in this clone")
+                waiting.append((e, "cannot verify here"))
+                continue
+            if not force:
+                raise
+            sha, how = None, ""         # nothing to judge - and `--force` judges nothing
+        if sha is None:
+            if several:
+                step("landed?", ancestry, f"no - {label}{short(commit)} is not on {trunk_name}")
+                waiting.append((e, f"not on {trunk_name} yet"))
+                continue
+            if not force:
+                step("landed?", ancestry, f"no - {short(commit)} is not on {trunk_name}")
+                if after_merge:
+                    there = trunk_worktree_elsewhere(ctx)
+                    where = f" in {there}, where `{ctx.trunk}` is checked out" if there else ""
+                    raise Fail(f"the platform tool reported the merge request merged, but "
+                               f"{trunk_name} does not have {short(commit)} - the merge is "
+                               f"queued or waiting (a merge train, auto-merge, a required "
+                               f"pipeline?); once it is on {trunk_name}, run "
+                               f"`{land_cmd(e['branch'])}`{where}",
+                               EXIT_NOT_MERGED)
+                note = ""
+                if kind == "sync":
+                    note = (f"; if it was squashed or rebased in the UI, rule 5 was broken "
+                            f"(see rules.md) - `{land_cmd(force=True)}` fast-forwards anyway")
+                others = landed_others(ctx, e) if implicit else []
+                if others:
+                    note += ("\n  other merge requests have landed - land each by its name: "
+                             + ", ".join(f"`{land_cmd(b)}`" for b in others))
+                request = e.get("mr") or f"`{e['branch']}`"
+                if ctx.dry_run:
+                    # a dry run does not fetch - a fetch writes FETCH_HEAD, the
+                    # remote-tracking refs and objects - so the ancestry above was asked of
+                    # the refs on disk. Saying "merge it" on that would be a guess; the
+                    # `fetch` line says what the server has, and this says what it means
+                    raise Fail(f"this dry run did not fetch, so it cannot tell whether MR "
+                               f"{request} has landed: from the refs on disk "
+                               f"{short(commit)} is not on {trunk_name}, and the `fetch` "
+                               f"line above says what {ctx.origin} has now. Run "
+                               f"`{land_cmd()}` without `--dry-run` to fetch and "
+                               f"decide{note}")
+                raise Fail(f"MR {request} is not on {trunk_name} yet - merge it, then run "
+                           f"`{land_cmd()}` again{note}")
+            step("landed?", ancestry, "landing not verified (--force): fast-forwarding to "
+                                      f"whatever {trunk_name} holds")
+        else:
+            cmd = ancestry if how == "ancestor" else (
+                f"git cherry {sh_arg(short(commit))} {sh_arg(trunk_name)} "
+                f"{sh_arg(short(e['base']))}")
+            step("landed?", cmd, f"yes - {label}as {short(sha)} ({how})")
+            if kind == "ship" and how == "ancestor":
+                # a fast-forward puts the shipped commit on the trunk's first-parent line; a
+                # merge commit keeps its SHA too, but hangs it off a second parent
+                first = git("rev-list", "--first-parent", f"{e['base']}..{trunk_ref}",
+                            cwd=ctx.root, check=False).split()
+                if sha not in first:
+                    print(f"  WARNING: the ship MR {label}was merged as a merge commit - rule "
+                          f"5 asks for a fast-forward; check the project's merge method "
+                          f"(`forkflow setup` reports it)")
+        landings.append((e, sha, how))
+    if not landings:                       # only with several: one alone has raised above
+        lines = "".join(f"\n  `{e['branch']}` (MR {e.get('mr') or '-'}): {why}"
+                        for e, why in waiting)
+        if ctx.dry_run:
+            # the sentence the single-record path above raises, for the same reason: a dry
+            # run does not fetch, so every "no" printed above was read off the refs on
+            # disk. Sending a user to merge requests that are already merged - and that
+            # the very next non-dry `land` lands without complaint - is the guess this
+            # caveat exists to stop, and it was written for one record only
+            raise Fail(f"this dry run did not fetch, so it cannot tell whether anything "
+                       f"pending has landed: from the refs on disk none of these is on "
+                       f"{trunk_name}, and the `fetch` line above says what {ctx.origin} "
+                       f"has now. Run `{land_cmd()}` without `--dry-run` to fetch and "
+                       f"decide:{lines}")
+        raise Fail(f"nothing pending is on {trunk_name} yet - merge, then run `{land_cmd()}` "
+                   f"again:{lines}")
+
+    return landings
+
+
+def report_landing(ctx: Ctx, landings: Sequence[tuple], leftovers: Sequence[str],
+                   several: bool, old: str, new: str) -> None:
+    """What the run did, in the three things it has to say: where the trunk went and that
+    HEAD is on it; a branch origin may still have (GitHub deletes none itself, and only a
+    verified landing gets the hint); and whatever is still pending, in the one format
+    `status` prints it in (`pending_line`)."""
+    moved = f"{short(old)}..{short(new)}" if old != new else f"at {short(new)}"
+    verified = [e["branch"] for e, sha, _ in landings if sha is not None]
+    said = "landed" if verified else "caught up, landing NOT verified"
+    if several:
+        said += " " + ", ".join(f"`{b}`" for b in verified)
+    print(f"  {DRY_PREFIX if ctx.dry_run else ''}{said}: {ctx.trunk} {moved} - you are on "
+          f"{ctx.trunk}")
+    if ctx.platform == "github":
+        for name in leftovers:
+            print(f"  {ctx.origin}/{name} may still exist: git push {sh_arg(ctx.origin)} "
+                  f"--delete {sh_arg(name)}")
+    done = {e["branch"] for e, _, _ in landings}
+    rest = {b: e for b, e in pending_entries(ctx).items() if b not in done}
+    for b in sorted(rest):
+        print(pending_line(ctx, b, rest[b]))
+
+
+def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False,
+                 entry: Optional[dict] = None, branch: str = "") -> None:
+    """The closing step of a ship or a sync, from the `pending` records: fetch, recognise
+    the landing, fast-forward the local trunk, delete the landed branch, forget the record.
+
+    Works after a human merged the merge request, in any later session, and after a
+    "squash and merge" or a "rebase and merge" of a ship (see `landed`). A merge request
+    that is not on the trunk yet is exit 2 and not an error - "not merged yet" - unless
+    `force`, which fast-forwards to whatever origin has, deletes no branch (nothing was
+    verified) and clears the record: the escape hatch for a landing the tool cannot see,
+    for a request that was closed instead of merged, and for a record whose commit is no
+    longer in this clone. Right after `--merge` (`after_merge`) "not on the trunk" is the
+    tool's success that did not land - a merge train, auto-merge - and that is exit 6, not
+    "merge it". Rule 5 is reported, not enforced: a ship that landed as a merge commit is
+    said out loud. A dry run fetches, decides, and prints every mutating step as `would:`;
+    the records stay.
+
+    Which records: see `pending_to_land`. With several, each verified one lands - one
+    fast-forward of the trunk, then each branch - and the rest are reported and kept; none
+    verified is the same exit 2 as for one. Whatever is still pending afterwards is listed
+    as `status` lists it. The record of the branch HEAD is on, picked because nothing was
+    named, answers for itself only: when it has not landed, the exit 2 names every other
+    record that has, each as the `forkflow land <branch>` that lands it.
+
+    Order: a plain `land` refuses what it cannot do here (a stopped rebase, a dirty tree, the
+    trunk checked out in another worktree) before it fetches. After `--merge` the verdict
+    comes first: whether the request reached the trunk is the one thing that run has to
+    say, and a queued merge is exit 6 wherever the trunk is checked out - refused as "the
+    trunk is elsewhere" it read as merged, and `land` there then said "merge it" of a request
+    that was already queued."""
+    chosen = pending_to_land(ctx, entry, branch, force)
+    several = len(chosen) > 1
+    implicit = (entry is None and not branch and not several
+                and chosen[0]["branch"] == current_branch(ctx))
+    resume = land_cmd("" if several else chosen[0]["branch"], force)
+    if not after_merge:
+        land_preflight(ctx, resume)
+
+    trunk_name = f"{ctx.origin}/{ctx.trunk}"
+    rc, cmd, result, err, _ = fetch(ctx, (ctx.origin,), [trunk_name])
+    if rc != 0:
+        step("fetch", cmd, "FAILED")
+        raise Fail(f"fetch failed: {err.strip()}")
+    step("fetch", cmd, result)
+
+    landings = judge_landings(ctx, chosen, force, after_merge, implicit)
+
+    if after_merge:                        # landed: now what this worktree cannot do
+        land_preflight(ctx, resume)
+    old, new = land_trunk(ctx)
+
+    leftovers = []
+    for e, sha, how in landings:
+        name = e["branch"]
+        own_branch = name not in (ctx.trunk, ctx.mirror)
+        if sha is not None and own_branch:
+            land_branch(ctx, e, sha, how)
+        elif sha is None:
+            print(f"  `{name}` is kept: its landing was not verified")
+        # a stale `origin/<branch>` goes under `--force` too: the kept branch is the one most
+        # likely to be shipped again, and that is decided by origin's answer, not by the
+        # landing. The remote-delete hint is for a verified landing only
+        if own_branch and remote_branch_left(ctx, name) and sha is not None:
+            leftovers.append(name)
+        if not ctx.dry_run and not forget_pending(ctx, e):
+            step("pending", "-", f"kept: the record for `{name}` changed while this ran (a new "
+                                 f"ship of it?) - it is not the one that landed")
+        elif not ctx.dry_run and pending_entries(ctx).get(name) == e:
+            # cleared, says `forget_pending`, and it is still there: the write failed
+            step("pending", "-", f"NOT cleared: `{STATE_FILE}` could not be written - `{name}` "
+                                 f"has landed and keeps showing as pending until "
+                                 f"`{land_cmd(name)}` can clear it")
+
+    report_landing(ctx, landings, leftovers, several, old, new)
+
+
+def land_branch(ctx: Ctx, entry: dict, sha: str, how: str) -> None:
+    """Delete the landed branch - what landed is the commit that was pushed, not whatever
+    the branch holds now. A commit made on it after the ship is on no trunk and, pushed by
+    nobody, on no remote: the branch goes only while its tip is still exactly the recorded
+    commit. Then `-d` for an ancestor landing, and `-D` for a rewritten one, which `-d`
+    refuses (the tip is unreachable from the trunk) - the patch is verifiably on the trunk,
+    and the tip is the commit whose patch it is. `-d` alone would not be the guard: `push`
+    sets the branch's upstream, and `-d` accepts a tip that `origin/<branch>` contains."""
+    branch = entry["branch"]
+    flag = "-d" if how == "ancestor" else "-D"
+    cmd = f"git branch {flag} {sh_arg(branch)}"
+    tip = rev(ctx.root, f"refs/heads/{branch}")
+    if not tip:
+        step("branch", cmd, f"`{branch}` is already gone")
+    elif tip != entry["commit"]:
+        step("branch", f"git rev-parse {sh_arg(branch)}",
+             f"kept: `{branch}` is at {short(tip)}, not the {short(entry['commit'])} that "
+             f"was pushed - its later commits did not land")
+    elif ctx.dry_run:
+        step("branch", cmd, f"would delete `{branch}` (landed as {short(sha)})", dry=True)
+    else:
+        rc, out, err = git_rc("branch", flag, branch, cwd=ctx.root)
+        if rc != 0:                 # the landing is done; a branch that will not go is said
+            why = ((err or out).strip().splitlines() or [f"git exit {rc}"])[-1]
+            step("branch", cmd, f"NOT deleted: {why}")
+        else:
+            step("branch", cmd, f"deleted (landed as {short(sha)})")
+
+
+def origin_has_branch(ctx: Ctx, branch: str) -> Optional[bool]:
+    """Origin's own answer (`ls-remote`), not a remote-tracking ref: None when it cannot be
+    asked."""
+    rc, out, _ = git_rc("ls-remote", "--heads", ctx.origin, f"refs/heads/{branch}",
+                        cwd=ctx.root)
+    return None if rc != 0 else bool(out.strip())
+
+
+def drop_stale_tracking(ctx: Ctx, branch: str) -> None:
+    """Remove `origin/<branch>` once origin has said it has no such branch. Left behind -
+    GitLab's `--remove-source-branch`, or anyone's delete, is not seen by a fetch that does
+    not prune - it is the lease the next `ship` of that name offers, and the push refuses a
+    lease on a ref that no longer exists ("stale info")."""
+    tracking = f"{ctx.origin}/{branch}"
+    cmd = f"git branch -d -r {sh_arg(tracking)}"
+    if ctx.dry_run:
+        step("origin", cmd, f"would remove `{tracking}` (gone from {ctx.origin})", dry=True)
+        return
+    rc, out, err = git_rc("branch", "-d", "-r", tracking, cwd=ctx.root)
+    step("origin", cmd, f"removed - `{branch}` is gone from {ctx.origin}" if rc == 0
+         else f"NOT removed: {((err or out).strip().splitlines() or [''])[-1]}")
+
+
+def remote_branch_left(ctx: Ctx, branch: str) -> bool:
+    """After a landing: is `branch` still on origin? When origin no longer has it, the
+    remote-tracking ref this clone kept is stale and goes too (`drop_stale_tracking`).
+    Answers False when there is nothing on origin, or nothing is known here to begin with."""
+    if not has_ref(ctx.root, f"refs/remotes/{ctx.origin}/{branch}"):
+        return False
+    there = origin_has_branch(ctx, branch)
+    if there is None:
+        return False                    # unreachable: say nothing, remove nothing
+    if not there:
+        drop_stale_tracking(ctx, branch)
+    return there
+
+
+def cmd_land(args: argparse.Namespace) -> int:
+    ctx = resolve_ctx(args.dir, args, need_upstream=True, need_trunk=True, strict_mirror=False)
+    header(ctx, "land")
+    land_pending(ctx, force=bool(getattr(args, "force", False)),
+                 branch=getattr(args, "branch", None) or "")
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -2558,6 +5489,8 @@ def template_text(ctx: Ctx) -> str:
         (f'mirror = {toml_string(ctx.mirror)}', "our fast-forward-only copy of it"),
         (f'trunk = {toml_string(ctx.trunk)}', "protected, MR-only branch with our work"),
         ("gate = []", 'e.g. ["make test", "terraform fmt"]'),
+        (f'merge = {toml_string(MERGE_MANUAL)}',
+         '"self": this fork\'s MRs are merged by whoever opened them - enables --merge'),
         (f'sync_prefix = {toml_string(ctx.sync_prefix)}', ""),
         (f'backup_prefix = {toml_string(ctx.backup_prefix)}', ""),
     ]
@@ -2657,7 +5590,7 @@ def setup_upstream_remote(ctx: Ctx, args: argparse.Namespace) -> Optional[str]:
 
 def setup_fetch(ctx: Ctx, upstream: str) -> None:
     """Both remotes, then their HEADs. A failure here has changed nothing yet."""
-    rc, cmd, result, err = fetch(ctx, (ctx.origin, upstream))
+    rc, cmd, result, err, _ = fetch(ctx, (ctx.origin, upstream))
     if rc != 0:
         step("fetch", cmd, "FAILED")
         raise Fail(f"fetch failed - nothing has been changed yet:\n{err.strip()}")
@@ -2746,7 +5679,8 @@ def setup_mirror(ctx: Ctx, target: str) -> None:
             raise Fail(f"cannot compare `{ref}` with `{ctx.up()}`: "
                        f"run `git fetch {sh_arg(ctx.upstream)}`")
     step("mirror", f"git merge-base --is-ancestor {sh_arg(m)} {sh_arg(ctx.up())}",
-         f"`{m}` is a pure copy of `{ctx.up()}` (behind is fine - `forkflow sync` advances it)")
+         f"`{m}` is a pure copy of `{ctx.up()}` (behind is fine - "
+         f"`{rerun_cmd('sync', None)}` advances it)")
 
 
 def setup_trunk(ctx: Ctx, target: str) -> None:
@@ -2962,14 +5896,21 @@ exit $status
 """
 
 
+def shown_argv(cmd: Sequence[str]) -> str:
+    """An argv list as the one line printed for it: quoted with `shlex.quote`, so what is
+    shown is exactly the argv that ran. The merge request's two steps both run a tool and
+    print what they ran; this is the one place that renders it."""
+    return " ".join(shlex.quote(c) for c in cmd)
+
+
 def sh_arg(value: str) -> str:
     """One word of a command this script *prints* for a human or Claude to paste.
 
     Every branch and remote name reaches such a command, and `git check-ref-format` accepts
     `;`, a backtick and `$(` - names that come from `.forkflow.toml`, a tracked file a sync
-    can bring in from upstream. Quoted only when it has to be (`shlex.quote`, as `open_mr`
-    already renders its argv), so an ordinary name prints exactly as the reader expects and
-    only a name that would otherwise be more than one word changes shape."""
+    can bring in from upstream. Quoted only when it has to be (`shlex.quote`, as
+    `shown_argv` renders an argv), so an ordinary name prints exactly as the reader expects
+    and only a name that would otherwise be more than one word changes shape."""
     return shlex.quote(value)
 
 
@@ -2979,8 +5920,8 @@ def sh_quote(value: str) -> str:
     the word early and turn the rest of it into code.
 
     Used for the generated hook and for the platform report's fix commands, which are pasted
-    into a shell by hand; `open_mr` renders an argv list it also runs itself, and quotes that
-    with `shlex.quote` so what is shown is exactly the argv that ran."""
+    into a shell by hand; `shown_argv` renders an argv list this script also runs itself, and
+    quotes that with `shlex.quote` so what is shown is exactly the argv that ran."""
     return "'" + value.replace("'", "'\\''") + "'"
 
 
@@ -3490,9 +6431,10 @@ def setup_template(ctx: Ctx) -> None:
         with open(path, "w") as fh:
             fh.write(template_text(ctx))
         step("template", cmd, "commented template written")
-    if not git_ok("ls-files", "--error-unmatch", CONFIG_FILE, cwd=ctx.root):
-        print(f"    it is untracked: commit {CONFIG_FILE} when you are happy with it, so the "
-              f"branch names and the gate are the same for everyone")
+    if not tracked_config_names(ctx.root):
+        print(f"    it is untracked: when you are happy with it, commit it on a branch off "
+              f"{ctx.origin}/{ctx.trunk} and ship that - never on the trunk or the mirror - so "
+              f"the branch names and the gate are the same for everyone")
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
@@ -3544,6 +6486,7 @@ COMMANDS = {
     "check": cmd_check,
     "sync": cmd_sync,
     "ship": cmd_ship,
+    "land": cmd_land,
     "setup": cmd_setup,
 }
 
@@ -3555,16 +6498,19 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
                         help="repository directory (default: cwd)")
     common.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS,
                         help="report what would happen; move no branch, push nothing, "
-                             "write no config (it does fetch, and simulates the merge)")
+                             "write no config or hook - and fetch nothing (`git ls-remote` "
+                             "reports what each remote has instead). The merge is still "
+                             "simulated, into a scratch directory")
     common.add_argument("--force", action="store_true", default=argparse.SUPPRESS,
                         help="`sync`: recreate an existing sync branch; `setup`: replace a "
-                             "foreign pre-push hook. No effect on status, check or ship")
+                             "foreign pre-push hook. No effect on status, check or ship; "
+                             "`land --force` fast-forwards a landing the tool cannot verify")
 
     p = argparse.ArgumentParser(prog="forkflow", parents=[common],
                                 description=__doc__.split("\n\n")[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter,
                                 epilog="`forkflow.py --test` runs the embedded test suite.")
-    sub = p.add_subparsers(dest="cmd", metavar="{status,check,sync,ship,setup}")
+    sub = p.add_subparsers(dest="cmd", metavar="{status,check,sync,ship,land,setup}")
 
     s = sub.add_parser("status", parents=[common], help="where mirror, trunk and upstream stand")
     s.add_argument("--fetch", action="store_true", help="refresh remote-tracking refs first")
@@ -3577,14 +6523,26 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     sy.add_argument("--continue", dest="cont", action="store_true",
                     help="resume after resolving merge conflicts")
     sy.add_argument("--mr", action="store_true", help="run the merge-request command")
+    sy.add_argument("--merge", action="store_true",
+                    help="open the merge request, merge it, then land it (you end on the "
+                         "trunk); needs merge = \"self\" in " + CONFIG_FILE)
     sy.add_argument("--title", help="merge-request title")
 
     sh = sub.add_parser("ship", parents=[common], help="squash a feature branch onto the trunk's tip")
     sh.add_argument("--continue", dest="cont", action="store_true",
                     help="resume after `git rebase --continue`")
     sh.add_argument("--mr", action="store_true", help="run the merge-request command")
+    sh.add_argument("--merge", action="store_true",
+                    help="open the merge request, merge it, then land it (you end on the "
+                         "trunk); needs merge = \"self\" in " + CONFIG_FILE)
     sh.add_argument("--title", help="merge-request title")
     sh.add_argument("--message-file", help="file with the squashed commit message")
+
+    la = sub.add_parser("land", parents=[common],
+                        help="the MR is merged: fast-forward the local trunk and delete the branch")
+    la.add_argument("branch", nargs="?", metavar="BRANCH",
+                    help="land this branch's pending record (default: the current branch's, "
+                         "else every pending one that has landed)")
 
     st = sub.add_parser("setup", parents=[common], help="make the rules mechanical in this clone")
     st.add_argument("--upstream", metavar="NAME", help="remote name of the original project")
@@ -3599,6 +6557,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     for name, default in (("dir", "."), ("dry_run", False), ("force", False)):
         if not hasattr(args, name):
             setattr(args, name, default)
+    if getattr(args, "merge", False):
+        args.mr = True                   # merging a merge request means opening it first
     return args
 
 
@@ -3777,6 +6737,16 @@ def run_tests() -> None:
     def checked_out(fork: str) -> str:
         return sh("git", "symbolic-ref", "-q", "--short", "HEAD", cwd=fork, check=False)
 
+    def odb(root: str) -> set:
+        """Every file in a clone's object database - loose objects, packs and their indexes.
+
+        What a `--dry-run` must leave exactly as it found it, along with `FETCH_HEAD` and the
+        remote-tracking refs: `git fetch` writes all three and `git merge-tree --write-tree`
+        writes objects, and the earlier rounds' snapshots covered neither."""
+        objects = git_path(root, "objects")
+        return {os.path.join(where, name)
+                for where, _, names in os.walk(objects) for name in names}
+
     def origin_sha(fork: str, branch: str) -> str:
         out = sh("git", "ls-remote", "origin", "refs/heads/" + branch, cwd=fork)
         return out.split("\t")[0] if out else ""
@@ -3803,19 +6773,169 @@ def run_tests() -> None:
             fh.write(body)
         os.chmod(path, 0o755)
 
-    def delete_after_receive(tmp: str, pattern: str = "refs/heads/backup/*") -> None:
-        """A post-receive hook in the bare origin that drops the ref it has just accepted:
-        the push reports success, so only the ls-remote confirmation can catch it."""
+    def post_receive(tmp: str, pattern: str, action: str) -> None:
+        """A post-receive hook in the bare origin that runs `action` (shell, with `$ref` and
+        `$new`) for every accepted ref matching `pattern` - after the push has succeeded."""
         hooks = os.path.join(tmp, "origin.git", "hooks")
         os.makedirs(hooks, exist_ok=True)
         body = ("#!/bin/sh\n"
                 "while read old new ref; do\n"
-                "  case \"$ref\" in %s) git update-ref -d \"$ref\" \"$new\";; esac\n"
-                "done\nexit 0\n" % pattern)
+                "  case \"$ref\" in %s) %s;; esac\n"
+                "done\nexit 0\n" % (pattern, action))
         path = os.path.join(hooks, "post-receive")
         with open(path, "w") as fh:
             fh.write(body)
         os.chmod(path, 0o755)
+
+    def delete_after_receive(tmp: str, pattern: str = "refs/heads/backup/*") -> None:
+        """Origin drops the ref it has just accepted: the push reports success, so only the
+        ls-remote confirmation can catch it."""
+        post_receive(tmp, pattern, 'git update-ref -d "$ref" "$new"')
+
+    def commit_after_receive(tmp: str, pattern: str = "refs/heads/feat/*",
+                             onto: str = "") -> None:
+        """Origin puts one more commit on the branch it has just accepted - a teammate
+        pushing between the push and the merge; only the head-commit guard at merge time can
+        catch it. With `onto`, the commit goes on that branch instead: somebody else's merge
+        request landing on the trunk in the same window."""
+        target = 'refs/heads/%s' % onto if onto else '"$ref"'
+        post_receive(tmp, pattern,
+                     'git update-ref %s "$(git commit-tree "%s^{tree}" -p %s -m teammate)"'
+                     % (target, target, target))
+
+    MERGING_TOOL_URL = {"glab": "https://example.invalid/-/merge_requests/1",
+                        "gh": "https://example.invalid/pull/1"}
+
+    # the fixture fork really does push to a local origin, so the platform and the fork it
+    # names are both supplied here; `TestMrCommandsNameTheFork` proves the URL these stand for
+    # is built from the origin. What the tests using this prove is that the argv the tool
+    # receives carries it - a fake `gh`/`glab` resolves no base repository itself
+    PLATFORM_FORKS = {"gitlab": "ssh://gitlab.example.com/acme/team/widget",
+                      "github": "https://github.com/acme/widget"}
+
+    def on_platform(platform: str):
+        """The fixture fork as a fork on `platform`, named as `PLATFORM_FORKS` has it."""
+        return mock.patch.multiple(sys.modules[__name__],
+                                   detect_platform=lambda url: platform,
+                                   mr_target=lambda ctx: (PLATFORM_FORKS[platform], ""))
+
+    def as_gitlab():
+        """The fixture fork as a GitLab fork (`on_platform`), for the tests that read what
+        a merge request command was given."""
+        return on_platform("gitlab")
+
+    def as_github():
+        return on_platform("github")
+
+    def merging_tool(tmp: str, name: str, trunk: str = "develop") -> None:
+        """A glab/gh on PATH that opens AND merges: the platform simulated, not faked away.
+
+        Its argv goes one argument per line into `<name>-<subcommand>-argv.txt` - `create`
+        and `merge` get separate logs, because the one binary is run twice under `--merge`
+        and a single truncating log would lose the create argv and the body copy
+        (`<name>-body-copy.md`). On `create` it prints a URL in the platform's shape
+        (`FORKFLOW_FAKE_CREATE=fail` makes it exit 1, `=nourl` succeed without a URL). On
+        `merge` it reads the sha from its own `--sha` / `--match-head-commit`, compares it
+        with the tip of the source branch in the bare origin and exits 1 with "head
+        mismatch" when they differ - so the head-commit guard is tested as behaviour, not
+        as an argv string. glab without `--auto-merge=false` does what the real one does:
+        arms merge-when-pipeline-succeeds, says so, exits 0 and moves nothing. Then it
+        merges the way the platform would: glab fast-forwards the bare origin's trunk
+        (`update-ref`) and refuses, as GitLab's ff method does, when the trunk is not an
+        ancestor of the tip; gh `--merge` makes a real merge commit ("Create a merge
+        commit" always does, even when a fast-forward was possible) and gh `--rebase`
+        cherry-picks the commit - a one-commit rebase, new SHA, same patch - both in a temp
+        clone of the origin pushed back, since a bare repository can do neither.
+        `--remove-source-branch` deletes the source branch on origin once merged.
+        `FORKFLOW_FAKE_FAIL=1` in the environment makes the merge exit 1 with a stderr
+        line and move nothing."""
+        origin_git = os.path.join(tmp, "origin.git")
+        script = (
+            'sub="$2"\n'
+            'for a in "$@"; do echo "$a"; done > {logs}/{name}-"$sub"-argv.txt\n'
+            'case "$sub" in\n'
+            'create)\n'
+            '  for a in "$@"; do [ -f "$a" ] && cp "$a" {body}; done\n'
+            '  case "$FORKFLOW_FAKE_CREATE" in\n'
+            '  fail) echo "{name}: not authenticated (FORKFLOW_FAKE_CREATE)" >&2; exit 1;;\n'
+            '  nourl) echo "Creating merge request"; exit 0;;\n'
+            '  esac\n'
+            '  echo "Creating merge request"\n'
+            '  echo {url}\n'
+            '  exit 0;;\n'
+            'merge)\n'
+            '  if [ -n "$FORKFLOW_FAKE_FAIL" ]; then\n'
+            '    echo "{name}: merge refused (FORKFLOW_FAKE_FAIL)" >&2; exit 1\n'
+            '  fi\n'
+            '  branch="$3"; want=""; method=""; now=0; rmsrc=0; prev=""\n'
+            '  for a in "$@"; do\n'
+            '    case "$prev" in --sha|--match-head-commit) want="$a";; esac\n'
+            '    case "$a" in\n'
+            '    --rebase|--merge|--squash) method="$a";;\n'
+            '    --auto-merge=false) now=1;;\n'
+            '    --remove-source-branch) rmsrc=1;;\n'
+            '    esac\n'
+            '    prev="$a"\n'
+            '  done\n'
+            '  tip=$(git --git-dir={origin} rev-parse "refs/heads/$branch") || exit 1\n'
+            '  if [ "$want" != "$tip" ]; then\n'
+            '    echo "{name}: head mismatch: $branch is at $tip, not $want" >&2; exit 1\n'
+            '  fi\n'
+            '  if [ {name} = glab ] && [ "$now" = 0 ]; then\n'
+            '    echo "{name}: auto-merge enabled: $branch merges when its pipeline succeeds"\n'
+            '    exit 0\n'
+            '  fi\n'
+            '  case "$method" in\n'
+            '  --rebase|--merge)\n'
+            '    clone={clone}; rm -rf "$clone"\n'
+            '    git clone -q -b {trunk} {origin} "$clone" >/dev/null 2>&1 || exit 1\n'
+            '    git -C "$clone" config commit.gpgsign false\n'
+            '    GIT_COMMITTER_NAME="{name} platform" GIT_COMMITTER_EMAIL=noreply@example.invalid\n'
+            '    export GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL\n'
+            '    if [ "$method" = --rebase ]; then\n'
+            '      git -C "$clone" cherry-pick "$tip" >/dev/null 2>&1 || {{\n'
+            '        echo "{name}: rebase and merge failed" >&2; exit 1; }}\n'
+            '    else\n'
+            '      git -C "$clone" merge --no-ff -q -m "Merge pull request from $branch" \\\n'
+            '        "$tip" >/dev/null 2>&1 || {{\n'
+            '        echo "{name}: create a merge commit failed" >&2; exit 1; }}\n'
+            '    fi\n'
+            '    git -C "$clone" push -q origin HEAD:{trunk} >/dev/null 2>&1 || exit 1;;\n'
+            '  *)\n'
+            '    trunk=$(git --git-dir={origin} rev-parse refs/heads/{trunk}) || exit 1\n'
+            '    git --git-dir={origin} merge-base --is-ancestor "$trunk" "$tip" || {{\n'
+            '      echo "{name}: fast-forward merge is not possible - rebase needed" >&2; exit 1; }}\n'
+            '    git --git-dir={origin} update-ref refs/heads/{trunk} "$tip" "$trunk" || exit 1;;\n'
+            '  esac\n'
+            '  if [ "$rmsrc" = 1 ]; then\n'
+            '    git --git-dir={origin} update-ref -d "refs/heads/$branch" "$tip" || exit 1\n'
+            '  fi\n'
+            '  echo "merged $branch into {trunk}"\n'
+            '  exit 0;;\n'
+            'esac\n'
+            'echo "{name}: unexpected subcommand $sub" >&2; exit 2\n'
+        ).format(name=name, logs=shlex.quote(tmp), url=shlex.quote(MERGING_TOOL_URL[name]),
+                 body=shlex.quote(os.path.join(tmp, name + "-body-copy.md")),
+                 origin=shlex.quote(origin_git), trunk=shlex.quote(trunk),
+                 clone=shlex.quote(os.path.join(tmp, "platform-clone")))
+        fake_tool(os.path.join(tmp, "bin"), name, script)
+
+    def lines_of(path: str) -> list:
+        """A recorded file as its lines, newline stripped - one argument per line, which is
+        how every fake tool here writes the argv it was given."""
+        with open(path) as fh:
+            return [ln.rstrip("\n") for ln in fh]
+
+    def tool_argv(tmp: str, name: str, sub: str) -> list:
+        """What `merging_tool` recorded for `<name> <mr|pr> <sub>`, [] when it never ran."""
+        path = os.path.join(tmp, "%s-%s-argv.txt" % (name, sub))
+        return lines_of(path) if os.path.exists(path) else []
+
+    def put_pending(fork: str, *entries: dict) -> None:
+        """The shared `pending` map holding exactly `entries`, keyed by branch as
+        `record_pending` keeps it - for a record no run of this clone could have written."""
+        write_state(ctx_for(fork, need_trunk=False, strict_mirror=False), "pending",
+                    {e["branch"]: e for e in entries})
 
     def local_branches(fork: str) -> str:
         return sh("git", "for-each-ref", "--format=%(refname)", "refs/heads/", cwd=fork)
@@ -3849,6 +6969,64 @@ def run_tests() -> None:
     def run(*argv: str):
         return capture(main, list(argv))
 
+    def printed_cmd(text: str, start: str) -> str:
+        """The first command in `text` that begins with `start` - `backticked`, or the tail
+        of a `then: forkflow ...` line: a printed remedy, to be run exactly as the user
+        would paste it."""
+        for cmd in (re.findall(r"`([^`]+)`", text)
+                    + re.findall(r"then: (forkflow [^`\n]+)", text)):
+            if cmd.startswith(start):
+                return cmd.strip()
+        raise AssertionError("no `%s...` printed in: %s" % (start, text))
+
+    def remedy_of(text: str) -> Tuple[str, str]:
+        """The printed case-variant remedy - (the command as printed, the path it copies the
+        working file to first) - read off the command itself, `test ! -e <path> && cp ...`."""
+        cmd = printed_cmd(text, "test ! -e ")
+        return cmd, shlex.split(cmd)[3]
+
+    def no_remedy(text: str) -> None:
+        """Nothing in `text` to run: no command that touches the file or commits."""
+        for start in ("test ", "cp ", "mv ", "git mv", "git rm", "git checkout", "git update-index",
+                      "git commit"):
+            if any(c.startswith(start) for c in re.findall(r"`([^`]+)`", text)):
+                raise AssertionError("a `%s...` command is printed in: %s" % (start, text))
+
+    def run_printed(text: str, start: str, fork: str):
+        """Run the printed `forkflow ...` command that begins with `start`, in `fork`."""
+        return run("-C", fork, *shlex.split(printed_cmd(text, start))[1:])
+
+    SHELL_VERBS = ("test ", "cp ", "mv ", "rm ", "printf ", "git ")
+
+    def run_every_printed(text: str, fork: str) -> list:
+        """Run EVERY shell command `text` prints, in order, exactly as printed, in `fork`;
+        answer what each one exited with.
+
+        A refusal is read by a person who pastes what it shows them, and twice on this
+        branch a remedy that read well did something else when it was actually run. So the
+        tests that cover a printed remedy run the whole of it, from the state it was printed
+        in, and then look at the fork."""
+        ran = []
+        for cmd in re.findall(r"`([^`]+)`", text):
+            if not cmd.startswith(SHELL_VERBS):
+                continue
+            ran.append((cmd, subprocess.run(["sh", "-c", cmd], cwd=fork,
+                                            capture_output=True).returncode))
+        return ran
+
+    def without_stamp(text: str) -> str:
+        """The same message with `keep_aside`'s `forkflow-config-<UTC>.toml` names taken
+        out. Two calls a second apart word a refusal identically but for that stamp, so a
+        test comparing one refusal with another must not depend on which side of a tick of
+        the clock it landed on."""
+        return re.sub(r"forkflow-config-\d{8}-\d{6}\.toml", "forkflow-config-STAMP.toml", text)
+
+    def kept_configs(fork: str) -> list:
+        """The copies a remedy made, newest name last - `keep_aside`'s destinations."""
+        gitdir = os.path.dirname(git_path(fork, "x"))
+        return sorted(os.path.join(gitdir, n) for n in os.listdir(gitdir)
+                      if n.startswith("forkflow-config-"))
+
     def ctx_for(fork: str, need_upstream: bool = True, need_trunk: bool = True,
                 strict_mirror: bool = True, **ns) -> Ctx:
         ns.setdefault("dry_run", False)
@@ -3871,6 +7049,11 @@ def run_tests() -> None:
             stack.enter_context(mock.patch.object(sys.modules[__name__], "utc_stamp",
                                                   frozen_utc_stamp))
             self.addCleanup(stack.close)
+
+        def value(self, argv: Sequence[str], flag: str) -> str:
+            """The argument after `flag` in a recorded argv - which has to carry the flag."""
+            self.assertIn(flag, argv)
+            return argv[list(argv).index(flag) + 1]
 
     # ------------------------------------------------------------------- #
     # pure helpers
@@ -3974,6 +7157,16 @@ def run_tests() -> None:
                     load_config(self.tmp)
             self.assertEqual(cm.exception.code, 2)
             self.assertIn("3.11", str(cm.exception))
+            # the way out it names keeps the file and its settings: every line a comment
+            self.assertIn("into a `#` comment", str(cm.exception))
+            path = os.path.join(self.tmp, CONFIG_FILE)
+            with open(path) as fh:
+                lines = fh.read().splitlines()
+            write(self.tmp, CONFIG_FILE, "".join("# %s\n" % ln for ln in lines))
+            with mock.patch.dict(sys.modules, {"tomllib": None}):
+                self.assertEqual(load_config(self.tmp), {})
+            with open(path) as fh:
+                self.assertIn('trunk = "trunk"', fh.read())
 
         @needs_tomllib
         def test_a_value_of_the_wrong_type_is_fatal(self):
@@ -4005,6 +7198,79 @@ def run_tests() -> None:
                     load_config(self.tmp)
             self.assertEqual(cm.exception.code, 2)
             self.assertIn("3.11", str(cm.exception))
+
+        @needs_tomllib
+        def test_merge_is_manual_or_self_and_nothing_else(self):
+            """`merge` decides whether `--merge` may merge at all: a spelling nobody defined
+            is refused outright rather than read as one of the two."""
+            for text, expected in (('merge = "self"\n', "self"), ('merge = "manual"\n', "manual")):
+                write(self.tmp, CONFIG_FILE, text)
+                self.assertEqual(load_config(self.tmp)["merge"], expected, text)
+            write(self.tmp, CONFIG_FILE, 'trunk = "develop"\n')
+            self.assertNotIn("merge", load_config(self.tmp))              # absent: the default
+            for text in ('merge = "auto"\n', 'merge = "Self"\n', 'merge = ""\n'):
+                write(self.tmp, CONFIG_FILE, text)
+                with self.assertRaises(Fail) as cm:
+                    load_config(self.tmp)
+                self.assertEqual(cm.exception.code, 2, text)
+                self.assertIn('`merge` must be "manual" or "self"', str(cm.exception))
+            write(self.tmp, CONFIG_FILE, "merge = true\n")
+            with self.assertRaises(Fail) as cm:
+                load_config(self.tmp)
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("`merge` must be a string", str(cm.exception))
+
+        def test_a_name_that_differs_only_in_case_is_refused(self):
+            """The directory lists `.ForkFlow.toml` and no `.forkflow.toml` - true on every
+            filesystem once that one file is written. A case-insensitive one would open it
+            as the config while git's case-exact paths call it absent; a case-sensitive one
+            would silently ignore the file every other tool there reads. Refused either way,
+            naming the file that was found."""
+            for variant in (".ForkFlow.toml", ".FORKFLOW.TOML", ".forkflow.TOML"):
+                path = write(self.tmp, variant, 'gate = ["true"]\n')
+                self.assertIn(variant, os.listdir(self.tmp))
+                self.assertNotIn(CONFIG_FILE, os.listdir(self.tmp))
+                with self.assertRaises(Fail) as cm:
+                    load_config(self.tmp)
+                self.assertEqual(cm.exception.code, 2, variant)
+                self.assertIn("`%s`" % variant, str(cm.exception))
+                os.unlink(path)
+            self.assertEqual(load_config(self.tmp), {})
+
+        @needs_tomllib
+        def test_an_untracked_variant_is_renamed_by_the_command_printed(self):
+            """Nothing tracked: the printed remedy copies the file into the git directory,
+            then renames it to the exact name - run as printed, the file keeps its content
+            and is read, and the copy is where the message said. No `.forkflow.toml` is
+            listed beside it, so on either kind of filesystem the rename replaces nothing.
+            The same line run twice stops before it could copy over the saved file."""
+            sh("git", "init", "-q", self.tmp)
+            write(self.tmp, ".ForkFlow.toml", 'trunk = "mine"\n')
+            with self.assertRaises(Fail) as cm:
+                load_config(self.tmp)
+            cmd, kept = remedy_of(str(cm.exception))
+            sh("sh", "-c", cmd, cwd=self.tmp)
+            self.assertIn(CONFIG_FILE, os.listdir(self.tmp))
+            self.assertNotIn(".ForkFlow.toml", os.listdir(self.tmp))
+            self.assertEqual(load_config(self.tmp), {"trunk": "mine"})
+            self.assertEqual(os.path.dirname(kept), os.path.join(self.tmp, ".git"))
+            with open(kept) as fh:
+                self.assertEqual(fh.read(), 'trunk = "mine"\n')
+            write(self.tmp, CONFIG_FILE, 'trunk = "edited since"\n')
+            self.assertNotEqual(subprocess.run(["sh", "-c", cmd], cwd=self.tmp,
+                                               capture_output=True).returncode, 0)
+            with open(kept) as fh:
+                self.assertEqual(fh.read(), 'trunk = "mine"\n')             # not copied over
+            self.assertEqual(load_config(self.tmp), {"trunk": "edited since"})
+
+        @needs_tomllib
+        def test_the_exact_name_is_read_when_a_variant_sits_beside_it(self):
+            """Only a case-sensitive filesystem can hold both; there git and the open() agree
+            on which file is `.forkflow.toml`, so it is read and the variant is not the
+            config."""
+            write(self.tmp, CONFIG_FILE, 'trunk = "trunk"\n')
+            with mock.patch.object(os, "listdir", return_value=[".ForkFlow.toml", CONFIG_FILE]):
+                self.assertEqual(load_config(self.tmp), {"trunk": "trunk"})
 
     # ------------------------------------------------------------------- #
     # resolve_ctx
@@ -4121,9 +7387,15 @@ def run_tests() -> None:
                 self.assertEqual(code, 0, " ".join(argv) + ": " + err + out)
             sh("git", "switch", "-c", "feat/x", cwd=fork)
             commit_fork(fork, "ours/a.txt", "a\n", "ours: a")
-            code, out, err = run("-C", fork, "ship", "--dry-run")   # fetches origin only
+            code, out, err = run("-C", fork, "ship", "--dry-run")   # origin only, and no fetch
             self.assertEqual(code, 0, err + out)
-            code, out, err = run("-C", fork, "sync", "--dry-run")   # fetches upstream itself
+            # a dry run writes nothing, so it does not fetch either - and against an
+            # `upstream/*` this stale it says that, rather than calling a teammate's sync
+            # rule 6. The real run fetches upstream itself and goes through
+            code, out, err = run("-C", fork, "sync", "--dry-run")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("did not fetch", err)
+            code, out, err = run("-C", fork, "sync")
             self.assertEqual(code, 0, err + out)
 
         def test_a_commit_on_top_of_a_teammates_mirror_is_still_divergence(self):
@@ -4364,7 +7636,7 @@ def run_tests() -> None:
             for line in out.splitlines():
                 if "  $ " in line:
                     found.append(line.split("  $ ", 1)[1].split("  -> ")[0])
-                for marker in ("rollback: ", "fix: ", "after the MR is merged: "):
+                for marker in ("rollback: ", "fix: ", "may still exist: "):
                     if marker in line:
                         found.append(line.split(marker, 1)[1])
             return found
@@ -4392,16 +7664,47 @@ def run_tests() -> None:
             commit_upstream(self.tmp, "src/app.py", "def main():\n    return 3\n")
             sh("git", "checkout", "-b", "feat/x", self.TRUNK, cwd=fork)
             commit_fork(fork, "ours/f.txt", "ours\n", "ours: step")
+            # a `pending` entry nothing landed, so `land --force --dry-run` prints the
+            # checkout it would run, with the trunk's name in it (the fast-forward, the branch
+            # deletion and the remote delete: `test_a_verified_landing_prints_every_...`)
+            put_pending(fork, {"kind": "ship", "branch": "feat/x", "commit": rev(fork, "feat/x"),
+                               "base": origin_sha(fork, self.TRUNK), "mr": ""})
 
             names, seen = (self.TRUNK, self.PREFIX), set()
             for argv in (("status", "--fetch"), ("check",), ("sync", "--dry-run"),
-                         ("ship", "--dry-run"), ("setup", "--dry-run")):
+                         ("ship", "--dry-run"), ("land", "--force", "--dry-run"),
+                         ("setup", "--dry-run")):
                 code, out, err = run("-C", fork, *argv)
                 self.assertEqual(code, 0, " ".join(argv) + ": " + err + out)
                 self.assertTrue(self.commands(out), "no commands printed by " + argv[0])
                 seen |= self.quoted(out, names)
             # and both names really did reach one, so the check above had something to judge
             self.assertEqual(seen, set(names))
+
+        @needs_tomllib
+        def test_a_verified_landing_prints_every_command_quoted(self):
+            """The landing that moves the trunk and deletes a branch prints the most: the
+            checkout, the fast-forward, the branch deletion and, on GitHub, the remote
+            delete - with a hostile trunk name and a hostile branch name in them."""
+            feature = "feat;touch$(id)"
+            fork = make_fork(self.tmp, trunk=self.TRUNK, config='trunk = "%s"\n' % self.TRUNK)
+            sh("git", "checkout", "-b", feature, self.TRUNK, cwd=fork)
+            commit = commit_fork(fork, "ours/f.txt", "ours\n", "ours: step")
+            sh("git", "push", "origin", "refs/heads/%s:refs/heads/%s" % (feature, feature),
+               cwd=fork)
+            put_pending(fork, {"kind": "ship", "branch": feature, "commit": commit,
+                               "base": origin_sha(fork, self.TRUNK), "mr": ""})
+            sh("git", "--git-dir=" + os.path.join(self.tmp, "origin.git"), "update-ref",
+               "refs/heads/" + self.TRUNK, commit)                  # merged: the trunk moves
+            sh("git", "fetch", "-q", "origin", cwd=fork)     # a dry run of its own does not
+            with on_platform("github"):
+                code, out, err = run("-C", fork, "land", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            printed = self.commands(out)
+            for verb in ("git checkout ", "git merge --ff-only ", "git branch -d ",
+                         "git push origin --delete "):
+                self.assertTrue([c for c in printed if c.startswith(verb)], verb + ":\n" + out)
+            self.assertEqual(self.quoted(out, (self.TRUNK, feature)), {self.TRUNK, feature})
 
     class TestState(Base):
         """`--continue` force-pushes, and rule 4 allows that only behind the backup the run it
@@ -4433,13 +7736,19 @@ def run_tests() -> None:
             self.assertEqual(sh("git", "status", "--porcelain", cwd=fork), "")
 
         def test_an_absent_or_unreadable_file_is_no_state_rather_than_a_crash(self):
+            """READING stays tolerant, so nothing that does not depend on the state file
+            fails over one that cannot be read. Writing does not: see
+            `test_a_state_file_that_cannot_be_read_refuses_merge_and_is_kept`."""
             ctx = ctx_for(make_fork(self.tmp))
             self.assertEqual(read_state(ctx), {})                        # absent
+            self.assertEqual(state_unreadable(ctx), "")                  # and no complaint
             for text in ("{not json", '["a", "list"]', ""):
                 with open(state_path(ctx), "w") as fh:
                     fh.write(text)
                 self.assertEqual(read_state(ctx), {}, repr(text))
                 self.assertEqual(resumable(ctx, "ship", "feat/x"), {})
+                self.assertIn(state_path(ctx), state_unreadable(ctx), repr(text))
+            os.unlink(state_path(ctx))              # what the refusal says to do about it
             write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"})
             self.assertEqual(resumable(ctx, "ship", "feat/x")["backup"], "b")
 
@@ -4461,6 +7770,447 @@ def run_tests() -> None:
             self.assertEqual(resumable(here, "ship", "feat/x")["backup"], "here")
             self.assertEqual(resumable(there, "ship", "feat/other")["backup"], "there")
             self.assertEqual(resumable(here, "ship", "feat/other"), {})
+
+        def test_the_pending_record_is_one_for_every_worktree(self):
+            """What waits to land is the clone's, not the worktree's: a ship in a linked
+            worktree lands where the trunk is checked out. The resume entries stay apart."""
+            fork = make_fork(self.tmp)
+            other = os.path.join(self.tmp, "wt")
+            sh("git", "worktree", "add", "-b", "feat/other", other, "develop", cwd=fork)
+            here, there = ctx_for(fork), ctx_for(other)
+            write_state(there, "ship", {"branch": "feat/other", "backup": "there"})
+            record_pending(there, "ship", "feat/other", rev(fork, "origin/develop"))
+            self.assertEqual(state_path(here, shared=True), state_path(there, shared=True))
+            self.assertEqual(state_path(here, shared=True), state_path(here))  # the main one's
+            self.assertEqual(list(pending_entries(here)), ["feat/other"])
+            self.assertEqual(pending_entries(here), pending_entries(there))
+            self.assertEqual(resumable(here, "ship", "feat/other"), {})       # not shared
+            write_state(here, "pending", None)
+            self.assertEqual(pending_entries(there), {})
+            self.assertEqual(resumable(there, "ship", "feat/other")["backup"], "there")
+
+        def test_an_interrupted_write_leaves_the_old_file_whole(self):
+            """Written in place, a write that dies half way truncates the JSON, and the next
+            read answers {} - every record in it lost. Replaced whole, it is old or new."""
+            ctx = ctx_for(make_fork(self.tmp))
+            write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"})
+
+            def dies(data, fh, **kw):
+                fh.write('{"half')
+                raise OSError("disk full")
+
+            with mock.patch.object(json, "dump", dies):
+                write_state(ctx, "sync", {"branch": "sync/x", "backup": "b2"})
+            self.assertEqual(resumable(ctx, "ship", "feat/x")["backup"], "b")
+            self.assertEqual(os.listdir(os.path.dirname(state_path(ctx))).count(STATE_FILE), 1)
+            self.assertEqual([f for f in os.listdir(os.path.dirname(state_path(ctx)))
+                              if f.startswith(STATE_FILE + ".")],
+                             [os.path.basename(state_lock_path(state_path(ctx)))])
+            # no temp left: the one file beside it is the lock, which is never removed
+
+        def test_a_write_that_cannot_happen_is_answered_not_swallowed(self):
+            """Every failure here was swallowed, so a state file that cannot be written -
+            a read-only git directory, a full disk, a `forkflow-state.json` that is not a
+            file - was invisible, and the run went on to report a branch as landable with
+            no record of it. The answer is the reason, for the caller to say what it cost."""
+            ctx = ctx_for(make_fork(self.tmp))
+            self.assertEqual(write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"}), "")
+            os.unlink(state_path(ctx))
+            os.mkdir(state_path(ctx))                       # nothing can be written there
+            why = write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"})
+            self.assertIn(STATE_FILE, why)
+            self.assertIn("nothing was written", why)
+            self.assertEqual(read_state(ctx), {})
+            # a directory there cannot be read either, and that is what is answered first -
+            # a file that cannot be READ is never written over. `save_state` answers for
+            # itself too, so a caller reaching it directly is not left guessing
+            self.assertIn(STATE_FILE, save_state(ctx, {"a": 1}))
+            os.rmdir(state_path(ctx))
+            self.assertEqual(write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"}), "")
+
+        def test_the_read_and_the_write_it_leads_to_are_one_operation(self):
+            """`os.replace` makes each write whole for a READER and does nothing about the
+            window between a caller's read and its own write. Two worktrees recording their
+            own ship read the same map, each adds its branch, and the second write puts the
+            map back as the first found it: eight concurrent ships left ONE record, and the
+            ships whose records went are landable by nothing the tool offers.
+
+            Deterministic here: another run takes the file's lock and writes its record
+            only after this one has asked for it. Unlocked, this run's read comes first and
+            its write is the one the other run then overwrites."""
+            import threading
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            sh("git", "branch", "feat/b", "develop", cwd=fork)
+            path = state_path(ctx, shared=True)
+            theirs = {"kind": "ship", "branch": "feat/a", "commit": "a" * 40,
+                      "base": "b" * 40, "mr": ""}
+            holding = threading.Event()
+
+            def other_run():
+                held = take_state_lock(path)
+                holding.set()
+                time.sleep(0.2)                    # long after this run has asked for it
+                save_state(ctx, {"pending": {"feat/a": theirs}}, shared=True)
+                drop_state_lock(held)
+
+            thread = threading.Thread(target=other_run)
+            thread.start()
+            self.assertTrue(holding.wait(5))
+            mine = record_pending(ctx, "ship", "feat/b", rev(fork, "origin/develop"))
+            thread.join()
+            self.assertEqual(pending_entries(ctx), {"feat/a": theirs, "feat/b": mine})
+            # the lock file stays; what was given up is the kernel's lock on it, so the
+            # next run takes it without anything having to decide the file is stale
+            self.assertTrue(os.path.exists(state_lock_path(path)))
+            drop_state_lock(take_state_lock(path))
+
+        def test_the_lock_a_killed_run_held_is_released_by_the_operating_system(self):
+            """The whole reason the lock is the kernel's. A real other process takes it and
+            is KILLED holding it - no chance to clean up, the case the old design answered
+            by calling a ten-minute-old lock file "stale" and unlinking it. Here nothing is
+            judged and nothing is unlinked: the lock dies with the process that held it, so
+            the next run takes it at once, and the lock FILE is still there afterwards
+            because removing it is what let one run release another's."""
+            if fcntl is None:                             # pragma: no cover - not POSIX
+                self.skipTest("this platform's lock is not fcntl.flock")
+            ctx = ctx_for(make_fork(self.tmp))
+            path = state_path(ctx, shared=True)
+            lock = state_lock_path(path)
+            holder = subprocess.Popen(
+                [sys.executable, "-c",
+                 "import fcntl, os, sys, time\n"
+                 "fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)\n"
+                 "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+                 "sys.stdout.write('held\\n')\n"
+                 "sys.stdout.flush()\n"
+                 "time.sleep(300)\n", lock],
+                stdout=subprocess.PIPE, universal_newlines=True)
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "held")
+                with mock.patch.object(sys.modules[__name__], "STATE_LOCK_WAIT", 0.05):
+                    why = write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"})
+                self.assertIn("held by another forkflow run", why)   # while it lives
+                self.assertEqual(read_state(ctx), {})
+            finally:
+                holder.kill()
+                holder.wait()
+                holder.stdout.close()
+            started = time.monotonic()
+            self.assertEqual(write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"}), "")
+            self.assertLess(time.monotonic() - started, STATE_LOCK_WAIT)
+            self.assertEqual(resumable(ctx, "ship", "feat/x")["backup"], "b")
+            self.assertTrue(os.path.exists(lock))         # never removed, by anyone
+
+        def test_a_platform_with_no_lock_refuses_rather_than_writing_unserialised(self):
+            """`fcntl` on POSIX, `msvcrt` on Windows; a Python with neither cannot keep two
+            runs apart, and the answer is a refusal that says which module is missing -
+            never a write that silently loses another run's records."""
+            ctx = ctx_for(make_fork(self.tmp))
+            module = sys.modules[__name__]
+            with mock.patch.object(module, "fcntl", None), \
+                 mock.patch.object(module, "msvcrt", None):
+                why = write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"})
+            self.assertIn("neither `fcntl` nor `msvcrt`", why)
+            self.assertIn("nothing was written", why)
+            self.assertEqual(read_state(ctx), {})
+            self.assertEqual(write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"}), "")
+
+        def test_a_filesystem_that_will_not_lock_refuses_and_names_the_reason(self):
+            """A network mount can answer the lock call with an error rather than with "held
+            by somebody else". That is not another run to wait for, so there is nothing to
+            wait for: it refuses at once, names what the operating system said, and writes
+            nothing. No fallback - every fallback here is another staleness judgement."""
+            if fcntl is None:                             # pragma: no cover - not POSIX
+                self.skipTest("this platform's lock is not fcntl.flock")
+            ctx = ctx_for(make_fork(self.tmp))
+
+            def unsupported(fd, flags):
+                raise OSError(errno.ENOLCK, "No locks available")
+
+            with mock.patch.object(fcntl, "flock", unsupported):
+                started = time.monotonic()
+                why = write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"})
+            self.assertLess(time.monotonic() - started, STATE_LOCK_WAIT)
+            self.assertIn("will not lock", why)
+            self.assertIn("No locks available", why)
+            self.assertIn("nothing was written", why)
+            self.assertEqual(read_state(ctx), {})
+
+        def test_a_lock_held_now_is_waited_for_and_then_given_up(self):
+            """The wait is bounded: a run that cannot get the lock answers why, and says
+            nothing was written rather than writing over what the holder is writing."""
+            ctx = ctx_for(make_fork(self.tmp))
+            path = state_path(ctx, shared=True)
+            held = take_state_lock(path)
+            try:
+                with mock.patch.object(sys.modules[__name__], "STATE_LOCK_WAIT", 0.05):
+                    why = write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"})
+            finally:
+                drop_state_lock(held)
+            self.assertIn("held by another forkflow run", why)
+            self.assertIn(state_lock_path(path), why)   # the file, so it can be looked at
+            self.assertIn("released the moment the run holding it ends", why)
+            self.assertEqual(read_state(ctx), {})
+            self.assertEqual(write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"}), "")
+
+        def test_no_number_of_published_versions_costs_this_fork_merge(self):
+            """HOW MANY versions the original project publishes is the project's choice, so
+            no count this fork refuses on can be a count the project cannot reach. The memory
+            was bounded at 500 twice over, and each bound was an attack:
+
+            - dropping the oldest to make room handed the project the EVICTION. Publish
+              enough and the digest of the file sitting untracked in this working tree falls
+              out; withdraw that version from every ref and no fail-closed condition fires
+              (`f10/repro15.py`).
+            - keeping the bound and refusing permanently on it handed the project a DENIAL
+              OF SERVICE for the same effort: 501 versions of one small file in 8.3 seconds
+              of scripted commits, and every fork that fetched that upstream lost `--merge`
+              for good - with a printed way out that did not work, because deleting the state
+              file only let the next run re-walk the refs and re-arm the flag (`q1/mem.py
+              m03`, `q1/mem2.py n04`).
+
+            So there is no count. Nothing is dropped, so nothing can be evicted; nothing is
+            refused for being too much, so nothing can be filled. A digest is about 70 bytes.
+            """
+            ctx = ctx_for(make_fork(self.tmp))
+            rid = repo_id(ctx.upstream_url, ctx.root)
+            digests = ["%064x" % n for n in range(1000)]
+            for start in range(0, len(digests), 50):
+                chunk = digests[start:start + 50]
+                known, why = remember_upstream_configs(ctx, {rid: set(chunk)})
+                self.assertEqual(why, "", start)
+                self.assertTrue(set(chunk) <= known, start)
+            self.assertEqual(sorted(remembered_upstream_configs(ctx)), sorted(digests))
+            self.assertEqual(config_memory_unprovable(ctx), "")
+            self.assertEqual(upstream_config_digests(ctx)[1], "")
+            # and no way out has to be printed, because nothing was refused
+            self.assertEqual(fork_config_state(ctx)[2], "")
+
+        def test_a_clone_the_old_bound_refused_answers_normally_again(self):
+            """The flag that bound wrote is still in the state files of every clone it
+            caught, and it was permanent BY DESIGN - no ordinary run could clear it. Nothing
+            reads it now, so those clones are not left refused for good by a defence that has
+            been withdrawn."""
+            ctx = ctx_for(make_fork(self.tmp))
+            change_state(ctx, True,
+                         lambda data: data.update({"upstream_configs_full": True}))
+            self.assertEqual(config_memory_unprovable(ctx), "")
+            self.assertEqual(upstream_config_digests(ctx)[1], "")
+            self.assertEqual(
+                remember_upstream_configs(ctx, {repo_id(ctx.upstream_url, ctx.root):
+                                                {"a" * 64}}),
+                ({"a" * 64}, ""))
+
+        def test_a_project_that_publishes_a_thousand_configs_still_merges(self):
+            """The same fact end to end rather than at the reader: the original project
+            publishes version after version of its `.forkflow.toml`, this fork fetches them
+            all, and its own untracked `merge = "self"` still answers for `merge`. This is
+            the shape `q1/mem.py m03` reproduced at 501 versions; the count here is what
+            keeps the test under a second."""
+            fork = make_fork(self.tmp)
+            mine = 'merge = "self"\ngate = ["make test"]\n'
+            write(fork, CONFIG_FILE, mine)
+            self.assertEqual(fork_merge_mode(ctx_for(fork)), "self")
+            seed = os.path.join(self.tmp, "seed")
+            for n in range(60):
+                write(seed, CONFIG_FILE, "# theirs v%d\n" % n)
+                sh("git", "add", "-A", cwd=seed)
+                sh("git", "commit", "-q", "-m", "theirs: v%d" % n, cwd=seed)
+            sh("git", "push", "-q", "origin", "main", cwd=seed)
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            ctx = ctx_for(fork)
+            self.assertGreaterEqual(len(upstream_config_digests(ctx)[0]), 60)
+            self.assertEqual(upstream_config_digests(ctx)[1], "")
+            self.assertEqual(fork_config_state(ctx)[0], "untracked_own")
+            self.assertEqual(fork_merge_mode(ctx), "self")
+
+        def test_a_memory_that_cannot_be_written_is_a_refusal_not_a_short_answer(self):
+            """A version the original project has since withdrawn would read as one it never
+            had, so a memory that cannot be written answers with the reason and leaves the
+            way out that needs no state file at all - have the request merged by hand."""
+            ctx = ctx_for(make_fork(self.tmp))
+            one = {repo_id(ctx.upstream_url, ctx.root): {"a" * 64}}
+            os.mkdir(state_path(ctx, shared=True))          # nothing can be written there
+            known, why = remember_upstream_configs(ctx, one)
+            self.assertEqual(known, set())
+            self.assertIn("cannot write down which", why)
+            self.assertIn(CONFIG_FILE, why)
+            self.assertIn("merged by hand", why)
+            os.rmdir(state_path(ctx, shared=True))
+            self.assertEqual(remember_upstream_configs(ctx, one), ({"a" * 64}, ""))
+
+        def test_a_dry_run_writes_down_no_upstream_config(self):
+            """The no-write contract: a dry run answers with the memory plus what it walked
+            and leaves no file behind."""
+            ctx = ctx_for(make_fork(self.tmp), dry_run=True)
+            one = {repo_id(ctx.upstream_url, ctx.root): {"a" * 64}}
+            self.assertEqual(remember_upstream_configs(ctx, one), ({"a" * 64}, ""))
+            self.assertFalse(os.path.exists(state_path(ctx, shared=True)))
+
+        def test_a_state_file_that_cannot_be_read_refuses_merge_and_is_kept(self):
+            """An unreadable state file used to answer `{}` and say nothing, which forgets
+            `upstream_configs` - the only thing that answers a version upstream has
+            withdrawn from every ref. One truncated write and upstream's own file read as
+            this fork's own (`f10/repro15.py`). Worse, the next write put the file back with
+            one key in it, so the record was gone for good and the refusal could be flushed
+            by any ordinary ship.
+
+            Now: `--merge` is refused, naming the file and what deleting it costs; the file
+            is not written over; and everything that does not depend on the memory goes on
+            working, because a corrupt state file is not a reason for the tool to stop."""
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            shared = state_path(ctx, shared=True)
+            one = {repo_id(ctx.upstream_url, ctx.root): {"a" * 64}}
+            remember_upstream_configs(ctx, one)
+            with open(shared) as fh:
+                whole = fh.read()
+            for damage in (whole[:len(whole) // 2], "", "[1, 2]", "not json at all"):
+                with open(shared, "w") as fh:
+                    fh.write(damage)
+                why = config_memory_unprovable(ctx)
+                self.assertIn(shared, why, repr(damage))
+                self.assertIn("delete it", why)
+                self.assertIn("merged by hand", why)
+                self.assertEqual(upstream_config_digests(ctx), (set(), why))
+                self.assertEqual(fork_config_state(ctx)[0], "unprovable")
+                self.assertEqual(fork_merge_mode(ctx), "manual")
+                # not written over, and the reason says what the write would have cost
+                failed = write_state(ctx, "ship", {"branch": "feat/x", "backup": "b"})
+                self.assertIn(shared, failed)
+                self.assertIn("nothing was written", failed)
+                self.assertIn("lose whatever is in there for good", failed)
+                with open(shared) as fh:
+                    self.assertEqual(fh.read(), damage)
+                # and what does not depend on the memory is unaffected
+                self.assertEqual(read_state(ctx, shared=True), {})
+                self.assertEqual(pending_entries(ctx), {})
+                self.assertEqual(run("-C", fork, "status")[0], 0)
+            os.unlink(shared)                       # the user's choice, and the way back
+            self.assertEqual(config_memory_unprovable(ctx), "")
+            self.assertEqual(remember_upstream_configs(ctx, one), ({"a" * 64}, ""))
+
+        def test_a_memory_that_is_not_a_record_of_digests_is_a_refusal_too(self):
+            """The hand-edited shape of the same fact - in either shape the record is read
+            in, the flat list an earlier run of this branch wrote and the
+            {repository: [digest]} one written now."""
+            ctx = ctx_for(make_fork(self.tmp))
+            for record in ({"a": 1}, "a" * 64, [1, 2], ["ok" * 32, 7],
+                           {"repo": "a" * 64}, {"repo": ["ok" * 32, 7]},
+                           {"repo": {"a" * 64: 1}}):
+                change_state(ctx, True, lambda d: d.update({"upstream_configs": record}))
+                why = config_memory_unprovable(ctx)
+                self.assertIn("not a record of digests", why, repr(record))
+                self.assertEqual(fork_config_state(ctx)[0], "unprovable")
+                self.assertEqual(fork_merge_mode(ctx), "manual")
+
+    class TestPendingEntry(Base):
+        """`land` works from the `pending` record and nothing else, so what is read back
+        has to be exactly what `record_pending` wrote - or nothing at all."""
+
+        def test_round_trip_and_the_url_added_afterwards(self):
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            self.assertEqual(pending_entries(ctx), {})
+            sh("git", "branch", "feat/x", "develop", cwd=fork)
+            base = rev(fork, "origin/develop")
+            written = record_pending(ctx, "ship", "feat/x", base)
+            self.assertEqual(pending_entries(ctx), {"feat/x": {
+                "kind": "ship", "branch": "feat/x", "commit": rev(fork, "feat/x"),
+                "base": base, "mr": ""}})
+            self.assertEqual(written, pending_entries(ctx)["feat/x"])      # what it returns
+            written = record_pending(ctx, "ship", "feat/x", base, "https://example.invalid/pull/1")
+            self.assertEqual(pending_entries(ctx)["feat/x"]["mr"],
+                             "https://example.invalid/pull/1")
+            self.assertEqual(pending_entries(ctx)["feat/x"]["commit"], rev(fork, "feat/x"))
+            self.assertEqual(written, pending_entries(ctx)["feat/x"])
+            self.assertTrue(forget_pending(ctx, written))
+            self.assertEqual(pending_entries(ctx), {})
+            self.assertNotIn("pending", read_state(ctx, shared=True))   # no empty map left
+
+        def test_one_entry_per_branch(self):
+            """Worktrees ship different branches at the same time: each keeps its own entry,
+            and only a second run of the same branch replaces one."""
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            base = rev(fork, "origin/develop")
+            sh("git", "branch", "feat/x", "develop", cwd=fork)
+            sh("git", "branch", "feat/y", "develop", cwd=fork)
+            record_pending(ctx, "ship", "feat/x", base)
+            record_pending(ctx, "sync", "feat/y", base)
+            self.assertEqual(sorted(pending_entries(ctx)), ["feat/x", "feat/y"])
+            self.assertEqual(pending_entries(ctx)["feat/x"]["kind"], "ship")
+            self.assertEqual(pending_entries(ctx)["feat/y"]["kind"], "sync")
+            commit_fork(fork, "ours/x.txt", "x\n", "ours: x")             # on develop
+            sh("git", "branch", "-f", "feat/x", "develop", cwd=fork)
+            record_pending(ctx, "ship", "feat/x", base, "https://example.invalid/pull/2")
+            self.assertEqual(pending_entries(ctx)["feat/x"]["commit"], rev(fork, "feat/x"))
+            self.assertEqual(pending_entries(ctx)["feat/y"]["kind"], "sync")   # untouched
+
+        def test_forget_clears_only_the_entry_that_is_still_the_one_landed(self):
+            """`land` clears what it landed - not a newer ship of the same branch recorded
+            while it ran, and never another branch's entry."""
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            base = rev(fork, "origin/develop")
+            sh("git", "branch", "feat/x", "develop", cwd=fork)
+            sh("git", "branch", "feat/y", "develop", cwd=fork)
+            landed_one = record_pending(ctx, "ship", "feat/x", base)
+            other = record_pending(ctx, "ship", "feat/y", base)
+            commit_fork(fork, "ours/x.txt", "x\n", "ours: x")
+            sh("git", "branch", "-f", "feat/x", "develop", cwd=fork)
+            newer = record_pending(ctx, "ship", "feat/x", base)          # shipped again
+            self.assertFalse(forget_pending(ctx, landed_one))
+            self.assertEqual(pending_entries(ctx), {"feat/x": newer, "feat/y": other})
+            self.assertTrue(forget_pending(ctx, newer))
+            self.assertEqual(pending_entries(ctx), {"feat/y": other})
+            self.assertTrue(forget_pending(ctx, newer))                 # gone already: fine
+            self.assertFalse(forget_pending(ctx_for(fork, dry_run=True), other))
+            self.assertEqual(pending_entries(ctx), {"feat/y": other})
+
+        def test_the_single_record_an_earlier_build_wrote_is_still_read(self):
+            """An upgrade between a ship and its landing: the state file holds one bare
+            entry, not a map. It reads as a map of one, and the next record keeps it."""
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            base = rev(fork, "origin/develop")
+            sh("git", "branch", "feat/x", "develop", cwd=fork)
+            sh("git", "branch", "feat/y", "develop", cwd=fork)
+            old = {"kind": "ship", "branch": "feat/x", "commit": rev(fork, "feat/x"),
+                   "base": base, "mr": ""}
+            save_state(ctx, {"pending": old}, shared=True)
+            self.assertEqual(pending_entries(ctx), {"feat/x": old})
+            new = record_pending(ctx, "ship", "feat/y", base)
+            self.assertEqual(pending_entries(ctx), {"feat/x": old, "feat/y": new})
+            self.assertEqual(read_state(ctx, shared=True)["pending"],
+                             {"feat/x": old, "feat/y": new})              # a map from now on
+
+        def test_anything_but_the_written_shape_is_no_entry(self):
+            ctx = ctx_for(make_fork(self.tmp))
+            good = {"kind": "ship", "branch": "feat/x", "commit": "abc", "base": "def"}
+            for bad in (["a", "list"],                                   # not a dict
+                        {k: v for k, v in good.items() if k != "commit"},  # missing a field
+                        dict(good, commit=1),                            # non-string field
+                        dict(good, base=None),
+                        dict(good, mr=7),                                # non-string URL
+                        "abc"):
+                for raw in (bad, {"feat/x": bad}):                       # bare or in the map
+                    save_state(ctx, {"pending": raw})
+                    self.assertEqual(pending_entries(ctx), {}, repr(raw))
+            save_state(ctx, {"pending": {"feat/y": good}})               # under another name
+            self.assertEqual(pending_entries(ctx), {})
+            save_state(ctx, {"pending": {"feat/x": good, "feat/z": dict(good, kind=3)}})
+            self.assertEqual(pending_entries(ctx), {"feat/x": good})     # `mr` may be absent
+
+        def test_a_dry_run_records_nothing(self):
+            """Asked of the shared file (`SHARED_STATE`), which is where `record_pending`
+            writes: the per-worktree path is the same file in a main worktree, so asking
+            that one would pass in a linked worktree with the record written."""
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork, dry_run=True)
+            record_pending(ctx, "ship", "develop", rev(fork, "origin/develop"))
+            self.assertFalse(os.path.exists(state_path(ctx, shared=True)))
 
     class TestCleanTree(Base):
         def test_untracked_is_clean(self):
@@ -4763,9 +8513,9 @@ def run_tests() -> None:
                 return real_rc(*args, **kw)
 
             with mock.patch.object(sys.modules[__name__], "git_rc", old_git_rc):
-                self.assertEqual(mirror_worktree(ctx), "")        # `develop` is checked out
+                self.assertEqual(branch_worktree(ctx, "main"), "")   # `develop` is checked out
                 sh("git", "switch", "main", cwd=fork)
-                self.assertEqual(mirror_worktree(ctx), ctx.root)
+                self.assertEqual(branch_worktree(ctx, "main"), ctx.root)
 
         def test_dry_run_moves_nothing(self):
             fork = make_fork(self.tmp)
@@ -4970,6 +8720,35 @@ def run_tests() -> None:
                 capture(simulate_merge, ctx, "no-such-ref")
             self.assertEqual(cm.exception.code, 2)
             self.assertIn("merge", str(cm.exception))
+
+        @unittest.skipIf(git_version() < MERGE_TREE_GIT, "needs git 2.38+")
+        def test_the_simulation_writes_no_object_into_this_clone(self):
+            """`merge-tree --write-tree` writes the merged tree and a blob per conflicting
+            file into the object database. Nothing needs them after the call - both callers
+            read stdout - and a `--dry-run` that promises to write nothing, and a `status`
+            that only reports, both reach this. So they go to a scratch directory and the
+            answer is the same one the unredirected call gives."""
+            fork = make_fork(self.tmp)
+            commit_fork(fork, "shared.tf",
+                        'resource "null_resource" "a" {\n  count = 2\n}\n', "ours: shared",
+                        push=True)
+            commit_upstream(self.tmp, "shared.tf",
+                            'resource "null_resource" "a" {\n  count = 3\n}\n')
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n")
+            sh("git", "fetch", "upstream", cwd=fork)
+            ctx = ctx_for(fork)
+            target = rev(fork, ctx.up())
+            before = odb(fork)
+            result, _, _ = capture(simulate_merge, ctx, target)
+            self.assertEqual(result, (False, ["shared.tf"]))
+            self.assertEqual(odb(fork), before)               # not one object
+            # the same question asked the way git would answer it on its own
+            plain = git_rc("merge-tree", "--write-tree", "--name-only",
+                           "origin/develop", target, cwd=fork)
+            redirected = merge_tree(fork, "--write-tree", "--name-only",
+                                    "origin/develop", target)
+            self.assertEqual(redirected, plain)
+            self.assertNotEqual(odb(fork), before)            # git's own call did write
 
         def test_nothing_is_written_and_the_worktree_is_untouched(self):
             fork = make_fork(self.tmp)
@@ -5509,6 +9288,68 @@ def run_tests() -> None:
             self.assertIn("up to date", out)
             self.assertEqual(sh("git", "for-each-ref", cwd=fork), before)
 
+        def test_a_dry_run_does_not_call_a_stale_fork_already_in_sync(self):
+            """"Already in sync" is a CONCLUSION - it returns 0 and skips every preflight
+            below it - and a dry run does not fetch, so on refs the server has moved past it
+            is a conclusion about a commit that is no longer upstream's tip. Said there, it
+            hid the merge simulation and the untracked-in-the-way and case-collision checks
+            the dry run exists to run, two lines under a `fetch` line reporting the newer
+            commit. `advance_mirror` and `judge_landings` already said so where they would
+            conclude from a stale ref; this is the third.
+
+            The refusal is about STALENESS and not about `--dry-run`: with `upstream/<branch>`
+            the same here as on the server, the same dry run still answers "already in sync"
+            and exits 0, both with nothing at all to take and with the trunk already carrying
+            what upstream has."""
+            fork = make_fork(self.tmp)
+            code, out, err = run("-C", fork, "sync", "--dry-run")   # nothing new anywhere
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("already in sync", out)
+
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            before = sh("git", "for-each-ref", cwd=fork)
+            code, out, err = run("-C", fork, "sync", "--dry-run")   # not fetched here
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("did not fetch", err)
+            self.assertNotIn("already in sync", out)
+            self.assertIn("NOT fetched (dry run)", out)
+            self.assertEqual(sh("git", "for-each-ref", cwd=fork), before)   # and wrote nothing
+
+            # a teammate synced it and this clone fetched: the trunk carries what upstream
+            # has and every ref is the server's, so the same dry run concludes again
+            push_upstream_into_origin(self.tmp, "develop")
+            push_upstream_into_origin(self.tmp, "main")
+            sh("git", "fetch", "-q", "--multiple", "origin", "upstream", cwd=fork)
+            code, out, err = run("-C", fork, "sync", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("already in sync", out)
+
+            # and the ref that decides is `upstream/<branch>` alone. Somebody pushed to the
+            # trunk on origin and this clone has not fetched that either - it changes
+            # nothing about whether the trunk already carries what upstream has, so
+            # refusing on it would be a refusal of an answerable question
+            second_clone_commit(self.tmp)
+            code, out, err = run("-C", fork, "sync", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("already in sync", out)
+            self.assertIn("NOT fetched (dry run)", out)      # origin/develop IS stale here
+
+        def test_a_stale_dry_run_still_runs_the_collision_preflight_after_a_fetch(self):
+            """What the refusal is protecting: the untracked-in-the-way preflight. Upstream
+            starts tracking a `.forkflow.toml` while this fork keeps its own untracked, which is
+            exit 2 with the remedy - and from the refs on disk it was exit 0 "already in
+            sync" with nothing checked at all."""
+            fork = make_fork(self.tmp)
+            write(fork, CONFIG_FILE, 'merge = "self"\n')       # untracked, as `setup` leaves it
+            commit_upstream(self.tmp, CONFIG_FILE, 'merge = "manual"\n', "theirs: config")
+            code, out, err = run("-C", fork, "sync", "--dry-run")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("did not fetch", err)
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            code, out, err = run("-C", fork, "sync", "--dry-run")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("overwrite an untracked file", err)
+
         def test_dry_run_previews_the_pending_merge_and_moves_nothing(self):
             fork = make_fork(self.tmp)
             commit_fork(fork, "shared.tf",
@@ -5520,6 +9361,7 @@ def run_tests() -> None:
             before_trunk = origin_sha(fork, "develop")
             before_mirror = origin_sha(fork, "main")
             before_local_mirror = rev(fork, "refs/heads/main")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)   # the dry run of its own does not
 
             code, out, err = run("-C", fork, "sync", "--dry-run")
             self.assertEqual(code, 0, err + out)
@@ -5536,6 +9378,35 @@ def run_tests() -> None:
             self.assertNotIn("backup/", local_branches(fork))
             self.assertNotIn(self.sync_name(), local_branches(fork))
             self.assertEqual(checked_out(fork), "develop")
+
+        def test_a_dry_run_fetches_nothing_and_simulates_without_writing_objects(self):
+            """The no-write contract against the two writing steps a `sync --dry-run` took.
+            `git fetch` rewrites `FETCH_HEAD`, moves the remote-tracking refs and brings
+            objects in: `git ls-remote` asks the same server, writes none of them, and the
+            line says what upstream has and that what follows is judged from the refs on
+            disk. `git merge-tree --write-tree` writes the merged tree and a blob per
+            conflict: the simulation still runs, with the objects sent to a scratch
+            directory (`merge_tree`), so the answer is the same and the clone gains
+            nothing."""
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            commit_upstream(self.tmp, "docs/more.md", "more\n", "theirs: more")   # unfetched
+            fetch_head = git_path(fork, "FETCH_HEAD")
+            if os.path.exists(fetch_head):
+                os.unlink(fetch_head)
+            before, refs = odb(fork), sh("git", "for-each-ref", cwd=fork)
+
+            code, out, err = run("-C", fork, "sync", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("git ls-remote upstream refs/heads/main", out)
+            self.assertIn("NOT fetched (dry run)", out)
+            self.assertIn("1 upstream commit(s) to take", out)       # from the refs on disk
+            if git_version() >= MERGE_TREE_GIT:
+                self.assertIn("merges clean", out)                   # simulated all the same
+            self.assertFalse(os.path.exists(fetch_head))
+            self.assertEqual(odb(fork), before)
+            self.assertEqual(sh("git", "for-each-ref", cwd=fork), refs)
 
         def test_existing_sync_branch_is_exit_2(self):
             fork = make_fork(self.tmp)
@@ -5761,7 +9632,9 @@ def run_tests() -> None:
             sync died on raw git output and left one more orphan backup on origin."""
             fork = make_fork(self.tmp)
             self.assertEqual(run("-C", fork, "setup")[0], 0)
-            self.assertTrue(os.path.exists(os.path.join(fork, CONFIG_FILE)))
+            path = os.path.join(fork, CONFIG_FILE)
+            with open(path) as fh:
+                ours = fh.read()
             commit_upstream(self.tmp, CONFIG_FILE, "gate = []\n", "theirs: forkflow too")
             before_trunk = origin_sha(fork, "develop")
 
@@ -5770,14 +9643,33 @@ def run_tests() -> None:
             self.assertIn(CONFIG_FILE, out + err)
             self.assertIn("untracked", out + err)
             self.assertNotIn("backup/", local_branches(fork))          # nothing to clean up
+            self.assertEqual(sh("git", "ls-remote", "origin", "refs/heads/backup/*",
+                                cwd=fork), "")
             self.assertEqual(origin_sha(fork, self.sync_name()), "")
             self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+            with open(path) as fh:
+                self.assertEqual(fh.read(), ours)
+            self.assertNotIn("Move them out", err)          # the config is never moved away
 
-            # the remedy the message names, run literally, unblocks it
-            os.unlink(os.path.join(fork, CONFIG_FILE))
-            code, out, err = run("-C", fork, "sync")
-            self.assertEqual(code, 0, err + out)
-            self.assertEqual(rev(fork, self.sync_name() + "^2"), rev(fork, "upstream/main"))
+            # the remedy it names, run literally: the config committed on a branch off the
+            # trunk and shipped, the merge request merged, landed - then the sync again. It
+            # used to say "remove the file", which deleted this fork's config for good
+            sh("git", "checkout", "-q", "-b", "cfg", "origin/develop", cwd=fork)
+            sh("git", "add", CONFIG_FILE, cwd=fork)
+            sh("git", "commit", "-q", "-m", "ours: forkflow config", cwd=fork)
+            code, out, err2 = run_printed(err, "forkflow ship", fork)
+            self.assertEqual(code, 0, err2 + out)
+            sh("git", "--git-dir=" + os.path.join(self.tmp, "origin.git"), "update-ref",
+               "refs/heads/develop", origin_sha(fork, "cfg"))
+            code, out, err2 = run("-C", fork, "land")
+            self.assertEqual(code, 0, err2 + out)
+            code, out, err2 = run_printed(err, "forkflow sync", fork)
+            # both sides track the file now: an add/add conflict the user resolves in the
+            # open, with this fork's config committed on the trunk - nothing lost
+            self.assertEqual(code, 4, err2 + out)
+            self.assertIn(CONFIG_FILE, sh("git", "diff", "--name-only", "--diff-filter=U",
+                                          cwd=fork))
+            self.assertEqual(sh("git", "show", "HEAD:" + CONFIG_FILE, cwd=fork), ours.strip())
 
         @needs_tomllib
         def test_the_untracked_merge_fallback_names_a_rerun_that_is_not_a_closed_loop(self):
@@ -5785,10 +9677,11 @@ def run_tests() -> None:
             `merge_upstream` is what is left when the tree changes under the run, and by then
             the sync branch exists. Naming plain `forkflow sync` there is a closed loop -
             that run refuses the existing branch and sends the user to `--continue`, which
-            has no merge to resume. Both halves of the loop are walked here."""
+            has no merge to resume. Both halves of the loop are walked here, after the
+            remedy it names - the file moved out of the tree, which keeps it."""
             fork = make_fork(self.tmp)
-            write(fork, CONFIG_FILE, "# ours, untracked\n")
-            commit_upstream(self.tmp, CONFIG_FILE, "gate = []\n", "theirs: forkflow too")
+            write(fork, "docs/theirs.md", "ours, untracked\n")
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
             with mock.patch.object(sys.modules[__name__], "untracked_in_the_way",
                                    lambda ctx, target: []):
                 code, out, err = run("-C", fork, "sync")
@@ -5796,19 +9689,56 @@ def run_tests() -> None:
             self.assertIn("forkflow sync --force", err)
             self.assertIn(self.sync_name(), local_branches(fork))    # the branch is there now
 
-            # the remedy cleared, the two commands the old message pointed at are the loop
-            os.unlink(os.path.join(fork, CONFIG_FILE))
-            code, out, err = run("-C", fork, "sync")
-            self.assertEqual(code, 2, out + err)
-            self.assertIn("already exists", err)
-            code, out, err = run("-C", fork, "sync", "--continue")
-            self.assertEqual(code, 2, out + err)
-            self.assertIn("nothing to continue", err)
+            self.assertIn("Move them out of the working tree", err)
+            kept = os.path.join(self.tmp, "theirs.md")
+            os.rename(os.path.join(fork, "docs", "theirs.md"), kept)
+            # the two commands the old message pointed at are the loop
+            code, out, err2 = run("-C", fork, "sync")
+            self.assertEqual(code, 2, out + err2)
+            self.assertIn("already exists", err2)
+            code, out, err2 = run("-C", fork, "sync", "--continue")
+            self.assertEqual(code, 2, out + err2)
+            self.assertIn("nothing to continue", err2)
             # and the one it names now gets out of it
             next_utc_second()
-            code, out, err = run("-C", fork, "sync", "--force")
-            self.assertEqual(code, 0, err + out)
+            code, out, err2 = run_printed(err, "forkflow sync --force", fork)
+            self.assertEqual(code, 0, err2 + out)
             self.assertEqual(rev(fork, self.sync_name() + "^2"), rev(fork, "upstream/main"))
+            with open(kept) as fh:
+                self.assertEqual(fh.read(), "ours, untracked\n")
+
+        @needs_tomllib
+        def test_the_untracked_merge_fallback_for_the_config_keeps_it(self):
+            """The fallback meeting the untracked config gives the config's own answer -
+            ship it, then `--force` - and followed to the letter it loses nothing: the next
+            sync meets upstream's copy as a tracked file, in a conflict the user resolves."""
+            fork = make_fork(self.tmp)
+            ours = "# ours, untracked\n"
+            path = write(fork, CONFIG_FILE, ours)
+            commit_upstream(self.tmp, CONFIG_FILE, "gate = []\n", "theirs: forkflow too")
+            with mock.patch.object(sys.modules[__name__], "untracked_in_the_way",
+                                   lambda ctx, target: []):
+                code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 2, out + err)
+            with open(path) as fh:
+                self.assertEqual(fh.read(), ours)
+            self.assertNotIn("Move them out", err)          # the config is never moved away
+
+            sh("git", "checkout", "-q", "-b", "cfg", "origin/develop", cwd=fork)
+            sh("git", "add", CONFIG_FILE, cwd=fork)
+            sh("git", "commit", "-q", "-m", "ours: forkflow config", cwd=fork)
+            next_utc_second()
+            code, out, err2 = run_printed(err, "forkflow ship", fork)
+            self.assertEqual(code, 0, err2 + out)
+            sh("git", "--git-dir=" + os.path.join(self.tmp, "origin.git"), "update-ref",
+               "refs/heads/develop", origin_sha(fork, "cfg"))
+            self.assertEqual(run("-C", fork, "land")[0], 0)
+            next_utc_second()
+            code, out, err2 = run_printed(err, "forkflow sync --force", fork)
+            self.assertEqual(code, 4, err2 + out)
+            self.assertIn(CONFIG_FILE, sh("git", "diff", "--name-only", "--diff-filter=U",
+                                          cwd=fork))
+            self.assertEqual(sh("git", "show", "HEAD:" + CONFIG_FILE, cwd=fork), ours.strip())
 
         def test_a_file_upstream_renamed_onto_an_untracked_path_is_refused(self):
             """git detects renames by default (2.9+), so an upstream `git mv` onto a path
@@ -5836,6 +9766,15 @@ def run_tests() -> None:
             self.assertNotIn(self.sync_name(), local_branches(fork))
             self.assertEqual(origin_sha(fork, self.sync_name()), "")
             self.assertEqual(origin_sha(fork, "develop"), before_trunk)
+            # the remedy it names, run literally: moved out of the tree, kept, and the sync
+            # goes through
+            kept = os.path.join(self.tmp, "README.md")
+            os.rename(os.path.join(fork, "docs", "README.md"), kept)
+            code, out, err2 = run_printed(err, "forkflow sync", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.assertEqual(rev(fork, self.sync_name() + "^2"), rev(fork, "upstream/main"))
+            with open(kept) as fh:
+                self.assertEqual(fh.read(), "# ours, untracked\n")
 
         @needs_tomllib
         def test_failing_gate_is_exit_3_with_the_continue_hint(self):
@@ -6279,7 +10218,7 @@ def run_tests() -> None:
             code, out, err = run("-C", fork, "sync", "--continue", "--dry-run")
             self.assertEqual(code, 0, err + out)
             self.assertIn("the merge is not committed", out)
-            self.assertTrue(merge_in_progress(ctx_for(fork)))    # still uncommitted
+            self.assertTrue(merge_in_progress(fork))    # still uncommitted
             self.assertEqual(rev(fork, "refs/heads/" + name), before)
             self.assertEqual(origin_sha(fork, name), "")
 
@@ -6383,11 +10322,23 @@ def run_tests() -> None:
         BASE_TF = 'resource "null_resource" "a" {\n  count = 1\n}\n'
 
         def feature(self, fork: str, name: str = "feat/x", commits: int = 1,
-                    push: bool = False) -> str:
+                    push: bool = False, only_own: bool = False) -> str:
+            """A feature branch off the trunk carrying `commits` commits of its own files.
+
+            `only_own` stages just the file it writes: `commit_fork` stages everything,
+            which would commit an untracked `.forkflow.toml` and turn a test about the
+            untracked config into one about a tracked one."""
             sh("git", "checkout", "-b", name, "develop", cwd=fork)
             for i in range(commits):
-                commit_fork(fork, "ours/f%d.txt" % i, "line %d\n" % i,
-                            "ours: step %d" % i, push=push)
+                path, message = "ours/f%d.txt" % i, "ours: step %d" % i
+                if not only_own:
+                    commit_fork(fork, path, "line %d\n" % i, message, push=push)
+                    continue
+                write(fork, path, "line %d\n" % i)
+                sh("git", "add", path, cwd=fork)
+                sh("git", "commit", "-q", "-m", message, cwd=fork)
+                if push:
+                    sh("git", "push", "origin", "%s:refs/heads/%s" % (name, name), cwd=fork)
             return name
 
         def backup_branch(self, fork: str) -> str:
@@ -6397,6 +10348,65 @@ def run_tests() -> None:
 
         def message_of(self, fork: str, ref: str = "HEAD") -> str:
             return sh("git", "log", "-1", "--format=%B", ref, cwd=fork).strip()
+
+        @staticmethod
+        def pending_of(fork: str, branch: Optional[str] = None) -> dict:
+            """A `pending` entry as `land` and `status` read it: `branch`'s, or without one
+            the only entry there is - {} when there is none. A test with several names the
+            branch (or reads `pending_entries` whole)."""
+            entries = pending_entries(ctx_for(fork, need_trunk=False, strict_mirror=False))
+            if branch is not None:
+                return entries.get(branch, {})
+            if len(entries) > 1:
+                raise AssertionError("several pending entries, name one: %r" % entries)
+            return next(iter(entries.values()), {})
+
+        def human(self, *cmds: Sequence[str]) -> str:
+            """A clone somebody else merges from: origin/develop checked out, each of `cmds`
+            run there, the result pushed; answers with the trunk's new tip.
+
+            Under their own committer identity: a cherry-pick onto the same parent by the
+            same committer in the same second is byte-for-byte the shipped commit again,
+            and a "rewrite" that keeps the SHA would prove nothing."""
+            clone = os.path.join(self.tmp, "human")
+            if not os.path.exists(clone):
+                sh("git", "clone", "-q", os.path.join(self.tmp, "origin.git"), clone)
+                identity(clone)
+            with mock.patch.dict(os.environ, {"GIT_COMMITTER_NAME": "a human",
+                                              "GIT_COMMITTER_EMAIL": "human@example.invalid"}):
+                sh("git", "fetch", "-q", "origin", cwd=clone)
+                sh("git", "checkout", "-q", "-B", "develop", "origin/develop", cwd=clone)
+                for cmd in cmds:
+                    sh("git", *cmd, cwd=clone)
+                sh("git", "push", "-q", "origin", "develop", cwd=clone)
+            return sh("git", "rev-parse", "HEAD", cwd=clone)
+
+        def move_trunk(self, sha: str) -> None:
+            """A human merged the MR by fast-forward: the bare origin's trunk moves to `sha`."""
+            sh("git", "--git-dir=" + os.path.join(self.tmp, "origin.git"),
+               "update-ref", "refs/heads/develop", sha)
+
+        def shipped(self, commits: int = 1) -> Tuple[str, str, dict]:
+            """A fork whose feature branch is shipped and pushed, the MR not merged yet."""
+            fork = make_fork(self.tmp)
+            name = self.feature(fork, commits=commits)
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("next: forkflow land", out)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"]), ("ship", name))
+            return fork, name, entry
+
+        def assert_landed(self, fork: str, name: str, tip: str) -> None:
+            """The trunk is at `tip` on origin, as fetched and locally, and checked out; the
+            branch is gone, the record is cleared, and the tree is clean."""
+            self.assertEqual(rev(fork, "refs/heads/develop"), tip)
+            self.assertEqual(rev(fork, "refs/remotes/origin/develop"), tip)
+            self.assertEqual(origin_sha(fork, "develop"), tip)
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(rev(fork, "refs/heads/" + name), "")
+            self.assertEqual(self.pending_of(fork), {})
+            self.assertEqual(sh("git", "status", "--porcelain", cwd=fork), "")
 
         def conflicting_ship(self) -> Tuple[str, str]:
             """A feature branch and origin/develop that changed the same line."""
@@ -7014,7 +11024,10 @@ def run_tests() -> None:
                 template = fh.read()
             self.assertIn('# trunk = "develop"', template)
             self.assertIn('# mirror = "main"', template)
-            self.assertIn("commit " + CONFIG_FILE, out)
+            self.assertIn('# merge = "manual"', template)
+            self.assertIn("enables --merge", template)
+            # committed on a branch and shipped - never on the trunk or the mirror
+            self.assertIn("commit it on a branch off origin/develop", out)
             self.assertNotIn("would:", out)
 
             branches, trunk_sha = local_branches(fork), origin_sha(fork, "develop")
@@ -7768,9 +11781,9 @@ def run_tests() -> None:
                 ("repos/*", repo[0], repo[1]),
             ])
 
-        def argv(self) -> list:
-            with open(self.log) as fh:
-                return [ln.rstrip("\n") for ln in fh]
+        def report_argv(self) -> list:
+            """The argv the report's own `glab api` / `gh api` fake recorded."""
+            return lines_of(self.log)
 
         def report(self, platform: str, origin: Optional[str] = None) -> str:
             """The report for a fork whose origin really is a hosted one: the paths it prints
@@ -7838,7 +11851,7 @@ def run_tests() -> None:
         def test_the_report_only_ever_reads(self):
             self.gitlab_tool()
             self.report("gitlab")
-            self.assertEqual(self.argv(), [
+            self.assertEqual(self.report_argv(), [
                 "api", "projects/acme%2Fteam%2Fwidget",
                 "api", "projects/acme%2Fteam%2Fwidget/protected_branches/develop",
                 "api", "projects/acme%2Fteam%2Fwidget/protected_branches/main"])
@@ -7896,7 +11909,7 @@ def run_tests() -> None:
             out = self.report("gitlab")
             self.assertIn("not checked (HTTP 500)", out)
             self.assertNotIn("trunk `develop`", out)
-            self.assertEqual(self.argv(), ["api", "projects/acme%2Fteam%2Fwidget"])
+            self.assertEqual(self.report_argv(), ["api", "projects/acme%2Fteam%2Fwidget"])
 
         def test_a_missing_tool_is_not_checked(self):
             ctx = ctx_for(make_fork(self.tmp))
@@ -7917,7 +11930,7 @@ def run_tests() -> None:
             self.assertIn("trunk `develop`: protected, force-push disallowed, "
                           "direct push blocked: ok", out)
             self.assertEqual(self.fixes(out), [])
-            self.assertEqual(self.argv(), [
+            self.assertEqual(self.report_argv(), [
                 "api", "repos/acme/widget",
                 "api", "repos/acme/widget/branches/develop/protection",
                 "api", "repos/acme/widget/branches/main/protection"])
@@ -8092,7 +12105,7 @@ def run_tests() -> None:
             self.assertIn("gh api -X PATCH repos/acme/widget -f default_branch=", out)
             self.assertIn("gh api -X PUT repos/acme/widget/branches/develop/protection", out)
             # and the reads the findings came from went to the fork as well
-            self.assertEqual(self.argv(), [
+            self.assertEqual(self.report_argv(), [
                 "api", "repos/acme/widget",
                 "api", "repos/acme/widget/branches/develop/protection",
                 "api", "repos/acme/widget/branches/main/protection"])
@@ -8121,7 +12134,7 @@ def run_tests() -> None:
             out = self.report("gitlab", origin="git@gitlab.example.com:acme/team/widget.git")
             self.assert_names_the_fork(out, "projects/acme%2Fteam%2Fwidget")
             self.assertIn("glab api --method PUT projects/acme%2Fteam%2Fwidget ", out)
-            self.assertEqual(self.argv(), [
+            self.assertEqual(self.report_argv(), [
                 "api", "projects/acme%2Fteam%2Fwidget",
                 "api", "projects/acme%2Fteam%2Fwidget/protected_branches/develop",
                 "api", "projects/acme%2Fteam%2Fwidget/protected_branches/main"])
@@ -8169,9 +12182,10 @@ def run_tests() -> None:
             self.assertFalse(os.path.exists(self.log))
 
     class TestPlatformReportInSetup(PlatformBase):
-        def as_gitlab(self):
+        def as_gitlab_host(self):
             """The fork under test pushes to a local origin: pretend it is a GitLab one, both
-            for the host and for the project path the report builds out of it."""
+            for the host and for the project path the report builds out of it. Not
+            `as_gitlab`, which names the fork for the merge request commands instead."""
             return mock.patch.multiple(sys.modules[__name__],
                                        detect_platform=lambda url: "gitlab",
                                        forge_path=lambda url: "acme/team/widget")
@@ -8185,7 +12199,7 @@ def run_tests() -> None:
             fork = make_fresh_fork(self.tmp)
             self.gitlab_tool(project=('{"default_branch":"main","merge_method":"ff"}', 0),
                              trunk=UNPROTECTED, mirror=UNPROTECTED)
-            with self.as_gitlab():
+            with self.as_gitlab_host():
                 code, out, err = run("-C", fork, "setup")
             self.assertEqual(code, 0, err + out)
             self.assertIn("default branch: `main` - it must be the trunk `develop`", out)
@@ -8195,13 +12209,13 @@ def run_tests() -> None:
         def test_a_dry_run_still_runs_the_read_only_report(self):
             fork = make_fork(self.tmp)
             self.gitlab_tool()
-            with self.as_gitlab():
+            with self.as_gitlab_host():
                 code, out, err = run("-C", fork, "setup", "--dry-run")
             self.assertEqual(code, 0, err + out)
             self.assertIn("read-only: default_branch=develop  merge_method=ff", out)
             self.assertIn("trunk `develop`: protected, force-push disallowed, "
                           "direct push blocked: ok", out)
-            self.assertEqual(self.argv(), [
+            self.assertEqual(self.report_argv(), [
                 "api", "projects/acme%2Fteam%2Fwidget",
                 "api", "projects/acme%2Fteam%2Fwidget/protected_branches/develop",
                 "api", "projects/acme%2Fteam%2Fwidget/protected_branches/main"])
@@ -8257,6 +12271,61 @@ def run_tests() -> None:
                 self.assertIn("never rebase", merge_button(c, "sync"), c.platform)
             self.assertIn("fast-forward", merge_button(gitlab, "ship"))
             self.assertIn("Rebase and merge", merge_button(github, "ship"))
+
+    class TestMergeCommand(unittest.TestCase):
+        """The merge command carries the method rule 5 requires and the head-commit guard,
+        names the fork, and addresses the merge request by its source branch."""
+
+        HEAD = "0123456789abcdef0123456789abcdef01234567"
+
+        def ctx(self, url: str, trunk: str = DEFAULT_TRUNK) -> Ctx:
+            c = Ctx(root="/repo", origin_url=url, trunk=trunk)
+            c.platform = detect_platform(url)
+            return c
+
+        def test_gitlab_is_the_projects_method_with_the_guard_and_no_auto_merge(self):
+            """No --squash and no --rebase: on GitLab the project's `merge_method` decides.
+            `--auto-merge=false` is what makes glab merge now rather than arm
+            merge-when-pipeline-succeeds, and `--yes` skips a confirmation nobody is at."""
+            ctx = self.ctx("git@gitlab.com:group/proj.git")
+            for kind in ("ship", "sync"):
+                self.assertEqual(
+                    merge_command(ctx, kind, "feat/x", self.HEAD),
+                    ["glab", "mr", "merge", "feat/x",
+                     "--repo", "ssh://gitlab.com/group/proj",
+                     "--sha", self.HEAD,
+                     "--auto-merge=false", "--remove-source-branch", "--yes"], kind)
+
+        def test_github_is_told_the_method_per_call(self):
+            """GitHub has no project-level method: `--merge` keeps a sync's merge commit,
+            `--rebase` fast-forwards a ship's one commit (the "Rebase and merge" button)."""
+            ctx = self.ctx("https://github.com/owner/repo.git")
+            self.assertEqual(
+                merge_command(ctx, "sync", "sync/upstream-20260101", self.HEAD),
+                ["gh", "pr", "merge", "sync/upstream-20260101",
+                 "--repo", "https://github.com/owner/repo",
+                 "--match-head-commit", self.HEAD, "--merge"])
+            self.assertEqual(
+                merge_command(ctx, "ship", "feat/x", self.HEAD),
+                ["gh", "pr", "merge", "feat/x",
+                 "--repo", "https://github.com/owner/repo",
+                 "--match-head-commit", self.HEAD, "--rebase"])
+            for kind in ("ship", "sync"):
+                self.assertNotIn("--squash", merge_command(ctx, kind, "feat/x", self.HEAD))
+
+        def test_the_guard_is_the_head_it_was_given(self):
+            for url, flag in (("git@gitlab.com:g/p.git", "--sha"),
+                              ("git@github.com:g/p.git", "--match-head-commit")):
+                cmd = merge_command(self.ctx(url), "ship", "feat/x", "abc123")
+                self.assertEqual(cmd[cmd.index(flag) + 1], "abc123", cmd)
+                self.assertEqual(cmd[3], "feat/x", cmd)          # addressed by branch
+
+        def test_no_fork_to_name_means_no_command(self):
+            self.assertEqual(merge_command(self.ctx("/srv/git/repo.git"), "ship", "feat/x",
+                                           self.HEAD), [])
+            # more than owner/repo on GitHub: gh refuses it, so `mr_target` names nothing
+            self.assertEqual(merge_command(self.ctx("https://github.com/a/b/c.git"), "ship",
+                                           "feat/x", self.HEAD), [])
 
     class TestMrCommandsNameTheFork(unittest.TestCase):
         """Every merge request command names the fork itself.
@@ -8350,8 +12419,8 @@ def run_tests() -> None:
         def test_unknown_platform_prints_the_manual_note(self):
             fork = make_fork(self.tmp)
             ctx = ctx_for(fork)
-            shown, out, _ = capture(open_mr, ctx, "feat/x", "a title", "body\n", True)
-            self.assertEqual(shown, "")
+            url, out, _ = capture(open_mr, ctx, "feat/x", "a title", "body\n", True)
+            self.assertEqual(url, "")
             self.assertIn("open the merge request manually: feat/x -> develop", out)
             self.assertIn("a title", out)
 
@@ -8364,13 +12433,43 @@ def run_tests() -> None:
             ctx.upstream_url = "git@gitlab.example.com:original/widget.git"
             done = subprocess.CompletedProcess([], 0, b"https://gitlab.example.com/mr/1\n", b"")
             with mock.patch.object(subprocess, "run", return_value=done) as ran:
-                shown, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+                url, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
             argv = list(ran.call_args[0][0])
             self.assertEqual(argv[argv.index("--repo") + 1],
                              "ssh://gitlab.example.com/acme/team/widget")
             self.assertNotIn("original/widget", " ".join(argv))
-            self.assertIn("--repo ssh://gitlab.example.com/acme/team/widget", shown)
+            self.assertIn("--repo ssh://gitlab.example.com/acme/team/widget", out)
             self.assertIn("created", out)
+            self.assertEqual(url, "https://gitlab.example.com/mr/1")
+
+        def test_the_url_is_the_first_http_line_the_tool_prints_and_only_on_success(self):
+            """glab and gh both print the merge request's URL on its own line, glab after a
+            "Creating merge request for ..." line. Anything else - no such line, or a tool
+            that failed after printing one - is no URL: the `pending` record must not name
+            a merge request that does not exist."""
+            ctx = ctx_for(make_fork(self.tmp))
+            ctx.platform = "gitlab"
+            ctx.origin_url = "git@gitlab.example.com:acme/team/widget.git"
+            chatty = subprocess.CompletedProcess(
+                [], 0, b"Creating merge request for feat/x into develop in acme/team/widget\n"
+                       b"https://gitlab.example.com/acme/team/widget/-/merge_requests/2\n"
+                       b"  more\n", b"")
+            with mock.patch.object(subprocess, "run", return_value=chatty):
+                url, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+            self.assertIn("glab mr create", out)
+            self.assertEqual(url, "https://gitlab.example.com/acme/team/widget/-/merge_requests/2")
+            silent = subprocess.CompletedProcess([], 0, b"done\n", b"")
+            with mock.patch.object(subprocess, "run", return_value=silent):
+                url, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+            self.assertIn("glab mr create", out)
+            self.assertEqual(url, "")
+            failed = subprocess.CompletedProcess([], 1, b"https://gitlab.example.com/x\n",
+                                                 b"glab: pipeline required\n")
+            with mock.patch.object(subprocess, "run", return_value=failed):
+                url, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+            self.assertIn("glab mr create", out)
+            self.assertEqual(url, "")
+            self.assertIn("FAILED (exit 1)", out)
 
         def test_the_tool_runs_with_its_confirmation_skipped_and_stdin_closed(self):
             """--mr has no terminal behind it. glab's "create this merge request?" prompt is
@@ -8384,11 +12483,11 @@ def run_tests() -> None:
             ctx.upstream_url = "git@gitlab.example.com:original/widget.git"
             done = subprocess.CompletedProcess([], 0, b"https://gitlab.example.com/mr/1\n", b"")
             with mock.patch.object(subprocess, "run", return_value=done) as ran:
-                shown, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+                _url, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
             argv = list(ran.call_args[0][0])
             self.assertIn("--yes", argv)
             self.assertIs(ran.call_args[1].get("stdin"), subprocess.DEVNULL)
-            self.assertIn("--yes", shown)         # the printed command is the runnable one
+            self.assertIn("--yes", out)           # the printed command is the runnable one
             ctx.platform = "github"
             ctx.origin_url = "git@github.com:acme/widget.git"
             with mock.patch.object(subprocess, "run", return_value=done) as ran:
@@ -8402,9 +12501,9 @@ def run_tests() -> None:
             ctx = ctx_for(make_fork(self.tmp))
             ctx.platform = "github"          # every fixture fork pushes to a local origin
             with mock.patch.object(subprocess, "run") as ran:
-                shown, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+                url, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
             ran.assert_not_called()
-            self.assertEqual(shown, "")
+            self.assertEqual(url, "")
             self.assertIn("names no project there", out)
             self.assertIn("open the merge request manually: feat/x -> develop", out)
 
@@ -8415,11 +12514,11 @@ def run_tests() -> None:
             ctx.origin_url = "git@gitlab.example.com:acme/team/widget.git"
             missing = FileNotFoundError(2, "No such file or directory")
             with mock.patch.object(subprocess, "run", side_effect=missing):
-                shown, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+                url, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
             self.assertIn("glab mr create --repo ssh://gitlab.example.com/acme/team/widget",
-                          shown)
+                          out)
+            self.assertEqual(url, "")
             self.assertIn("glab unavailable", out)
-            self.assertIn("No such file or directory", out)
 
         def temp_files(self) -> list:
             return sorted(f for f in os.listdir(tempfile.gettempdir())
@@ -8431,11 +12530,45 @@ def run_tests() -> None:
             ctx.platform = "github"
             ctx.origin_url = "https://github.com/acme/widget.git"
             before = self.temp_files()
-            shown, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
-            self.assertIn("gh pr create --repo https://github.com/acme/widget", shown)
-            self.assertIn("<description file>", shown)
+            url, out, _ = capture(open_mr, ctx, "feat/x", "t", "body\n", True)
+            self.assertIn("gh pr create --repo https://github.com/acme/widget", out)
+            self.assertIn("<description file>", out)
+            self.assertEqual(url, "")
             self.assertIn("not run (dry run)", out)
             self.assertEqual(self.temp_files(), before)      # nothing was written anywhere
+
+    class TestRunTool(Base):
+        """`run_tool` is the one place glab and gh are run from (`TestSourceInvariants` pins
+        it): output captured, stdin closed, and a tool that cannot run is None, not a
+        raise - the command is still worth printing for the user to run by hand."""
+
+        def test_a_missing_tool_is_none_and_never_raises(self):
+            ctx = ctx_for(make_fork(self.tmp))
+            self.assertIsNone(run_tool(ctx, ["forkflow-no-such-tool", "mr", "create"]))
+
+        def test_a_present_tool_answers_with_its_process(self):
+            ctx = ctx_for(make_fork(self.tmp))
+            p = run_tool(ctx, ["sh", "-c", "echo out; echo err >&2; exit 3"])
+            self.assertEqual((p.returncode, p.stdout, p.stderr), (3, b"out\n", b"err\n"))
+
+        def test_stdin_is_closed_so_a_prompt_cannot_wait(self):
+            """A tool that asks a question reads end-of-file at once, not the developer's
+            terminal - the failure guarded against is a suite (or a `--mr`) that hangs. The
+            test's own stdin is swapped for a pipe first: a runner whose stdin is already
+            at end-of-file would otherwise pass whether or not the tool inherits it."""
+            ctx = ctx_for(make_fork(self.tmp))
+            probe = ("import os, sys; a, b = os.fstat(0), os.stat(os.devnull); "
+                     "print((a.st_dev, a.st_ino) == (b.st_dev, b.st_ino))")
+            saved = os.dup(0)
+            r, w = os.pipe()
+            try:
+                os.dup2(r, 0)
+                p = run_tool(ctx, [sys.executable, "-c", probe])
+            finally:
+                os.dup2(saved, 0)
+                for fd in (saved, r, w):
+                    os.close(fd)
+            self.assertEqual(p.stdout.strip(), b"True")
 
     class TestMrEndToEnd(Base):
         def record(self, name: str) -> str:
@@ -8451,35 +12584,13 @@ def run_tests() -> None:
                       % (shlex.quote(log), shlex.quote(self.body_copy)))
             return log
 
-        def argv(self, log: str) -> list:
-            with open(log) as fh:
-                return [ln.rstrip("\n") for ln in fh]
-
-        def value(self, argv: Sequence[str], flag: str) -> str:
-            self.assertIn(flag, argv)
-            return argv[list(argv).index(flag) + 1]
-
         def body_of(self, argv: Sequence[str], flag: str) -> str:
             self.value(argv, flag)                       # the file was named on the command line
             with open(self.body_copy) as fh:
                 return fh.read()
 
-        # the fixture fork really does push to a local origin, so the platform and the fork
-        # it names are both supplied here; `TestMrCommandsNameTheFork` proves the URL these
-        # stand for is built from the origin. What these tests prove is that the argv the
-        # tool receives carries it - the fake `gh`/`glab` resolves no base repository itself
-        GL_FORK = "ssh://gitlab.example.com/acme/team/widget"
-        GH_FORK = "https://github.com/acme/widget"
-
-        def as_gitlab(self):
-            return mock.patch.multiple(sys.modules[__name__],
-                                       detect_platform=lambda url: "gitlab",
-                                       mr_target=lambda ctx: (self.GL_FORK, ""))
-
-        def as_github(self):
-            return mock.patch.multiple(sys.modules[__name__],
-                                       detect_platform=lambda url: "github",
-                                       mr_target=lambda ctx: (self.GH_FORK, ""))
+        GL_FORK = PLATFORM_FORKS["gitlab"]         # see `on_platform`
+        GH_FORK = PLATFORM_FORKS["github"]
 
         def test_sync_mr_runs_glab_with_the_sync_body(self):
             fork = make_fork(self.tmp)
@@ -8490,11 +12601,11 @@ def run_tests() -> None:
             log = self.record("glab")
             name = sync_branch_name()
 
-            with self.as_gitlab():
+            with as_gitlab():
                 code, out, err = run("-C", fork, "sync", "--mr")
             self.assertEqual(code, 0, err + out)
 
-            argv = self.argv(log)
+            argv = lines_of(log)
             self.assertEqual(argv[:2], ["mr", "create"])
             self.assertIn("--remove-source-branch", argv)
             # no terminal answers glab's confirmation under --mr; on the first real fork the
@@ -8526,11 +12637,11 @@ def run_tests() -> None:
             second_clone_commit(self.tmp)
             log = self.record("gh")
 
-            with self.as_github():
+            with as_github():
                 code, out, err = run("-C", fork, "ship", "--mr")
             self.assertEqual(code, 0, err + out)
 
-            argv = self.argv(log)
+            argv = lines_of(log)
             self.assertEqual(argv[:2], ["pr", "create"])
             self.assertNotIn("--yes", argv)      # gh has no such flag; --title/--body-file suffice
             self.assertEqual(self.value(argv, "--repo"), self.GH_FORK)   # fork, not upstream
@@ -8550,7 +12661,7 @@ def run_tests() -> None:
         def test_titles_are_overridden_and_the_command_is_only_printed_without_mr(self):
             fork = make_fork(self.tmp)
             commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
-            with self.as_gitlab():
+            with as_gitlab():
                 code, out, err = run("-C", fork, "sync", "--title", "sync: hand written")
             self.assertEqual(code, 0, err + out)
             self.assertIn("--title 'sync: hand written'", out)
@@ -8561,7 +12672,7 @@ def run_tests() -> None:
             sh("git", "checkout", "-b", "feat/x", "develop", cwd=fork)
             commit_fork(fork, "ours/a.txt", "a\n", "ours: a")
             second_clone_commit(self.tmp)
-            with self.as_github():
+            with as_github():
                 code, out, err = run("-C", fork, "ship", "--title", "ship: hand written")
             self.assertEqual(code, 0, err + out)
             self.assertIn("--title 'ship: hand written'", out)
@@ -8573,7 +12684,7 @@ def run_tests() -> None:
                       'echo "glab: not authenticated" >&2\nexit 1\n')
             name = sync_branch_name()
 
-            with self.as_gitlab():
+            with as_gitlab():
                 code, out, err = run("-C", fork, "sync", "--mr")
             self.assertEqual(code, 0, err + out)
             self.assertIn("FAILED (exit 1) - open it yourself", out)
@@ -8588,16 +12699,4243 @@ def run_tests() -> None:
             second_clone_commit(self.tmp)
             absent = ["forkflow-no-such-tool", "pr", "create"]
 
-            with self.as_github(), mock.patch.object(
+            with as_github(), mock.patch.object(
                     sys.modules[__name__], "mr_command", lambda *a: absent):
                 code, out, err = run("-C", fork, "ship", "--mr")
             self.assertEqual(code, 0, err + out)
             self.assertIn("forkflow-no-such-tool unavailable", out)
             self.assertEqual(origin_sha(fork, "feat/x"), rev(fork, "HEAD"))
 
+    class TestPendingRecord(ShipBase):
+        """Every `ship` and `sync` that pushed a branch leaves the `pending` record `land`
+        works from - with or without `--mr`, whether or not the merge request could be
+        opened, and with the URL the tool printed when it could."""
+
+        def url_tool(self, name: str, url: str) -> None:
+            """A glab/gh that prints a chatty line first, then the URL - as both tools do."""
+            fake_tool(os.path.join(self.tmp, "bin"), name,
+                      'echo "Creating a merge request for $2"\necho %s\n' % shlex.quote(url))
+
+        @staticmethod
+        def parents_of(fork: str, sha: str) -> list:
+            return sh("git", "rev-list", "--parents", "-1", sha, cwd=fork).split()[1:]
+
+        def test_a_run_that_cannot_take_the_lock_records_nothing_and_says_so(self):
+            """The bounded wait ends in a REFUSAL, never in a write beside the holder. Run,
+            not read: another run holds the state file's lock throughout a real `ship`, and
+            afterwards the file is byte for byte what it was - while the push and the branch
+            are exactly as the run left them, so nothing is undone by it. The run says which
+            record it could not write and what to run in place of `forkflow land`."""
+            fork = make_fork(self.tmp)
+            name = self.feature(fork)
+            ctx = ctx_for(fork)
+            self.assertEqual(write_state(ctx, "sync", {"branch": "sync/x", "backup": "b"}), "")
+            path = state_path(ctx, shared=True)
+            with open(path) as fh:
+                before = fh.read()
+            held = take_state_lock(path)
+            try:
+                with mock.patch.object(sys.modules[__name__], "STATE_LOCK_WAIT", 0.05):
+                    code, out, err = run("-C", fork, "ship")
+            finally:
+                drop_state_lock(held)
+            self.assertEqual(code, 0, err + out)        # the work happened: not a failure
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+            with open(path) as fh:
+                self.assertEqual(fh.read(), before)     # nothing written beside the holder
+            self.assertIn("held by another forkflow run", out)
+            self.assertIn("could not record that", out)
+            self.assertNotIn("after the MR is merged, next:", out)
+
+        def test_a_run_on_a_python_that_cannot_lock_records_nothing_and_says_so(self):
+            """The same refusal, for the platform rather than for the holder: a Python with
+            neither `fcntl` nor `msvcrt` has no lock to take, and forkflow will not write the
+            state file unserialised. Run, not read - a real `ship`, whose push and branch are
+            left exactly as it made them while the state file keeps the bytes it had."""
+            fork = make_fork(self.tmp)
+            name = self.feature(fork)
+            ctx = ctx_for(fork)
+            self.assertEqual(write_state(ctx, "sync", {"branch": "sync/x", "backup": "b"}), "")
+            path = state_path(ctx, shared=True)
+            with open(path) as fh:
+                before = fh.read()
+            module = sys.modules[__name__]
+            with mock.patch.object(module, "fcntl", None), \
+                 mock.patch.object(module, "msvcrt", None):
+                code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)        # the work happened: not a failure
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+            with open(path) as fh:
+                self.assertEqual(fh.read(), before)     # nothing written unserialised
+            self.assertIn("neither `fcntl` nor `msvcrt`", out)
+            self.assertIn("could not record that", out)
+            self.assertNotIn("after the MR is merged, next:", out)
+
+        def test_ship_records_the_squashed_tip_and_the_trunk_it_was_built_on(self):
+            fork = make_fork(self.tmp)
+            name = self.feature(fork, commits=2)
+            base = origin_sha(fork, "develop")
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            entry = self.pending_of(fork)
+            self.assertEqual(entry, {"kind": "ship", "branch": name, "commit": rev(fork, name),
+                                     "base": base, "mr": ""})
+            self.assertEqual(entry["commit"], origin_sha(fork, name))     # the pushed tip
+            self.assertEqual(self.parents_of(fork, entry["commit"]), [base])   # one squash
+            self.assertEqual(resumable(ctx_for(fork), "ship", name), {})   # still cleared
+
+        def test_ship_base_is_the_fetched_trunk_not_the_stale_local_one(self):
+            """`base` is `origin/<trunk>` after the fetch the run made - the commit the
+            squash sits on - not the local trunk, which may be behind."""
+            fork = make_fork(self.tmp)
+            name = self.feature(fork)
+            moved = second_clone_commit(self.tmp)
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            entry = self.pending_of(fork)
+            self.assertEqual(entry["base"], moved)
+            self.assertEqual(self.parents_of(fork, entry["commit"]), [moved])
+            self.assertNotEqual(rev(fork, "develop"), moved)              # local trunk untouched
+
+        def test_sync_records_the_merge_commit(self):
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            base = origin_sha(fork, "develop")
+            name = sync_branch_name()
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 0, err + out)
+            entry = self.pending_of(fork)
+            self.assertEqual(entry, {"kind": "sync", "branch": name, "commit": rev(fork, name),
+                                     "base": base, "mr": ""})
+            self.assertEqual(entry["commit"], origin_sha(fork, name))
+            parents = self.parents_of(fork, entry["commit"])
+            self.assertEqual(len(parents), 2)                             # the merge commit
+            self.assertEqual(parents[0], base)
+            self.assertEqual(resumable(ctx_for(fork, strict_mirror=False), "sync", name), {})
+
+        def test_the_url_gh_prints_is_recorded_for_a_ship(self):
+            fork = make_fork(self.tmp)
+            name = self.feature(fork)
+            self.url_tool("gh", "https://github.com/acme/widget/pull/7")
+            with on_platform("github"):
+                code, out, err = run("-C", fork, "ship", "--mr")
+            self.assertEqual(code, 0, err + out)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"], entry["mr"]),
+                             ("ship", name, "https://github.com/acme/widget/pull/7"))
+            self.assertEqual(entry["commit"], origin_sha(fork, name))
+
+        def test_a_record_that_could_not_be_written_is_said_not_assumed(self):
+            """The push and the merge request both succeeded and the record did not, so the
+            run used to print "after the MR is merged, next: forkflow land" about a record
+            that does not exist - and `land` then answered "nothing pending" about a branch
+            that is pushed with its request open. The record is read back; when it is not
+            there the run says what stands and how to finish by hand. Nothing is undone,
+            nothing commits, and every command printed is one `land` would have run."""
+            fork = make_fork(self.tmp)
+            name = self.feature(fork)
+            url = "https://github.com/acme/widget/pull/7"
+            self.url_tool("gh", url)
+            state = state_path(ctx_for(fork), shared=True)
+            os.mkdir(state)                          # nothing can be written there
+            with on_platform("github"):
+                code, out, err = run("-C", fork, "ship", "--mr")
+            self.assertEqual(code, 0, err + out)     # the work happened: it is not a failure
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+            self.assertIn("could not record that", out)
+            self.assertIn(url, out)
+            self.assertIn(state, out)
+            self.assertNotIn("after the MR is merged, next:", out)
+            for cmd in ("git fetch origin", "git checkout develop",
+                        "git merge --ff-only origin/develop", "git branch -d feat/x"):
+                self.assertIn(cmd, out)
+            for forbidden in ("git commit", "--force", "push origin develop"):
+                self.assertNotIn(forbidden, out.split("WARNING:")[-1])
+            os.rmdir(state)
+            self.assertEqual(run("-C", fork, "land")[0], EXIT_PRECONDITION)   # as it warned
+
+        def test_the_url_glab_prints_is_recorded_for_a_sync(self):
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            url = "https://gitlab.example.com/acme/team/widget/-/merge_requests/3"
+            self.url_tool("glab", url)
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--mr")
+            self.assertEqual(code, 0, err + out)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"], entry["mr"]),
+                             ("sync", sync_branch_name(), url))
+
+        def test_a_failed_or_missing_tool_still_leaves_the_record(self):
+            """The branch is pushed either way; the merge request is what is missing, and
+            `land` after a by-hand merge needs the record just the same."""
+            fork = make_fork(self.tmp)
+            name = self.feature(fork)
+            fake_tool(os.path.join(self.tmp, "bin"), "glab",
+                      'echo "https://example.invalid/-/merge_requests/9"\n'
+                      'echo "glab: not authenticated" >&2\nexit 1\n')
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "ship", "--mr")
+            self.assertEqual(code, 0, err + out)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"], entry["mr"]), ("ship", name, ""))
+            self.assertEqual(entry["commit"], origin_sha(fork, name))
+
+            sh("git", "checkout", "-b", "feat/y", "develop", cwd=fork)
+            commit_fork(fork, "ours/y.txt", "y\n", "ours: y")
+            next_utc_second()                              # a second `backup/<time>-pre-ship`
+            absent = ["forkflow-no-such-tool", "mr", "create"]
+            with on_platform("gitlab"), mock.patch.object(
+                    sys.modules[__name__], "mr_command", lambda *a: absent):
+                code, out, err = run("-C", fork, "ship", "--mr")
+            self.assertEqual(code, 0, err + out)
+            entry = self.pending_of(fork, "feat/y")        # this run's, URL-less
+            self.assertEqual((entry["kind"], entry["branch"], entry["mr"]),
+                             ("ship", "feat/y", ""))
+            self.assertEqual(self.pending_of(fork, name)["commit"], origin_sha(fork, name))
+
+        def test_the_record_is_written_before_the_merge_request_step(self):
+            """The branch is on origin the moment the push succeeds; a run that dies in the
+            merge request step (Ctrl-C at glab's prompt, a temp file that cannot be written)
+            must still have left what `land` needs."""
+            fork = make_fork(self.tmp)
+            name = self.feature(fork)
+            with mock.patch.object(sys.modules[__name__], "open_mr",
+                                   side_effect=KeyboardInterrupt):
+                code, out, err = run("-C", fork, "ship", "--mr")
+            self.assertEqual(code, EXIT_INTERRUPTED, err + out)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"]), ("ship", name))
+            self.assertEqual(entry["commit"], origin_sha(fork, name))
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            with mock.patch.object(sys.modules[__name__], "open_mr",
+                                   side_effect=KeyboardInterrupt):
+                code, out, err = run("-C", fork, "sync", "--mr")
+            self.assertEqual(code, EXIT_INTERRUPTED, err + out)
+            entry = self.pending_of(fork, sync_branch_name())
+            self.assertEqual((entry["kind"], entry["branch"]), ("sync", sync_branch_name()))
+            self.assertEqual(entry["commit"], origin_sha(fork, sync_branch_name()))
+            self.assertEqual(self.pending_of(fork, name)["commit"], origin_sha(fork, name))
+
+        def test_a_dry_run_writes_no_record(self):
+            fork = make_fork(self.tmp)
+            self.feature(fork)
+            code, out, err = run("-C", fork, "ship", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertFalse(os.path.exists(git_path(fork, STATE_FILE)))
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            # the dry run does not fetch, and against an `upstream/*` the server has moved
+            # past it says so instead of concluding anything
+            # (`test_a_dry_run_does_not_call_a_stale_fork_already_in_sync`)
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            code, out, err = run("-C", fork, "sync", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertFalse(os.path.exists(git_path(fork, STATE_FILE)))
+
+    @needs_tomllib
+    class MergeBase(ShipBase):
+        """A `merge = "self"` fork on a named platform, with `merging_tool` as the platform:
+        what the `--merge` tests and the `land`-after-`--merge` tests share. The fixture's
+        origin is a local path, so the platform and the fork it names are supplied
+        (`TestMrCommandsNameTheFork` proves the URL; `on_platform` supplies it)."""
+
+        TOOLS = {"gitlab": "glab", "github": "gh"}
+
+        def self_fork(self) -> str:
+            return make_fork(self.tmp, config='merge = "self"\n')
+
+        def platform(self, name: str) -> str:
+            """A merging glab/gh on PATH; answers with the platform it stands for."""
+            merging_tool(self.tmp, self.TOOLS[name])
+            return name
+
+        def tool_argv_for(self, platform: str, sub: str) -> list:
+            """What the merging fake for `platform` recorded for its `create` or `merge`."""
+            return tool_argv(self.tmp, self.TOOLS[platform], sub)
+
+        def upstream_change(self) -> None:
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+
+        @staticmethod
+        def tree_of(fork: str, sha: str) -> str:
+            return sh("git", "rev-parse", sha + "^{tree}", cwd=fork)
+
+    class TestMergeStep(MergeBase):
+        """`--merge`: the merge request the run just opened is merged by the platform tool
+        with the method rule 5 requires and a head-commit guard - or the run is exit 6 with
+        the branch pushed, the merge request open and the `pending` record intact.
+
+        The platform is `merging_tool`, which moves the bare origin's trunk the way the real
+        one would, so a success is asserted on the trunk moving and not on the argv alone.
+        Nothing here asserts on `pending` after a successful merge: `land` chains in after
+        it and clears the record (`TestMergeLands` asserts that chain)."""
+
+        # -- success: the trunk moves, by the platform, to what this run pushed ----------
+
+        def test_gitlab_ship_merges_with_the_projects_method_and_the_head_guard(self):
+            fork = self.self_fork()
+            name = self.feature(fork, commits=2)
+            base = origin_sha(fork, "develop")
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 0, err + out)
+            # fast-forwarded to the one squashed commit this run pushed, on the base
+            shipped = origin_sha(fork, "develop")
+            self.assertNotEqual(shipped, base)
+            self.assertEqual(sh("git", "rev-list", "--parents", "-1", shipped,
+                                cwd=fork).split()[1:], [base])
+            self.assertEqual(self.tool_argv_for("gitlab", "create")[:2], ["mr", "create"])
+            argv = self.tool_argv_for("gitlab", "merge")
+            self.assertEqual(argv[:3], ["mr", "merge", name])          # by branch, not URL
+            self.assertEqual(self.value(argv, "--repo"), PLATFORM_FORKS["gitlab"])
+            self.assertEqual(self.value(argv, "--sha"), shipped)       # the pushed head
+            self.assertIn("--auto-merge=false", argv)
+            self.assertIn("--remove-source-branch", argv)
+            self.assertIn("--yes", argv)
+            for flag in ("--squash", "--rebase", "--merge"):
+                self.assertNotIn(flag, argv)               # the project's method decides
+            self.assertEqual(origin_sha(fork, name), "")               # the source is removed
+            self.assertIn(MERGING_TOOL_URL["glab"], out)
+            self.assertIn("  merge  $ glab mr merge", out)             # the step, not the fake
+
+        def test_gitlab_sync_merges_the_merge_commit_fast_forward(self):
+            fork = self.self_fork()
+            self.upstream_change()
+            name = sync_branch_name()
+            base = origin_sha(fork, "develop")
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.assertEqual(code, 0, err + out)
+            synced = origin_sha(fork, "develop")                      # fast-forwarded to ...
+            self.assertEqual(sh("git", "rev-list", "--parents", "-1", synced, cwd=fork).split(),
+                             [synced, base, rev(fork, "upstream/main")])  # ... the sync merge
+            argv = self.tool_argv_for("gitlab", "merge")
+            self.assertEqual(argv[:3], ["mr", "merge", name])
+            self.assertEqual(self.value(argv, "--sha"), synced)
+            self.assertEqual(origin_sha(fork, name), "")               # the source is removed
+
+        def test_github_ship_merges_with_rebase_and_the_head_guard(self):
+            """"Rebase and merge" rewrites the commit: the trunk gets a new SHA with the
+            same patch on top of the base - which is what the fake does, and what `land`
+            has to recognise later."""
+            fork = self.self_fork()
+            name = self.feature(fork)
+            base = origin_sha(fork, "develop")
+            with on_platform(self.platform("github")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 0, err + out)
+            shipped = origin_sha(fork, name)
+            argv = self.tool_argv_for("github", "merge")
+            self.assertEqual(argv[:3], ["pr", "merge", name])
+            self.assertEqual(self.value(argv, "--repo"), PLATFORM_FORKS["github"])
+            self.assertEqual(self.value(argv, "--match-head-commit"), shipped)
+            self.assertIn("--rebase", argv)
+            for flag in ("--squash", "--merge", "--auto-merge=false", "--yes"):
+                self.assertNotIn(flag, argv)
+            sh("git", "fetch", "origin", cwd=fork)
+            landed = origin_sha(fork, "develop")
+            self.assertNotIn(landed, (base, shipped))                  # rewritten
+            self.assertEqual(sh("git", "rev-list", "--parents", "-1", landed,
+                                cwd=fork).split()[1:], [base])
+            self.assertEqual(self.tree_of(fork, landed), self.tree_of(fork, shipped))
+
+        def test_github_sync_merges_with_merge(self):
+            """"Create a merge commit" makes one even where a fast-forward was possible: the
+            trunk gets a new merge commit whose second parent is the sync's own."""
+            fork = self.self_fork()
+            self.upstream_change()
+            name = sync_branch_name()
+            base = origin_sha(fork, "develop")
+            with on_platform(self.platform("github")):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.assertEqual(code, 0, err + out)
+            synced = origin_sha(fork, name)                    # gh deletes no branch
+            argv = self.tool_argv_for("github", "merge")
+            self.assertEqual(argv[:3], ["pr", "merge", name])
+            self.assertEqual(self.value(argv, "--match-head-commit"), synced)
+            self.assertIn("--merge", argv)
+            self.assertNotIn("--rebase", argv)
+            self.assertNotIn("--squash", argv)
+            tip = origin_sha(fork, "develop")
+            self.assertEqual(sh("git", "rev-list", "--parents", "-1", tip, cwd=fork).split()[1:],
+                             [base, synced])
+
+        # -- exit 6: the branch is pushed, the record is landable ------------------------
+
+        def refused_merge(self, fork: str, name: str, kind: str, base: str,
+                          platform: str, *argv: str) -> dict:
+            """Run with --merge, expect exit 6, and answer with the intact record."""
+            with on_platform(platform):
+                code, out, err = run("-C", fork, kind, "--merge", *argv)
+            self.assertEqual(code, 6, err + out)
+            self.assertIn("forkflow land", err)                        # the way out
+            self.assertEqual(origin_sha(fork, "develop"), base)        # trunk unchanged
+            entry = self.pending_of(fork)
+            self.assertEqual((entry.get("kind"), entry.get("branch")), (kind, name))
+            self.assertEqual(entry.get("commit"), rev(fork, "refs/heads/" + name))
+            self.assertEqual(entry.get("base"), base)
+            self.assertEqual(resumable(ctx_for(fork, strict_mirror=False), kind, name), {})
+            return entry
+
+        def head_moved(self, platform: str, flag: str) -> None:
+            """A teammate's commit reaches the branch between the push and the merge: the
+            guard names the commit this run pushed, and the platform refuses - the merge
+            must never take whatever the branch points at by then. The proof is the fake's
+            refusal, not the argv; and the argv carries exactly the recorded commit."""
+            fork = self.self_fork()
+            name = self.feature(fork)
+            base = origin_sha(fork, "develop")
+            commit_after_receive(self.tmp)
+            with on_platform(self.platform(platform)):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 6, err + out)
+            self.assertIn("head mismatch", out)                        # the fake's refusal
+            self.assertIn("NOT MERGED (exit 1)", out)
+            self.assertIn("forkflow land", err)                        # the way out
+            self.assertEqual(origin_sha(fork, "develop"), base)        # trunk unchanged
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"], entry["base"]),
+                             ("ship", name, base))
+            self.assertEqual(entry["commit"], rev(fork, "refs/heads/" + name))
+            self.assertEqual(entry["mr"], MERGING_TOOL_URL[self.TOOLS[platform]])
+            self.assertEqual(self.value(self.tool_argv_for(platform, "merge"), flag),
+                             entry["commit"])
+            self.assertNotEqual(origin_sha(fork, name), entry["commit"])    # it did move
+            self.assertEqual(sh("git", "symbolic-ref", "--short", "HEAD", cwd=fork), name)
+
+        def test_gitlab_refuses_a_head_that_moved_after_the_push(self):
+            self.head_moved("gitlab", "--sha")
+
+        def test_github_refuses_a_head_that_moved_after_the_push(self):
+            self.head_moved("github", "--match-head-commit")
+
+        def test_a_failing_merge_is_exit_6_with_the_request_open(self):
+            fork = self.self_fork()
+            self.upstream_change()
+            name = sync_branch_name()
+            base = origin_sha(fork, "develop")
+            os.environ["FORKFLOW_FAKE_FAIL"] = "1"
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.assertEqual(code, 6, err + out)
+            self.assertIn("created", out)                              # the MR is open ...
+            self.assertIn(MERGING_TOOL_URL["glab"], out)
+            self.assertIn("NOT MERGED (exit 1)", out)                  # ... and not merged
+            self.assertIn("FORKFLOW_FAKE_FAIL", out)                   # the tool's stderr
+            self.assertIn("not merged", err)
+            self.assertEqual(origin_sha(fork, "develop"), base)
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+            entry = self.pending_of(fork)
+            self.assertEqual(entry, {"kind": "sync", "branch": name,
+                                     "commit": rev(fork, "refs/heads/" + name),
+                                     "base": base, "mr": MERGING_TOOL_URL["glab"]})
+            self.assertEqual(resumable(ctx_for(fork, strict_mirror=False), "sync", name), {})
+
+        def test_a_merge_request_that_was_not_created_is_exit_6(self):
+            """The tool failed at `create`, so there is no merge request to merge: no merge
+            is attempted, and the record is there for a by-hand merge and `land`."""
+            fork = self.self_fork()
+            name = self.feature(fork)
+            base = origin_sha(fork, "develop")
+            self.platform("gitlab")
+            os.environ["FORKFLOW_FAKE_CREATE"] = "fail"
+            entry = self.refused_merge(fork, name, "ship", base, "gitlab")
+            # the create ran ...
+            self.assertEqual(self.tool_argv_for("gitlab", "create")[:2], ["mr", "create"])
+            self.assertEqual(entry["mr"], "")
+            self.assertEqual(self.tool_argv_for("gitlab", "merge"), [])   # ... the merge never did
+            self.assertEqual(origin_sha(fork, name), entry["commit"])   # pushed all the same
+
+        def test_a_merge_request_the_tool_gave_no_url_for_is_exit_6(self):
+            """`create` exited 0 but printed no URL: nothing says a merge request exists, so
+            nothing is merged - by branch name or otherwise."""
+            fork = self.self_fork()
+            name = self.feature(fork)
+            base = origin_sha(fork, "develop")
+            self.platform("gitlab")
+            os.environ["FORKFLOW_FAKE_CREATE"] = "nourl"
+            entry = self.refused_merge(fork, name, "ship", base, "gitlab")
+            self.assertEqual(entry["mr"], "")
+            self.assertEqual(self.tool_argv_for("gitlab", "merge"), [])
+            self.assertEqual(origin_sha(fork, name), entry["commit"])
+
+        def test_a_merge_the_tool_only_queued_is_exit_6_not_merged(self):
+            """The tool answers 0 but nothing reaches the trunk - here glab arming auto-merge,
+            as it does without `--auto-merge=false`; a merge train or a queue look the same.
+            That request is not merged: exit 6, the record intact, nothing moved - never an
+            exit 2 that opens with "the merge request was merged"."""
+            fork = self.self_fork()
+            name = self.feature(fork)
+            base = origin_sha(fork, "develop")
+            real = merge_command
+
+            def armed(*a):
+                return [c for c in real(*a) if c != "--auto-merge=false"]
+
+            with on_platform(self.platform("gitlab")), \
+                    mock.patch.object(sys.modules[__name__], "merge_command", armed):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 6, err + out)
+            self.assertNotIn("was merged;", err)
+            self.assertIn("forkflow land", err)
+            self.assertEqual(origin_sha(fork, "develop"), base)
+            self.assertEqual(rev(fork, "refs/heads/develop"), base)
+            self.assertEqual(checked_out(fork), name)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"], entry["commit"]),
+                             ("ship", name, rev(fork, "refs/heads/" + name)))
+
+        def test_a_trunk_that_moved_after_the_push_is_not_fast_forwarded_over(self):
+            """Somebody else's merge request landed between the push and the merge: GitLab's
+            fast-forward method refuses ("rebase needed"), so it is exit 6 with the record
+            intact - and the other commit stays on the trunk."""
+            fork = self.self_fork()
+            name = self.feature(fork)
+            commit_after_receive(self.tmp, onto="develop")
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 6, err + out)
+            self.assertIn("NOT MERGED (exit 1)", out)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"]), ("ship", name))
+            origin_git = "--git-dir=" + os.path.join(self.tmp, "origin.git")
+            self.assertEqual(sh("git", origin_git, "log", "-1", "--format=%s %P", "develop"),
+                             "teammate " + entry["base"])               # not fast-forwarded over
+            self.assertEqual(origin_sha(fork, name), entry["commit"])   # nothing removed
+
+        def test_a_missing_merge_tool_is_exit_6(self):
+            fork = self.self_fork()
+            name = self.feature(fork)
+            base = origin_sha(fork, "develop")
+            self.platform("github")
+            absent = ["forkflow-no-such-tool", "pr", "merge", name]
+            with mock.patch.object(sys.modules[__name__], "merge_command", lambda *a: absent):
+                with on_platform("github"):
+                    code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 6, err + out)
+            self.assertIn("NOT MERGED (forkflow-no-such-tool unavailable", out)
+            self.assertEqual(origin_sha(fork, "develop"), base)
+            self.assertEqual(self.pending_of(fork)["mr"], MERGING_TOOL_URL["gh"])
+
+        # -- what does not merge ----------------------------------------------------------
+
+        def test_mr_without_merge_runs_no_merge(self):
+            fork = self.self_fork()
+            name = self.feature(fork)
+            base = origin_sha(fork, "develop")
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--mr")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(self.tool_argv_for("gitlab", "create")[:2], ["mr", "create"])
+            self.assertEqual(self.tool_argv_for("gitlab", "merge"), [])
+            self.assertEqual(origin_sha(fork, "develop"), base)
+            self.assertEqual(self.pending_of(fork)["mr"], MERGING_TOOL_URL["glab"])
+            self.assertEqual(sh("git", "symbolic-ref", "--short", "HEAD", cwd=fork), name)
+
+        def test_a_dry_run_runs_nothing_and_writes_nothing(self):
+            fork = self.self_fork()
+            self.upstream_change()
+            sh("git", "fetch", "-q", "upstream", cwd=fork)   # a dry run of its own does not
+            before = (origin_sha(fork, "develop"), origin_sha(fork, "main"))
+            self.platform("gitlab")
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--merge", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("would: merge", out)
+            self.assertIn("would: land", out)
+            self.assertIn("unless --merge lands it", out)         # where you end up
+            name = self.feature(fork)
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "ship", "--merge", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("would: merge", out)
+            self.assertIn("glab mr merge " + name, out)
+            self.assertIn("would: land", out)
+            self.assertEqual(self.tool_argv_for("gitlab", "create"), [])       # neither tool ran
+            self.assertEqual(self.tool_argv_for("gitlab", "merge"), [])
+            self.assertFalse(os.path.exists(git_path(fork, STATE_FILE)))    # no state at all
+            self.assertEqual((origin_sha(fork, "develop"), origin_sha(fork, "main")), before)
+            self.assertEqual(self.backup_branch(fork), "")
+            self.assertEqual(origin_sha(fork, name), "")                # nothing pushed
+
+    # ------------------------------------------------------------------- #
+    # land
+    # ------------------------------------------------------------------- #
+
+    class TestLand(ShipBase):
+        """`land`: the closing step, from the `pending` record a ship or a sync left.
+
+        The merge is a human's here - the bare origin's trunk is moved by the test, the way
+        the platform's merge button moves it: a fast-forward, a cherry-pick (rebase and
+        merge), a squash, a merge commit. Assertions are on state: where the local trunk,
+        HEAD and the landed branch are afterwards, and whether the record is gone."""
+
+        MR = "https://example.invalid/-/merge_requests/1"
+
+        def parent_of(self, sha: str) -> str:
+            return sh("git", "rev-parse", sha + "^", cwd=os.path.join(self.tmp, "human"))
+
+        def with_mr(self, fork: str, entry: dict) -> dict:
+            """The record as a run with `--mr` leaves it: the merge request's URL known."""
+            entry = dict(entry, mr=self.MR)
+            put_pending(fork, entry)
+            return entry
+
+        def synced(self) -> Tuple[str, str, dict]:
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("next: forkflow land", out)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"]), ("sync", sync_branch_name()))
+            return fork, entry["branch"], entry
+
+        def land(self, fork: str, *flags: str):
+            return run("-C", fork, "land", *flags)
+
+        def assert_untouched(self, fork: str, name: str, entry: dict, on: str) -> None:
+            """Nothing moved: local trunk, HEAD, the branch and the record as they were."""
+            self.assertEqual(rev(fork, "refs/heads/develop"), entry["base"])
+            self.assertEqual(checked_out(fork), on)
+            self.assertEqual(rev(fork, "refs/heads/" + name), entry["commit"])
+            self.assertEqual(self.pending_of(fork), entry)
+
+        # -- preflight: exit 2, nothing moves ----------------------------------------------
+
+        def test_nothing_pending_is_exit_2(self):
+            fork = make_fork(self.tmp)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("nothing pending", err)
+            self.assertEqual(checked_out(fork), "develop")
+
+        def test_a_dirty_tree_is_exit_2(self):
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            write(fork, "README.md", "# edited\n")
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("uncommitted changes", err)
+            self.assert_untouched(fork, name, entry, on=name)
+
+        def test_a_rebase_stopped_on_a_clean_tree_is_exit_2(self):
+            """A rebase stopped by a failing `--exec` leaves the tree clean, so only the
+            rebase check can refuse it - checking the trunk out would walk out of it."""
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            sh("git", "checkout", "-q", "-b", "other", "develop", cwd=fork)
+            commit_fork(fork, "ours/other.txt", "other\n", "other: one")
+            sh("git", "rebase", "--no-ff", "--exec", "false", "HEAD~1", cwd=fork, check=False)
+            ctx = ctx_for(fork, strict_mirror=False)
+            self.assertTrue(rebase_in_progress(ctx))
+            self.assertTrue(clean_tree(ctx))
+            head = rev(fork, "HEAD")
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertEqual(rev(fork, "refs/heads/develop"), entry["base"])
+            self.assertEqual(rev(fork, "HEAD"), head)
+            self.assertTrue(rebase_in_progress(ctx))
+            self.assertEqual(self.pending_of(fork), entry)
+
+        def test_a_failed_fetch_is_exit_2_even_when_the_refs_show_the_landing(self):
+            """The refs on disk already say "landed", but `land` fetches first and a fetch
+            that fails stops it: nothing moves on a stale view."""
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            sh("git", "remote", "set-url", "origin", os.path.join(self.tmp, "gone.git"),
+               cwd=fork)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("fetch failed", err)
+            self.assert_untouched(fork, name, entry, on=name)
+
+        def test_a_rebase_in_progress_is_exit_2(self):
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            sh("git", "checkout", "-q", "-b", "other", "develop", cwd=fork)
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "other: shared")
+            second_clone_commit(self.tmp, path="shared.tf",
+                                content=self.BASE_TF.replace("count = 1", "count = 9"))
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            sh("git", "rebase", "origin/develop", cwd=fork, check=False)   # stops on shared.tf
+            self.assertTrue(rebase_in_progress(ctx_for(fork, strict_mirror=False)))
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("rebase is in progress", err)
+            self.assertEqual(rev(fork, "refs/heads/develop"), entry["base"])
+            self.assertEqual(self.pending_of(fork), entry)
+
+        def test_the_trunk_checked_out_in_another_worktree_is_exit_2(self):
+            """Refused before the fetch, naming the worktree - and the route it names works:
+            `land` there sees the same record, lands, and forgets it for both."""
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            wt = os.path.join(self.tmp, "wt")
+            sh("git", "worktree", "add", "-q", wt, "develop", cwd=fork)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("checked out in %s:" % wt, err)           # the path is named
+            self.assert_untouched(fork, name, entry, on=name)
+            # refused before the fetch: the remote-tracking trunk has not seen the merge
+            self.assertEqual(rev(fork, "refs/remotes/origin/develop"), entry["base"])
+            self.assertEqual(self.pending_of(wt), entry)            # the same record there
+            code, out, err = self.land(wt)
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(wt, "refs/heads/develop"), entry["commit"])
+            self.assertEqual(checked_out(wt), "develop")
+            self.assertEqual(self.pending_of(wt), {})
+            self.assertEqual(self.pending_of(fork), {})
+            # the branch is checked out in the main worktree, so git will not delete it; the
+            # landing is done all the same
+            self.assertEqual(rev(fork, "refs/heads/" + name), entry["commit"])
+            self.assertIn("NOT deleted", out)
+
+        def test_a_ship_from_a_linked_worktree_lands_in_the_main_one(self):
+            """The usual worktree layout: the main worktree stays on the trunk, the feature
+            is shipped from a linked one. `land` there names the main worktree, and `land`
+            in the main worktree finds the record the linked one wrote."""
+            fork = make_fork(self.tmp)
+            linked = os.path.join(self.tmp, "linked")
+            sh("git", "worktree", "add", "-q", "-b", "feat/x", linked, "develop", cwd=fork)
+            commit_fork(linked, "ours/f0.txt", "line 0\n", "ours: step 0")
+            code, out, err = run("-C", linked, "ship")
+            self.assertEqual(code, 0, err + out)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"]), ("ship", "feat/x"))
+            self.assertEqual(self.pending_of(linked), entry)
+            self.move_trunk(entry["commit"])
+            code, out, err = self.land(linked)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("checked out in %s:" % fork, err)
+            self.assertEqual(rev(linked, "refs/remotes/origin/develop"), entry["base"])
+            self.assertEqual(checked_out(linked), "feat/x")
+            self.assertEqual(self.pending_of(fork), entry)
+            code, out, err = self.land(fork)                        # the route it named
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(fork, "refs/heads/develop"), entry["commit"])
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(self.pending_of(fork), {})
+            self.assertEqual(self.pending_of(linked), {})
+            self.assertEqual(rev(fork, "refs/heads/feat/x"), entry["commit"])  # checked out there
+            self.assertEqual(checked_out(linked), "feat/x")
+
+        # -- not landed --------------------------------------------------------------------
+
+        def test_a_ship_not_merged_yet_is_exit_2_naming_the_request(self):
+            fork, name, entry = self.shipped()
+            entry = self.with_mr(fork, entry)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn(self.MR, err)
+            self.assertIn("not on origin/develop yet", err)
+            self.assertNotIn("rule 5", err)                          # a ship may be rewritten
+            self.assert_untouched(fork, name, entry, on=name)
+            self.assertEqual(origin_sha(fork, "develop"), entry["base"])
+
+        def test_a_sync_not_merged_yet_carries_the_rule_5_note(self):
+            fork, name, entry = self.synced()
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("`%s`" % name, err)                        # no URL: the branch
+            self.assertIn("rule 5", err)
+            self.assertIn("land --force", err)
+            self.assert_untouched(fork, name, entry, on=name)
+
+        def test_a_sync_squashed_in_the_ui_is_not_landed_and_says_rule_5(self):
+            """A human squashed the sync: upstream's commits are on the trunk under new
+            SHAs, so the merge commit never becomes an ancestor. Patch equivalence is a
+            ship's test only - for a sync it would call this landed and `-D` the branch -
+            so it is exit 2 with the rule-5 note, and `status` agrees it has not landed."""
+            fork, name, entry = self.synced()
+            tip = self.human(("merge", "--squash", "origin/" + name),
+                             ("commit", "-q", "-m", "a sync, squashed by hand"))
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("rule 5", err)
+            self.assert_untouched(fork, name, entry, on=name)
+            self.assertEqual(rev(fork, "refs/remotes/origin/develop"), tip)   # it did fetch
+            code, out, err = run("-C", fork, "status", "--offline")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("- not on origin/develop yet", out)
+            self.assertEqual(self.pending_of(fork), entry)
+
+        def test_the_ship_of_another_clone_cannot_be_verified_here(self):
+            """A record whose commit this clone does not have - the state file copied from
+            elsewhere, say - is refused rather than guessed at; `--force` clears it without
+            touching a branch."""
+            fork, name, shipped = self.shipped()
+            elsewhere = commit_upstream(self.tmp, "docs/x.md", "x\n")   # never fetched here
+            entry = dict(shipped, commit=elsewhere, branch="feat/other")
+            put_pending(fork, entry)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("cannot verify", err)
+            self.assertEqual(rev(fork, "refs/heads/develop"), entry["base"])
+            self.assertEqual(checked_out(fork), name)                # nothing moved ...
+            self.assertEqual(self.pending_of(fork), entry)           # ... and nothing forgotten
+            # `--force` judges nothing, so a commit it cannot see is no obstacle: the trunk
+            # follows origin, no branch is touched, and the record goes
+            other = second_clone_commit(self.tmp)
+            code, out, err = self.land(fork, "--force")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(fork, "refs/heads/develop"), other)
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(rev(fork, "refs/heads/" + name), shipped["commit"])  # untouched
+            self.assertIn("landing NOT verified", out)
+            self.assertEqual(self.pending_of(fork), {})
+
+        def test_a_ship_whose_commit_was_pruned_is_cleared_by_force(self):
+            """The merge request was abandoned, the branch deleted and its commit pruned:
+            `status` can only say "cannot verify", plain `land` refuses to guess - and
+            `--force`, the documented way to clear a closed request, clears it. Two commits,
+            so the squash is a commit of its own and not the tip the pre-ship backup keeps."""
+            fork, name, entry = self.shipped(commits=2)
+            sh("git", "checkout", "-q", "develop", cwd=fork)
+            sh("git", "branch", "-D", name, cwd=fork)
+            sh("git", "push", "-q", "origin", "--delete", name, cwd=fork)
+            sh("git", "reflog", "expire", "--expire=now", "--all", cwd=fork)
+            sh("git", "gc", "-q", "--prune=now", cwd=fork)
+            self.assertEqual(sh("git", "cat-file", "-t", entry["commit"], cwd=fork,
+                                check=False), "")                    # gone from the clone
+            code, out, err = run("-C", fork, "status", "--offline")
+            self.assertIn("- cannot verify here", out)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertEqual(self.pending_of(fork), entry)
+            code, out, err = self.land(fork, "--force")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(self.pending_of(fork), {})
+            self.assertEqual(checked_out(fork), "develop")
+
+        def test_an_empty_ship_is_not_matched_to_an_empty_trunk_commit(self):
+            """The squash allows an empty commit, and an empty patch matches every empty
+            commit: only ancestry can land an empty ship."""
+            fork = make_fork(self.tmp)
+            name = self.feature(fork, commits=0)
+            commit_fork(fork, "ours/tmp.txt", "tmp\n", "ours: add")
+            sh("git", "rm", "-q", "ours/tmp.txt", cwd=fork)
+            sh("git", "commit", "-q", "-m", "ours: remove", cwd=fork)
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            entry = self.pending_of(fork)
+            self.assertEqual(sh("git", "diff", entry["base"], entry["commit"], cwd=fork), "")
+            self.human(("commit", "-q", "--allow-empty", "-m", "somebody's empty commit"))
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assert_untouched(fork, name, entry, on=name)
+
+        @needs_merge_tree
+        def test_a_rewritten_patch_that_was_reverted_is_not_landed(self):
+            """The patch reached the trunk and was reverted since: `git cherry` still finds
+            it, but the trunk no longer has the change - not a landing, and not a reason to
+            delete the branch."""
+            fork, name, entry = self.shipped()
+            self.human(("cherry-pick", "origin/" + name), ("revert", "--no-edit", "HEAD"))
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assert_untouched(fork, name, entry, on=name)
+
+        @needs_merge_tree
+        def test_a_rewritten_patch_edited_again_since_is_still_landed(self):
+            """Later work on the very lines the ship changed is not a revert: the patch
+            landed, and the trunk has moved on from it."""
+            fork, name, entry = self.shipped()
+            self.human(("cherry-pick", "origin/" + name))
+            write(os.path.join(self.tmp, "human"), "ours/f0.txt", "line 0, moved on\n")
+            tip = self.human(("commit", "-q", "-am", "somebody moved it on"))
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("(rewritten)", out)
+            self.assert_landed(fork, name, tip)
+
+        def test_a_branch_already_deleted_by_hand_still_lands(self):
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            sh("git", "checkout", "-q", "develop", cwd=fork)
+            sh("git", "branch", "-D", name, cwd=fork)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("`%s` is already gone" % name, out)       # the only difference
+            self.assert_landed(fork, name, entry["commit"])
+
+        def test_the_mirror_is_never_deleted_whatever_the_record_says(self):
+            """A hand-edited record naming the mirror, whose tip is on the trunk: it lands
+            (the trunk catches up) and `main` stays."""
+            fork = make_fork(self.tmp)
+            mirror = rev(fork, "refs/heads/main")
+            put_pending(fork, {"kind": "ship", "branch": "main", "commit": mirror,
+                               "base": rev(fork, "refs/remotes/origin/develop"), "mr": ""})
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(fork, "refs/heads/main"), mirror)
+            self.assertEqual(self.pending_of(fork), {})
+
+        # -- landed ------------------------------------------------------------------------
+
+        def test_a_ship_merged_by_fast_forward_lands_by_ancestry(self):
+            fork, name, entry = self.shipped(commits=2)
+            self.move_trunk(entry["commit"])
+            old = rev(fork, "refs/heads/develop")
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("(ancestor)", out)
+            self.assertIn("git branch -d " + name, out)
+            self.assertIn("landed: develop %s..%s" % (short(old), short(entry["commit"])), out)
+            self.assertIn("you are on develop", out)
+            self.assertNotIn("WARNING", out)
+            self.assert_landed(fork, name, entry["commit"])
+            self.assertTrue(os.path.exists(os.path.join(fork, "ours", "f1.txt")))  # files follow
+
+        def test_a_sync_merged_as_its_merge_commit_lands(self):
+            fork, name, entry = self.synced()
+            self.move_trunk(entry["commit"])
+            mirror = rev(fork, "refs/heads/main")
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assert_landed(fork, name, entry["commit"])
+            self.assertEqual(rev(fork, "refs/heads/main"), mirror)     # the mirror is not touched
+            self.assertTrue(os.path.exists(os.path.join(fork, "docs", "theirs.md")))
+
+        def test_a_ship_rebased_by_the_platform_lands_by_its_patch(self):
+            """"Rebase and merge": a new SHA with the same patch. `-d` would refuse the
+            branch (its tip is unreachable from the trunk), so the verified landing uses `-D`."""
+            fork, name, entry = self.shipped()
+            tip = self.human(("cherry-pick", "origin/" + name))
+            self.assertNotEqual(tip, entry["commit"])
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("%s (rewritten)" % short(tip), out)
+            self.assertIn("git branch -D " + name, out)
+            self.assert_landed(fork, name, tip)
+
+        def test_a_rewritten_ship_is_found_behind_a_commit_that_landed_first(self):
+            """Another commit reached the trunk between the push and the merge: tree
+            equality would say "not landed"; the patch is still there."""
+            fork, name, entry = self.shipped()
+            other = second_clone_commit(self.tmp)
+            tip = self.human(("cherry-pick", "origin/" + name))
+            self.assertEqual(self.parent_of(tip), other)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("(rewritten)", out)
+            self.assert_landed(fork, name, tip)
+            self.assertTrue(os.path.exists(os.path.join(fork, "ours", "other.txt")))
+
+        def test_a_ship_squashed_by_a_human_lands_by_its_patch(self):
+            fork, name, entry = self.shipped()
+            tip = self.human(("merge", "--squash", "origin/" + name),
+                             ("commit", "-q", "-m", "squashed by hand"))
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("(rewritten)", out)
+            self.assert_landed(fork, name, tip)
+
+        # -- the branch moved on after the ship: only the pushed commit landed ---------------
+
+        def assert_kept_at(self, fork: str, name: str, tip: str, landed_tip: str) -> None:
+            """The landing is done - trunk caught up, HEAD on it, record cleared - and the
+            branch is still there at `tip`, the commit that did not land."""
+            self.assertEqual(rev(fork, "refs/heads/develop"), landed_tip)
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(self.pending_of(fork), {})
+            self.assertEqual(rev(fork, "refs/heads/" + name), tip)       # kept, not rewound
+            rc, _, _ = git_rc("merge-base", "--is-ancestor", tip, "refs/heads/develop",
+                              cwd=fork)
+            self.assertEqual(rc, 1)                     # the later commit is on no trunk ...
+            self.assertIn("refs/heads/" + name,        # ... and still reachable from a branch
+                          sh("git", "for-each-ref", "--contains", tip,
+                             "--format=%(refname)", "refs/heads/", cwd=fork).splitlines())
+
+        def test_a_commit_after_a_rewritten_ship_keeps_the_branch(self):
+            """"Rebase and merge" of the pushed commit, and one more commit made on the
+            branch after the ship: the patch that landed is the shipped one, so `-D` of the
+            branch would destroy the later commit. It is kept, and the landing still runs."""
+            fork, name, entry = self.shipped()
+            later = commit_fork(fork, "ours/later.txt", "later\n", "ours: after the ship")
+            tip = self.human(("cherry-pick", entry["commit"]))
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("(rewritten)", out)
+            self.assertNotIn("git branch -D", out)
+            self.assert_kept_at(fork, name, later, tip)
+
+        def test_a_commit_after_the_ship_pushed_by_hand_still_keeps_the_branch(self):
+            """The later commit pushed by hand: `push` set the branch's upstream, so a
+            plain `git branch -d` would take the branch now that `origin/<branch>` contains
+            its tip - the recorded commit is the guard, not `-d`."""
+            fork, name, entry = self.shipped()
+            later = commit_fork(fork, "ours/later.txt", "later\n", "ours: after the ship",
+                                push=True)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertEqual(rev(fork, "refs/remotes/origin/" + name), later)
+            tip = self.human(("cherry-pick", entry["commit"]))
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assert_kept_at(fork, name, later, tip)
+
+        def test_a_commit_after_a_fast_forwarded_ship_keeps_the_branch(self):
+            fork, name, entry = self.shipped()
+            later = commit_fork(fork, "ours/later.txt", "later\n", "ours: after the ship")
+            self.move_trunk(entry["commit"])
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("(ancestor)", out)
+            self.assert_kept_at(fork, name, later, entry["commit"])
+
+        def test_a_ship_merged_as_a_merge_commit_lands_with_the_rule_5_warning(self):
+            fork, name, entry = self.shipped()
+            tip = self.human(("merge", "--no-ff", "-q", "-m", "Merge " + name, "origin/" + name))
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("(ancestor)", out)
+            self.assertIn("WARNING", out)
+            self.assertIn("merged as a merge commit", out)
+            self.assert_landed(fork, name, tip)
+
+        def test_a_local_trunk_with_its_own_commit_is_exit_2_and_untouched(self):
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            sh("git", "checkout", "-q", "develop", cwd=fork)
+            own = commit_fork(fork, "ours/local.txt", "local\n", "local: by hand")
+            sh("git", "checkout", "-q", name, cwd=fork)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("commits origin lacks", err)
+            self.assertEqual(rev(fork, "refs/heads/develop"), own)
+            self.assertEqual(checked_out(fork), name)
+            self.assertEqual(rev(fork, "refs/heads/" + name), entry["commit"])
+            self.assertEqual(self.pending_of(fork), entry)
+
+        def test_a_missing_local_trunk_is_created_from_origin(self):
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            sh("git", "branch", "-D", "develop", cwd=fork)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("git branch --no-track develop origin/develop", out)
+            self.assert_landed(fork, name, entry["commit"])
+            # `--no-track` as state, not as the printed command: the recreated trunk has no
+            # upstream, so a stray `git pull` on it later is refused rather than merged
+            self.assertEqual(sh("git", "config", "--get", "branch.develop.remote", cwd=fork,
+                                check=False), "")
+            self.assertEqual(sh("git", "config", "--get", "branch.develop.merge", cwd=fork,
+                                check=False), "")
+
+        def test_land_from_an_unrelated_branch_ends_on_the_trunk(self):
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            sh("git", "checkout", "-q", "-b", "other", "develop", cwd=fork)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assert_landed(fork, name, entry["commit"])
+            self.assertEqual(rev(fork, "refs/heads/other"), entry["base"])   # left alone
+
+        def test_land_from_the_trunk_itself(self):
+            """The trunk checked out here is not "another worktree": `land` runs on it."""
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            sh("git", "checkout", "-q", "develop", cwd=fork)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assert_landed(fork, name, entry["commit"])
+
+        def test_a_trunk_already_caught_up_is_still_checked_out(self):
+            """The local trunk was pulled by hand and HEAD went back to the branch: there is
+            nothing to fast-forward, but `land` still leaves you on the trunk - and only from
+            there can the landed branch be deleted."""
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            sh("git", "checkout", "-q", "develop", cwd=fork)
+            sh("git", "merge", "-q", "--ff-only", "origin/develop", cwd=fork)
+            sh("git", "checkout", "-q", name, cwd=fork)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            self.assert_landed(fork, name, entry["commit"])
+
+        def test_land_twice_is_nothing_pending(self):
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 0, err + out)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("nothing pending", err)
+
+        # -- --force and --dry-run ---------------------------------------------------------
+
+        def test_force_fast_forwards_an_unverified_landing_and_keeps_the_branch(self):
+            """The MR was closed instead of merged and somebody else's commit landed: the
+            trunk follows origin, the branch stays (nothing proved it landed), the record
+            is cleared - the escape hatch, said out loud."""
+            fork, name, entry = self.shipped()
+            entry = self.with_mr(fork, entry)
+            other = second_clone_commit(self.tmp)
+            code, out, err = self.land(fork)
+            self.assertEqual(code, 2, err + out)                      # without --force: no
+            self.assert_untouched(fork, name, entry, on=name)
+            with on_platform("github"):
+                code, out, err = self.land(fork, "--force")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("not verified (--force)", out)
+            self.assertIn("`%s` is kept" % name, out)
+            self.assertIn("caught up, landing NOT verified: develop", out)   # not "landed:"
+            self.assertNotIn("may still exist", out)      # the branch is kept: no delete hint
+            self.assertEqual(rev(fork, "refs/heads/develop"), other)
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(rev(fork, "refs/heads/" + name), entry["commit"])   # kept
+            self.assertEqual(self.pending_of(fork), {})
+
+        def test_force_deletes_the_branch_when_the_landing_is_verified(self):
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            code, out, err = self.land(fork, "--force")
+            self.assertEqual(code, 0, err + out)
+            self.assertNotIn("not verified", out)
+            self.assert_landed(fork, name, entry["commit"])
+
+        def test_a_dry_run_moves_nothing_and_keeps_the_record(self):
+            """The landing is already in this clone's refs - `ship --merge` and a merge by
+            hand both leave it fetched - so the dry run judges it and previews every step."""
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            sh("git", "fetch", "-q", "origin", cwd=fork)      # a dry run of its own does not
+            code, out, err = self.land(fork, "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("would: checkout  $ git checkout develop", out)
+            self.assertIn("would: trunk  $ git merge --ff-only origin/develop", out)
+            self.assertIn("would: branch  $ git branch -d " + name, out)
+            self.assertIn("would: landed", out)
+            self.assertEqual(rev(fork, "refs/remotes/origin/develop"), entry["commit"])
+            self.assert_untouched(fork, name, entry, on=name)
+
+        def test_a_dry_run_fetches_nothing_and_says_what_it_could_not_tell(self):
+            """The no-write contract, against the one writing step every `--dry-run` path
+            took: `git fetch` rewrites `FETCH_HEAD`, moves the remote-tracking refs and
+            brings objects in. `git ls-remote` asks the same server and writes none of them,
+            so the run says what origin has and that the verdict below it is from the refs
+            on disk - rather than fetching, or saying "merge it" about a request that is
+            merged. The refusal names the run that can decide."""
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])
+            fetch_head = git_path(fork, "FETCH_HEAD")
+            if os.path.exists(fetch_head):
+                os.unlink(fetch_head)
+            before = odb(fork)
+            code, out, err = self.land(fork, "--dry-run")
+            self.assertEqual(code, EXIT_PRECONDITION, err + out)
+            self.assertIn("did not fetch", err)
+            self.assertIn("without `--dry-run`", err)
+            self.assertIn("git ls-remote origin refs/heads/develop", out)
+            self.assertIn("NOT fetched (dry run)", out)
+            self.assertFalse(os.path.exists(fetch_head))             # no FETCH_HEAD
+            self.assertEqual(odb(fork), before)                      # no objects
+            self.assertNotEqual(rev(fork, "refs/remotes/origin/develop"), entry["commit"])
+            self.assert_untouched(fork, name, entry, on=name)
+            code, out, err = self.land(fork)                         # the named run decides
+            self.assertEqual(code, 0, err + out)
+            self.assert_landed(fork, name, entry["commit"])
+
+    class TestStatusPending(ShipBase):
+        """`status`'s `pending` line: the record a ship or a sync left and whether it has
+        landed, judged with git only from the refs as they are. Assertions are on the
+        decision the line carries (landed / not landed / cannot verify), read back through
+        `verdict()`, never on the sentence around it."""
+
+        @staticmethod
+        def pending_line(out: str) -> Optional[str]:
+            lines = [ln for ln in out.splitlines() if ln.startswith("  pending")]
+            return lines[0] if lines else None
+
+        def verdict(self, out: str) -> Optional[str]:
+            """The decision on the pending line: "landed", "not landed", "cannot verify",
+            or None when there is no such line."""
+            line = self.pending_line(out)
+            if line is None:
+                return None
+            if "landed: run forkflow land" in line:
+                return "landed"
+            if "cannot verify" in line:
+                return "cannot verify"
+            self.assertIn("not on origin/develop yet", line)
+            return "not landed"
+
+        def status(self, fork: str, *flags: str) -> str:
+            code, out, err = run("-C", fork, "status", *flags)
+            self.assertEqual(code, 0, err + out)
+            return out
+
+        def test_no_line_when_nothing_is_pending(self):
+            fork = make_fork(self.tmp)
+            self.assertIsNone(self.verdict(self.status(fork)))
+
+        def test_not_landed_until_the_trunk_moves_and_fetch_flips_the_verdict(self):
+            fork, name, entry = self.shipped()
+            out = self.status(fork)
+            self.assertEqual(self.verdict(out), "not landed")
+            self.assertIn(f"pending  ship {name} -> MR -", self.pending_line(out))
+            self.move_trunk(entry["commit"])
+            # without --fetch the verdict is from the refs on disk, which have not moved
+            self.assertEqual(self.verdict(self.status(fork)), "not landed")
+            self.assertEqual(self.verdict(self.status(fork, "--fetch")), "landed")
+            # the fetch moved the refs, so a plain status now agrees
+            self.assertEqual(self.verdict(self.status(fork)), "landed")
+            self.assertEqual(self.pending_of(fork), entry)        # status writes nothing
+
+        def test_a_sync_is_judged_by_ancestry_of_its_merge_commit(self):
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 0, err + out)
+            entry = self.pending_of(fork)
+            self.assertEqual(entry["kind"], "sync")
+            self.assertEqual(self.verdict(self.status(fork)), "not landed")
+            self.move_trunk(entry["commit"])
+            sh("git", "fetch", "origin", cwd=fork)
+            self.assertEqual(self.verdict(self.status(fork)), "landed")
+
+        def test_the_url_is_shown_when_the_record_has_one(self):
+            fork, name, entry = self.shipped()
+            url = "https://example.invalid/-/merge_requests/7"
+            put_pending(fork, dict(entry, mr=url))
+            self.assertIn(f"-> MR {url} -", self.pending_line(self.status(fork)))
+
+        def test_offline_gives_the_same_verdict(self):
+            """The check is git-only: `--offline` skips the server round-trip and nothing else."""
+            fork, name, entry = self.shipped()
+            self.assertEqual(self.pending_line(self.status(fork, "--offline")),
+                             self.pending_line(self.status(fork)))
+            self.assertEqual(self.verdict(self.status(fork, "--offline")), "not landed")
+            self.move_trunk(entry["commit"])
+            sh("git", "fetch", "origin", cwd=fork)
+            self.assertEqual(self.verdict(self.status(fork, "--offline")), "landed")
+            self.assertEqual(self.pending_line(self.status(fork, "--offline")),
+                             self.pending_line(self.status(fork)))
+
+        def test_cannot_verify_without_the_trunk_on_origin(self):
+            """A fresh fork has no `origin/develop`; `status` resolves without one and must
+            not raise for this line."""
+            fork = make_fresh_fork(self.tmp)
+            head = rev(fork, "HEAD")
+            put_pending(fork, {"kind": "ship", "branch": "feat/x", "commit": head,
+                               "base": head, "mr": ""})
+            self.assertEqual(self.verdict(self.status(fork)), "cannot verify")
+
+        def test_cannot_verify_when_the_commit_is_not_in_this_clone(self):
+            """The record is the other clone's: `landed()` would raise, `status` does not."""
+            fork = make_fork(self.tmp)
+            put_pending(fork, {"kind": "ship", "branch": "feat/x", "commit": "1" * 40,
+                               "base": rev(fork, "refs/remotes/origin/develop"), "mr": ""})
+            self.assertEqual(self.verdict(self.status(fork)), "cannot verify")
+
+        def test_a_malformed_entry_is_ignored(self):
+            fork = make_fork(self.tmp)
+            write_state(ctx_for(fork, strict_mirror=False), "pending",
+                        {"kind": "ship", "branch": "feat/x"})
+            self.assertIsNone(self.verdict(self.status(fork)))
+
+    class TestMergeLands(MergeBase):
+        """`--merge` ends by running `land` in the same process: the trunk is
+        fast-forwarded locally, you are left on it, the branch is gone, the record cleared -
+        on both platforms and for both kinds. A merge that succeeded and a catch-up that
+        then could not run is exit 2 opening with "the merge request was merged"."""
+
+        def test_gitlab_ship_lands_by_fast_forward(self):
+            fork = self.self_fork()
+            name = self.feature(fork, commits=2)
+            old = rev(fork, "refs/heads/develop")
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 0, err + out)
+            # what was pushed
+            shipped = self.value(self.tool_argv_for("gitlab", "merge"), "--sha")
+            self.assertEqual(sh("git", "rev-list", "--parents", "-1", shipped,
+                                cwd=fork).split()[1:], [old])
+            self.assertIn("(ancestor)", out)
+            self.assertIn("landed: develop %s..%s" % (short(old), short(shipped)), out)
+            self.assertEqual(origin_sha(fork, name), "")             # glab removed it ...
+            self.assertNotIn("may still exist", out)                 # ... so no hint ...
+            self.assertEqual(rev(fork, "refs/remotes/origin/" + name), "")   # ... nor a stale ref
+            self.assert_landed(fork, name, shipped)
+            # which is what lets the name be shipped again: a stale `origin/<branch>` would
+            # be offered as the lease, and `--force-with-lease` refuses it ("stale info")
+            next_utc_second()
+            sh("git", "checkout", "-q", "-b", name, "develop", cwd=fork)
+            commit_fork(fork, "ours/again.txt", "again\n", "ours: again")
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(self.pending_of(fork), {})
+
+        def test_gitlab_sync_lands_its_merge_commit(self):
+            fork = self.self_fork()
+            self.upstream_change()
+            name = sync_branch_name()
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("unless --merge lands it", out)
+            synced = self.value(self.tool_argv_for("gitlab", "merge"), "--sha")
+            self.assertEqual(len(sh("git", "rev-list", "--parents", "-1", synced,
+                                    cwd=fork).split()), 3)           # the sync's merge commit
+            self.assert_landed(fork, name, synced)
+            self.assertEqual(rev(fork, "refs/heads/main"), rev(fork, "upstream/main"))
+
+        def test_github_ship_lands_its_rebased_copy(self):
+            fork = self.self_fork()
+            name = self.feature(fork)
+            base = origin_sha(fork, "develop")
+            with on_platform(self.platform("github")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 0, err + out)
+            tip = origin_sha(fork, "develop")
+            self.assertNotIn(tip, (base, origin_sha(fork, name)))     # rewritten by the platform
+            self.assertIn("(rewritten)", out)
+            self.assertIn("git branch -D " + name, out)
+            self.assertIn("git push origin --delete " + name, out)    # gh leaves the remote branch
+            self.assert_landed(fork, name, tip)
+
+        def test_github_sync_lands_its_merge_commit(self):
+            """GitHub's merge commit sits on top of the sync's: the sync's commit is on the
+            trunk under its own SHA, off the new commit's second parent - which is rule 5
+            for a sync, so no WARNING (that is a ship's)."""
+            fork = self.self_fork()
+            self.upstream_change()
+            name = sync_branch_name()
+            with on_platform(self.platform("github")):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.assertEqual(code, 0, err + out)
+            synced = origin_sha(fork, name)
+            tip = origin_sha(fork, "develop")
+            self.assertNotEqual(tip, synced)                         # a new merge commit
+            self.assertIn("yes - as %s (ancestor)" % short(synced), out)
+            self.assertNotIn("WARNING", out)
+            self.assert_landed(fork, name, tip)
+            # gh deletes no branch: the sync branch is still on origin, and the way to remove
+            # it is printed - for a sync as for a ship
+            self.assertNotEqual(origin_sha(fork, name), "")
+            self.assertIn("git push origin --delete " + name, out)
+
+        def test_a_conflicted_sync_resumed_with_merge_lands(self):
+            """The conflicted run says how to resume it - with `--merge`, which it was given
+            - and the resumed run merges and lands like an unconflicted one."""
+            fork = self.self_fork()
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "ours: shared", push=True)
+            commit_upstream(self.tmp, "shared.tf", self.BASE_TF.replace("count = 1", "count = 3"),
+                            "theirs: shared")
+            name = sync_branch_name()
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.assertEqual(code, 4, err + out)
+            self.assertIn("forkflow sync --continue --merge", err)
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
+            sh("git", "add", "shared.tf", cwd=fork)
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--continue", "--merge")
+            self.assertEqual(code, 0, err + out)
+            synced = self.value(self.tool_argv_for("gitlab", "merge"), "--sha")
+            self.assertEqual(len(sh("git", "rev-list", "--parents", "-1", synced,
+                                    cwd=fork).split()), 3)
+            self.assert_landed(fork, name, synced)
+
+        def test_a_stopped_ship_resumed_with_merge_lands(self):
+            fork = self.self_fork()
+            name = self.feature(fork, commits=0)
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "ours: shared")
+            second_clone_commit(self.tmp, path="shared.tf",
+                                content=self.BASE_TF.replace("count = 1", "count = 9"))
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 4, err + out)
+            self.assertIn("forkflow ship --continue --merge", err)
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
+            sh("git", "add", "shared.tf", cwd=fork)
+            sh("git", "rebase", "--continue", cwd=fork)
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "ship", "--continue", "--merge")
+            self.assertEqual(code, 0, err + out)
+            self.assert_landed(fork, name,
+                               self.value(self.tool_argv_for("gitlab", "merge"), "--sha"))
+            with open(os.path.join(fork, "shared.tf")) as fh:
+                self.assertIn("count = 4", fh.read())                # the resolution landed
+
+        def test_a_refused_merge_leaves_a_record_a_by_hand_merge_lands_from(self):
+            """Exit 6 says "the branch is pushed; merge by hand, then `forkflow land`" - so
+            that has to work: the platform refuses, a human merges the open request in the
+            UI, and a later `land` finishes from the record the failed run left. The
+            landable state is proven by landing, not by the record's shape alone."""
+            fork = self.self_fork()
+            name = self.feature(fork, commits=2)
+            old = rev(fork, "refs/heads/develop")
+            os.environ["FORKFLOW_FAKE_FAIL"] = "1"
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 6, err + out)
+            del os.environ["FORKFLOW_FAKE_FAIL"]
+            shipped = origin_sha(fork, name)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"], entry["commit"], entry["mr"]),
+                             ("ship", name, shipped, MERGING_TOOL_URL["glab"]))
+            self.assertEqual(rev(fork, "refs/heads/develop"), old)          # nothing landed
+            self.assertEqual(origin_sha(fork, "develop"), entry["base"])
+            self.assertEqual(sh("git", "symbolic-ref", "--short", "HEAD", cwd=fork), name)
+            self.move_trunk(shipped)            # a human merges the request by fast-forward
+            code, out, err = run("-C", fork, "land")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("(ancestor)", out)
+            self.assert_landed(fork, name, shipped)
+
+        def test_a_merged_request_whose_catch_up_cannot_run_says_so_first(self):
+            """The local trunk carries a commit of its own: the platform merged the request,
+            `land` refuses to move the trunk, and the exit says both - merged, not landed."""
+            fork = self.self_fork()
+            name = self.feature(fork)
+            sh("git", "checkout", "-q", "develop", cwd=fork)
+            own = commit_fork(fork, "ours/local.txt", "local\n", "local: by hand")
+            sh("git", "checkout", "-q", name, cwd=fork)
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 2, err + out)
+            self.assertTrue(err.startswith("forkflow: the merge request was merged; "
+                                           "the local catch-up did not run: "), err)
+            self.assertIn("commits origin lacks", err)
+            shipped = self.value(self.tool_argv_for("gitlab", "merge"), "--sha")
+            self.assertEqual(origin_sha(fork, "develop"), shipped)   # merged ...
+            self.assertEqual(rev(fork, "refs/heads/develop"), own)   # ... not landed
+            self.assertEqual(sh("git", "symbolic-ref", "--short", "HEAD", cwd=fork), name)
+            self.assertEqual(rev(fork, "refs/heads/" + name), shipped)
+            entry = self.pending_of(fork)                            # `land` can run later
+            self.assertEqual((entry["kind"], entry["branch"], entry["commit"]),
+                             ("ship", name, shipped))
+            self.assertEqual(entry["mr"], MERGING_TOOL_URL["glab"])
+
+        def test_a_merge_from_a_linked_worktree_is_landed_from_the_main_one(self):
+            """`ship --merge` in a linked worktree while the main one has the trunk checked
+            out: merged, the catch-up names the main worktree, and `land` there finishes -
+            the record the linked worktree wrote is the one it reads."""
+            fork = self.self_fork()
+            linked = os.path.join(self.tmp, "linked")
+            sh("git", "worktree", "add", "-q", "-b", "feat/x", linked, "develop", cwd=fork)
+            commit_fork(linked, "ours/f0.txt", "line 0\n", "ours: step 0")
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", linked, "ship", "--merge")
+            self.assertEqual(code, 2, err + out)
+            self.assertTrue(err.startswith("forkflow: the merge request was merged; "), err)
+            self.assertIn("checked out in %s:" % fork, err)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"]), ("ship", "feat/x"))
+            self.assertEqual(origin_sha(fork, "develop"), entry["commit"])      # merged
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "land")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(fork, "refs/heads/develop"), entry["commit"])
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(self.pending_of(linked), {})
+
+        def queued(self):
+            """glab arming auto-merge instead of merging - a merge train or a queue look the
+            same: the tool answers 0 and nothing reaches the trunk."""
+            real = merge_command
+
+            def armed(*a):
+                return [c for c in real(*a) if c != "--auto-merge=false"]
+
+            return mock.patch.object(sys.modules[__name__], "merge_command", armed)
+
+        def assert_queued_then_landed_where_it_says(self, fork: str, linked: str, err: str,
+                                                    kind: str, name: str, base: str) -> None:
+            """Exit 6's state - nothing moved, the record intact, both worktrees where they
+            were - then the queue completes and the command it printed, run in the worktree
+            it named, lands the record."""
+            self.assertFalse(err.startswith("forkflow: the merge request was merged"), err)
+            self.assertEqual(origin_sha(fork, "develop"), base)
+            self.assertEqual(rev(fork, "refs/heads/develop"), base)
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(checked_out(linked), name)
+            entry = self.pending_of(fork)
+            self.assertEqual((entry["kind"], entry["branch"]), (kind, name))
+            self.assertEqual(printed_cmd(err, "forkflow land"), "forkflow land " + name)
+            self.assertIn(" in %s," % fork, err)
+            self.move_trunk(entry["commit"])
+            with on_platform("gitlab"):
+                code, out, err2 = run_printed(err, "forkflow land", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.assertEqual(rev(fork, "refs/heads/develop"), entry["commit"])
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(self.pending_of(fork), {})
+
+        def test_a_queued_ship_merge_from_a_linked_worktree_is_exit_6(self):
+            """The usual layout - the trunk in the main worktree, the work in a linked one -
+            and a merge the tool only queued. The landing was judged after "the trunk is
+            checked out elsewhere", so it read "the merge request was merged" (exit 2), and
+            `land` in the main worktree then said "merge it" of a request already queued.
+            The verdict comes first now: exit 6, with the command for once it is through."""
+            fork = self.self_fork()
+            linked = os.path.join(self.tmp, "linked")
+            sh("git", "worktree", "add", "-q", "-b", "feat/x", linked, "develop", cwd=fork)
+            commit_fork(linked, "ours/f0.txt", "line 0\n", "ours: step 0")
+            base = origin_sha(fork, "develop")
+            with on_platform(self.platform("gitlab")), self.queued():
+                code, out, err = run("-C", linked, "ship", "--merge")
+            self.assertEqual(code, 6, err + out)
+            self.assert_queued_then_landed_where_it_says(fork, linked, err, "ship", "feat/x",
+                                                         base)
+
+        def test_a_queued_sync_merge_from_a_linked_worktree_is_exit_6(self):
+            fork = self.self_fork()
+            linked = os.path.join(self.tmp, "linked")
+            sh("git", "worktree", "add", "-q", "-b", "scratch", linked, "develop", cwd=fork)
+            self.upstream_change()
+            base = origin_sha(fork, "develop")
+            with on_platform(self.platform("gitlab")), self.queued():
+                code, out, err = run("-C", linked, "sync", "--merge")
+            self.assertEqual(code, 6, err + out)
+            self.assert_queued_then_landed_where_it_says(fork, linked, err, "sync",
+                                                         sync_branch_name(), base)
+
     # ------------------------------------------------------------------- #
     # argument parsing and main
     # ------------------------------------------------------------------- #
+
+    class TestPendingPerBranch(MergeBase):
+        """Worktrees of one clone shipping different branches before either lands.
+
+        `pending` is shared by every worktree, one entry per branch: a ship in one worktree
+        must neither replace nor land another worktree's, `land` on a branch lands that
+        branch's record, `land` off every recorded branch lands whichever have landed and
+        keeps the rest, and `--merge` lands the record its own run wrote. Both trunk layouts:
+        checked out in the main worktree, and checked out nowhere."""
+
+        def entries(self, fork: str) -> dict:
+            return pending_entries(ctx_for(fork, need_trunk=False, strict_mirror=False))
+
+        def worktree(self, fork: str, name: str, path: str = "", content: str = "") -> str:
+            """A linked worktree on a new branch `name` off develop, with one commit of a
+            file of its own (or `content` for shared.tf)."""
+            wt = os.path.join(self.tmp, path or name.replace("/", "-"))
+            sh("git", "worktree", "add", "-q", "-b", name, wt, "develop", cwd=fork)
+            if content:
+                commit_fork(wt, "shared.tf", content, "ours: " + name)
+            else:
+                commit_fork(wt, "ours/%s.txt" % name.replace("/", "-"), name + "\n",
+                            "ours: " + name)
+            return wt
+
+        def ship_in(self, wt: str, *flags: str) -> None:
+            next_utc_second()                     # each ship names a `backup/<time>-pre-ship`
+            code, out, err = run("-C", wt, "ship", *flags)
+            self.assertEqual(code, 0, err + out)
+
+        def two_shipped(self, fork: str) -> Tuple[str, str, dict, dict]:
+            w1, w2 = self.worktree(fork, "feat/a"), self.worktree(fork, "feat/b")
+            self.ship_in(w1)
+            self.ship_in(w2)
+            entries = self.entries(fork)
+            self.assertEqual(sorted(entries), ["feat/a", "feat/b"])     # neither replaced
+            for name, entry in entries.items():
+                self.assertEqual(entry["commit"], origin_sha(fork, name))
+            self.assertEqual(self.entries(w1), entries)                  # one map for all
+            return w1, w2, entries["feat/a"], entries["feat/b"]
+
+        def test_trunk_in_the_main_worktree(self):
+            fork = make_fork(self.tmp)
+            w1, w2, a, b = self.two_shipped(fork)
+            base = rev(fork, "refs/heads/develop")
+
+            # `status` anywhere lists both
+            code, out, err = run("-C", w1, "status", "--offline")
+            self.assertEqual(code, 0, err + out)
+            lines = [ln for ln in out.splitlines() if ln.startswith("  pending  ")]
+            self.assertEqual([ln.split()[2] for ln in lines], ["feat/a", "feat/b"])
+
+            # in W1 the trunk is elsewhere: refused before anything, naming W1's record
+            code, out, err = run("-C", w1, "land")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("run `forkflow land feat/a` there", err)
+            self.assertEqual(self.entries(fork), {"feat/a": a, "feat/b": b})
+
+            # in the main worktree, off every recorded branch: nothing has landed yet
+            code, out, err = run("-C", fork, "land")
+            self.assertEqual(code, 2, err + out)
+            self.assertEqual(rev(fork, "refs/heads/develop"), base)
+            self.assertEqual(self.entries(fork), {"feat/a": a, "feat/b": b})
+
+            # a merges: `land` there lands a - and only a
+            self.move_trunk(a["commit"])
+            code, out, err = run("-C", fork, "land")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(fork, "refs/heads/develop"), a["commit"])
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(self.entries(fork), {"feat/b": b})
+            self.assertEqual(rev(fork, "refs/heads/feat/a"), a["commit"])   # W1 has it out
+            self.assertEqual(rev(fork, "refs/heads/feat/b"), b["commit"])
+            self.assertEqual(checked_out(w1), "feat/a")
+            self.assertEqual(checked_out(w2), "feat/b")
+
+            # b merges later, rebased onto a by the platform: the route W1's refusal named,
+            # with the branch, lands it by patch
+            tip = self.human(("cherry-pick", b["commit"]))
+            code, out, err = run("-C", fork, "land", "feat/b")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(fork, "refs/heads/develop"), tip)
+            self.assertEqual(self.entries(fork), {})
+
+        def test_trunk_checked_out_nowhere(self):
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "-q", "-b", "scratch", "develop", cwd=fork)
+            w1, w2, a, b = self.two_shipped(fork)
+            base = rev(fork, "refs/heads/develop")
+
+            # b merges; `land` in W1 answers for W1's own branch, and a has not landed
+            self.move_trunk(b["commit"])
+            code, out, err = run("-C", w1, "land")
+            self.assertEqual(code, 2, err + out)
+            self.assertEqual(checked_out(w1), "feat/a")                  # HEAD did not move
+            self.assertEqual(rev(fork, "refs/heads/develop"), base)
+            self.assertEqual(rev(fork, "refs/heads/feat/b"), b["commit"])
+            self.assertEqual(self.entries(fork), {"feat/a": a, "feat/b": b})
+
+            # `land` in W2 lands b there
+            code, out, err = run("-C", w2, "land")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(checked_out(w2), "develop")
+            self.assertEqual(rev(fork, "refs/heads/develop"), b["commit"])
+            self.assertEqual(rev(fork, "refs/heads/feat/b"), "")         # landed, deleted
+            self.assertEqual(self.entries(fork), {"feat/a": a})
+            self.assertEqual(checked_out(w1), "feat/a")
+
+            # then a, rebased onto b: the trunk is now out in W2, where `land feat/a` lands it
+            tip = self.human(("cherry-pick", a["commit"]))
+            code, out, err = run("-C", w1, "land")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("run `forkflow land feat/a` there", err)
+            code, out, err = run("-C", w2, "land", "feat/a")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(fork, "refs/heads/develop"), tip)
+            self.assertEqual(self.entries(fork), {})
+            self.assertEqual(rev(fork, "refs/heads/feat/a"), a["commit"])   # W1 has it out
+
+        def test_ship_continue_keeps_the_other_worktrees_record(self):
+            fork = make_fork(self.tmp)
+            w1 = self.worktree(fork, "feat/a",
+                               content=self.BASE_TF.replace("count = 1", "count = 2"))
+            second_clone_commit(self.tmp, path="shared.tf",
+                                content=self.BASE_TF.replace("count = 1", "count = 9"))
+            code, out, err = run("-C", w1, "ship")
+            self.assertEqual(code, 4, err + out)                         # stopped mid-rebase
+            w2 = self.worktree(fork, "feat/b")
+            self.ship_in(w2)
+            b = self.entries(fork)["feat/b"]
+            write(w1, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
+            sh("git", "add", "shared.tf", cwd=w1)
+            sh("git", "rebase", "--continue", cwd=w1)
+            next_utc_second()
+            code, out, err = run("-C", w1, "ship", "--continue")
+            self.assertEqual(code, 0, err + out)
+            entries = self.entries(fork)
+            self.assertEqual(sorted(entries), ["feat/a", "feat/b"])
+            self.assertEqual(entries["feat/b"], b)
+            self.assertEqual(entries["feat/a"]["commit"], origin_sha(fork, "feat/a"))
+
+        def test_merge_lands_its_own_record_while_another_worktree_ships(self):
+            """W1 runs `ship --merge`; while the platform merges, W2 ships feat/b. W1 lands
+            the record its own run wrote - not the one W2 wrote a moment ago - and leaves
+            W2's in place."""
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "-q", "-b", "scratch", "develop", cwd=fork)   # trunk free
+            w1, w2 = self.worktree(fork, "feat/a"), self.worktree(fork, "feat/b")
+            write(w1, CONFIG_FILE, 'merge = "self"\n')                   # untracked, as setup
+            merging_tool(self.tmp, "glab")
+            done, log = os.path.join(self.tmp, "w2-shipped"), os.path.join(self.tmp, "w2.log")
+            fake_tool(os.path.join(self.tmp, "wrap"), "glab", (
+                'if [ "$2" = merge ] && [ ! -e {done} ]; then\n'
+                '  : > {done}; sleep 1.1\n'
+                '  {py} {script} -C {w2} ship > {log} 2>&1\n'
+                'fi\n'
+                'exec {real} "$@"\n').format(
+                    done=shlex.quote(done), py=shlex.quote(sys.executable),
+                    script=shlex.quote(os.path.abspath(__file__)), w2=shlex.quote(w2),
+                    log=shlex.quote(log),
+                    real=shlex.quote(os.path.join(self.tmp, "bin", "glab"))))
+            next_utc_second()
+            with on_platform("gitlab"):
+                code, out, err = run("-C", w1, "ship", "--merge")
+            self.assertTrue(os.path.exists(done))                        # W2 did ship mid-way
+            self.assertEqual(code, 0, err + out)
+            shipped = self.value(self.tool_argv_for("gitlab", "merge"), "--sha")
+            self.assertEqual(rev(fork, "refs/heads/develop"), shipped)
+            self.assertEqual(checked_out(w1), "develop")
+            self.assertEqual(rev(fork, "refs/heads/feat/a"), "")
+            entries = self.entries(fork)
+            self.assertEqual(sorted(entries), ["feat/b"])                # W2's, kept
+            self.assertEqual(entries["feat/b"]["commit"], origin_sha(fork, "feat/b"))
+            self.assertEqual(entries["feat/b"]["commit"], rev(fork, "refs/heads/feat/b"))
+
+        def test_a_dry_run_with_several_pending_says_it_could_not_tell(self):
+            """A dry run does not fetch, so with several records the "no" beside each was
+            read off the refs on disk - and the sentence under them sent the user to merge
+            two merge requests that the very next non-dry `land` lands without complaint.
+            The caveat was written for the one-record path only; both paths say it now."""
+            fork = make_fork(self.tmp)
+            w1, w2, a, b = self.two_shipped(fork)
+            base = rev(fork, "refs/heads/develop")
+            self.human(("merge", "--no-ff", "-m", "m", a["commit"]),
+                       ("merge", "--no-ff", "-m", "m2", b["commit"]))       # both merged on origin
+            code, out, err = run("-C", fork, "land", "--dry-run")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("did not fetch", err)
+            self.assertIn("without `--dry-run`", err)
+            self.assertNotIn("merge, then run", err)             # what it used to say
+            self.assertIn("`feat/a`", err)                       # each record is still named
+            self.assertIn("`feat/b`", err)
+            self.assertEqual(self.entries(fork), {"feat/a": a, "feat/b": b})
+            self.assertEqual(rev(fork, "refs/heads/develop"), base)
+            code, out, err = run("-C", fork, "land")              # and it lands them
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(self.entries(fork), {})
+
+        def test_several_pending_and_none_merged_still_says_merge_them(self):
+            """The refusal the dry run must not borrow: a real `land` has fetched, so
+            "nothing pending is on the trunk yet - merge, then run it again" is true there."""
+            fork = make_fork(self.tmp)
+            w1, w2, a, b = self.two_shipped(fork)
+            code, out, err = run("-C", fork, "land")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("nothing pending is on origin/develop yet", err)
+            self.assertNotIn("did not fetch", err)
+
+        def test_force_needs_the_record_named_when_several_are_pending(self):
+            """`--force` judges nothing, so it must not pick among several on its own: off
+            every recorded branch it is refused outright - not quietly turned into a plain
+            `land` of whichever has landed - and named it acts on that record only."""
+            fork = make_fork(self.tmp)
+            w1, w2, a, b = self.two_shipped(fork)
+            base = rev(fork, "refs/heads/develop")
+            self.move_trunk(a["commit"])                               # a merged, b not
+            code, out, err = run("-C", fork, "land", "--force")
+            self.assertEqual(code, 2, err + out)
+            self.assertEqual(self.entries(fork), {"feat/a": a, "feat/b": b})
+            self.assertEqual(rev(fork, "refs/heads/develop"), base)
+            code, out, err = run("-C", fork, "land", "feat/nope")
+            self.assertEqual(code, 2, err + out)
+            self.assertEqual(self.entries(fork), {"feat/a": a, "feat/b": b})
+            self.assertEqual(rev(fork, "refs/heads/develop"), base)
+            code, out, err = run("-C", fork, "land", "--force", "feat/b")   # b: closed, say
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(self.entries(fork), {"feat/a": a})
+            self.assertEqual(rev(fork, "refs/heads/develop"), a["commit"])  # whatever origin has
+            self.assertEqual(rev(fork, "refs/heads/feat/b"), b["commit"])   # kept: unverified
+
+        def test_merge_lands_its_own_entry_even_when_the_record_cannot_be_written(self):
+            """`save_state` swallows a write that fails - a restore point that cannot be
+            recorded is still one - so `--merge` must not depend on reading its record back:
+            it lands the entry it holds. Every write of the state file fails here while the
+            file stays READABLE, because those are two different facts now: one that cannot
+            be read is a memory that has been made to forget, and the test below is that."""
+            fork = make_fork(self.tmp, config='merge = "self"\n')
+            name = self.feature(fork)
+
+            def dies(data, fh, **kw):
+                raise OSError("disk full")
+
+            with on_platform(self.platform("gitlab")), mock.patch.object(json, "dump", dies):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 0, err + out)
+            shipped = self.value(self.tool_argv_for("gitlab", "merge"), "--sha")
+            self.assertEqual(rev(fork, "refs/heads/develop"), shipped)
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(rev(fork, "refs/heads/" + name), "")
+            self.assertEqual(self.entries(fork), {})            # nothing was recorded
+            self.assertFalse(os.path.exists(git_path(fork, STATE_FILE)))
+
+        def test_a_state_file_that_cannot_be_read_refuses_merge_before_any_push(self):
+            """The other half. A state file that cannot be READ is where this clone's memory
+            of the original project's configs went, and without it a version the project has
+            withdrawn reads as one it never had - so `--merge` is refused, at the gate,
+            before anything is pushed, naming the file. A plain `ship` is not refused: it
+            does not depend on that memory."""
+            fork = make_fork(self.tmp, config='merge = "self"\n')
+            name = self.feature(fork)
+            blocker = os.path.join(fork, ".git", STATE_FILE)        # the main worktree's
+            write(fork, os.path.join(".git", STATE_FILE, "keep"), "")
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, EXIT_PRECONDITION, err + out)
+            self.assertIn(blocker, err)
+            self.assertIn("merged by hand", err)
+            self.assertEqual(origin_sha(fork, name), "")            # nothing pushed
+            self.assertEqual(self.tool_argv_for("gitlab", "merge"), [])
+            self.assertTrue(os.path.isdir(blocker))                 # and left alone
+            self.assertEqual(run("-C", fork, "status")[0], 0)       # the rest goes on
+            self.ship_in(fork)                                      # and so does a plain ship
+            self.assertNotEqual(origin_sha(fork, name), "")
+
+        def b_landed_while_on_a(self) -> Tuple[str, dict, dict]:
+            """One worktree: feat/b shipped, then feat/a shipped and still checked out, and
+            only feat/b's merge request merged."""
+            fork = make_fork(self.tmp)
+            for name in ("feat/b", "feat/a"):          # a patch of its own each, or git cherry
+                self.feature(fork, name, commits=0)    # calls one the other's landing
+                commit_fork(fork, "ours/%s.txt" % name[-1], name + "\n", "ours: " + name)
+                self.ship_in(fork)
+            a, b = self.entries(fork)["feat/a"], self.entries(fork)["feat/b"]
+            self.move_trunk(b["commit"])
+            return fork, a, b
+
+        def assert_b_landed_a_kept(self, fork: str, a: dict, b: dict) -> None:
+            self.assertEqual(rev(fork, "refs/heads/develop"), b["commit"])
+            self.assertEqual(rev(fork, "refs/heads/feat/b"), "")
+            self.assertEqual(rev(fork, "refs/heads/feat/a"), a["commit"])
+            self.assertEqual(self.entries(fork), {"feat/a": a})
+
+        def test_the_landed_command_status_prints_works_from_a_branch_with_its_own_record(self):
+            """`status` said "landed: run forkflow land" of feat/b; run from feat/a, that
+            plain `land` answered for feat/a only - "not merged yet" - and nothing landed.
+            The verdict names the branch, and run as printed it lands feat/b."""
+            fork, a, b = self.b_landed_while_on_a()
+            code, out, err = run("-C", fork, "status", "--fetch")
+            self.assertEqual(code, 0, err + out)
+            line = next(ln for ln in out.splitlines()
+                        if ln.strip().startswith("pending") and " feat/b " in ln)
+            cmd = line.split("landed: run ", 1)[1].strip()
+            self.assertEqual(checked_out(fork), "feat/a")
+            code, out, err = run("-C", fork, *shlex.split(cmd)[1:])
+            self.assertEqual(code, 0, err + out)
+            self.assert_b_landed_a_kept(fork, a, b)
+
+        def test_land_on_an_unlanded_branch_names_the_records_that_landed(self):
+            """Plain `land` on feat/a picks feat/a's record; not merged, it is exit 2 with
+            nothing moved - and it names feat/b, which has landed, as the command that lands
+            it. That command, run as printed, does."""
+            fork, a, b = self.b_landed_while_on_a()
+            develop = rev(fork, "refs/heads/develop")
+            code, out, err = run("-C", fork, "land")
+            self.assertEqual(code, 2, err + out)
+            self.assertEqual(rev(fork, "refs/heads/develop"), develop)
+            self.assertEqual(checked_out(fork), "feat/a")
+            self.assertEqual(self.entries(fork), {"feat/a": a, "feat/b": b})
+            self.assertNotIn("forkflow land feat/a", err)     # only the ones that landed
+            code, out, err2 = run_printed(err, "forkflow land feat/", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.assert_b_landed_a_kept(fork, a, b)
+
+    class TestShipAfterTheBranchLeftOrigin(MergeBase):
+        """A fetch does not prune, so `origin/<branch>` outlives the branch on origin when
+        the platform removes it after a merge (GitLab's `--remove-source-branch`). Offered as
+        the lease, it made every later ship of that name exit 5 "(stale info)", each attempt
+        leaving one more backup behind."""
+
+        def gone_from_origin(self, name: str) -> None:
+            sh("git", "--git-dir=" + os.path.join(self.tmp, "origin.git"),
+               "update-ref", "-d", "refs/heads/" + name)
+
+        def test_a_ship_after_a_merge_and_before_land_creates_the_branch_again(self):
+            fork, name, entry = self.shipped()
+            self.move_trunk(entry["commit"])                           # merged in the UI ...
+            self.gone_from_origin(name)                                # ... source removed
+            commit_fork(fork, "ours/more.txt", "more\n", "ours: more")
+            tracking = "refs/remotes/origin/" + name
+            self.assertEqual(rev(fork, tracking), entry["commit"])    # stale, still here
+            next_utc_second()
+            code, out, err = run("-C", fork, "ship", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(fork, tracking), entry["commit"])    # a dry run drops nothing
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+            self.assertEqual(rev(fork, tracking), rev(fork, "refs/heads/" + name))
+            self.assertEqual(sh("git", "rev-list", "--count", entry["commit"] + ".." + name,
+                                cwd=fork), "1")                       # the new work, squashed
+            backup = self.backup_branch(fork)                        # rule 4 still honoured
+            self.assertEqual(origin_sha(fork, backup), rev(fork, "refs/heads/" + backup))
+            self.assertEqual(self.pending_of(fork, name)["commit"], origin_sha(fork, name))
+
+        def test_land_force_drops_the_stale_ref_and_the_kept_branch_ships_again(self):
+            """The request was merged in a way `land` cannot see, and the platform removed the
+            branch: `land --force` keeps the local branch - and must not keep the stale
+            `origin/<branch>` that would block its next ship."""
+            fork, name, entry = self.shipped()
+            self.gone_from_origin(name)
+            code, out, err = run("-C", fork, "land", "--force")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(rev(fork, "refs/heads/" + name), entry["commit"])   # kept
+            self.assertEqual(rev(fork, "refs/remotes/origin/" + name), "")      # not stale
+            self.assertEqual(self.pending_of(fork), {})
+            sh("git", "checkout", "-q", name, cwd=fork)
+            commit_fork(fork, "ours/more.txt", "more\n", "ours: more")
+            next_utc_second()
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+
+        def test_a_branch_origin_still_has_keeps_its_lease(self):
+            """Only origin's own "no such branch" drops the lease: a branch still there is
+            replaced behind `--force-with-lease` as before."""
+            fork, name, entry = self.shipped()
+            commit_fork(fork, "ours/more.txt", "more\n", "ours: more")
+            next_utc_second()
+            code, out, err = run("-C", fork, "ship")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("--force-with-lease=%s:%s" % (name, entry["commit"]), out)
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+
+        def test_the_stopped_rebase_hint_carries_merge(self):
+            """`ship --merge` stops on a conflict; the second commit stops the rebase again,
+            and `ship --continue --merge` run too early names the resume. Followed to the
+            letter once the rebase is done, it merges and lands."""
+            fork = self.self_fork()
+            name = self.feature(fork, commits=0)
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "ours: two")
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 3"),
+                        "ours: three")
+            second_clone_commit(self.tmp, path="shared.tf",
+                                content=self.BASE_TF.replace("count = 1", "count = 9"))
+            with on_platform(self.platform("gitlab")):
+                self.assertEqual(run("-C", fork, "ship", "--merge")[0], 4)
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
+            sh("git", "add", "shared.tf", cwd=fork)
+            sh("git", "rebase", "--continue", cwd=fork, check=False)   # stops on the second
+            self.assertTrue(rebase_in_progress(ctx_for(fork, strict_mirror=False)))
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "ship", "--continue", "--merge")
+            self.assertEqual(code, 2, err + out)
+            hinted = re.search(r"and then `(forkflow ship[^`]*)`", err)
+            self.assertTrue(hinted, err)
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 5"))
+            sh("git", "add", "shared.tf", cwd=fork)
+            sh("git", "rebase", "--continue", cwd=fork)
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, *hinted.group(1).split()[1:])
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(self.tool_argv_for("gitlab", "merge")[:3], ["mr", "merge", name])
+            self.assertEqual(origin_sha(fork, "develop"), rev(fork, "refs/heads/develop"))
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(self.pending_of(fork), {})
+
+    class TestPrintedRerunsCarryMerge(MergeBase):
+        """Every `forkflow sync` / `forkflow ship` a `--merge` run prints carries `--merge`.
+
+        Followed to the letter, one without it pushes and opens the request, merges nothing,
+        and exits 0 with a line that reads like success - found three rounds running at one
+        site after another, so every such command is built by `rerun_cmd` / `continue_cmd`
+        (`TestSourceInvariants` holds that). Each site here is reached for real, and its
+        command run exactly as printed has to end merged and landed."""
+
+        def run_it(self, text: str, start: str, fork: str) -> Tuple[int, str, str]:
+            with on_platform("gitlab"):
+                return run_printed(text, start, fork)
+
+        def merged_and_landed(self, fork: str, branch: str) -> None:
+            self.assertEqual(self.tool_argv_for("gitlab", "merge")[:3], ["mr", "merge", branch])
+            self.assertEqual(origin_sha(fork, "develop"), rev(fork, "refs/heads/develop"))
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(self.pending_of(fork, branch), {})
+
+        def conflicted_sync(self) -> str:
+            """A `merge = "self"` fork whose `sync --merge` stopped on a conflict."""
+            fork = self.self_fork()
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "ours: shared", push=True)
+            commit_upstream(self.tmp, "shared.tf", self.BASE_TF.replace("count = 1", "count = 3"),
+                            "theirs: shared")
+            with on_platform(self.platform("gitlab")):
+                self.assertEqual(run("-C", fork, "sync", "--merge")[0], 4)
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
+            sh("git", "add", "shared.tf", cwd=fork)
+            return fork
+
+        def test_a_sync_committed_by_hand_is_resumed_with_merge(self):
+            """The conflict resolved and the merge committed by hand, the user reruns
+            `sync --merge`: the branch exists, and the resume it names must merge."""
+            fork = self.conflicted_sync()
+            sh("git", "commit", "-q", "--no-edit", cwd=fork)
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.assertEqual(code, 2, err + out)
+            code, out, err2 = self.run_it(err, "forkflow sync --continue", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.merged_and_landed(fork, sync_branch_name())
+
+        def test_ship_on_a_sync_branch_names_the_sync_resume_with_merge(self):
+            fork = self.conflicted_sync()
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 2, err + out)
+            code, out, err2 = self.run_it(err, "forkflow sync --continue", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.merged_and_landed(fork, sync_branch_name())
+
+        def test_a_published_sync_branch_is_redone_with_force_and_merge(self):
+            """Today's sync branch is on origin and gone here: `--force` publishes `<name>-2`,
+            and with `--merge` merges and lands it."""
+            fork = self.self_fork()
+            self.upstream_change()
+            name = sync_branch_name()
+            with on_platform(self.platform("gitlab")):
+                self.assertEqual(run("-C", fork, "sync", "--mr")[0], 0)
+            sh("git", "checkout", "-q", "develop", cwd=fork)
+            sh("git", "branch", "-D", name, cwd=fork)
+            next_utc_second()
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.assertEqual(code, 2, err + out)
+            code, out, err2 = self.run_it(err, "forkflow sync --force", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.merged_and_landed(fork, name + "-2")
+
+        def test_a_sync_the_trunk_moved_under_is_redone_with_force_and_merge(self):
+            """`check` fails on the tip because origin's trunk moved after the merge was made:
+            the redo it names (`--force`) must merge. The gate asks for an untracked marker so
+            the first stop is the gate's and the second the tip's."""
+            fork = make_fork(self.tmp, config='merge = "self"\ngate = ["test -e .gate-ok"]\n')
+            self.upstream_change()
+            with on_platform(self.platform("gitlab")):
+                self.assertEqual(run("-C", fork, "sync", "--merge")[0], 3)
+            second_clone_commit(self.tmp)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            write(fork, ".gate-ok", "")
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--continue", "--merge")
+            self.assertEqual(code, 3, err + out)
+            next_utc_second()
+            code, out, err2 = self.run_it(out, "forkflow sync --force", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.merged_and_landed(fork, sync_branch_name())
+
+        def test_a_sync_branch_without_its_merge_is_redone_with_merge(self):
+            """A branch under today's sync name carrying no merge: "nothing to continue".
+            Plain `sync` would refuse the existing branch and send the user back to
+            `--continue` - the rerun named is `--force`, and it merges."""
+            fork = self.self_fork()
+            self.upstream_change()
+            sh("git", "checkout", "-q", "-b", sync_branch_name(), "develop", cwd=fork)
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "sync", "--continue", "--merge")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("nothing to continue", err)
+            code, out, err2 = self.run_it(err, "forkflow sync", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.merged_and_landed(fork, sync_branch_name())
+
+        def test_no_ship_to_continue_names_ship_with_merge(self):
+            fork = self.self_fork()
+            name = self.feature(fork)
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--continue", "--merge")
+            self.assertEqual(code, 2, err + out)
+            code, out, err2 = self.run_it(err, "forkflow ship", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.merged_and_landed(fork, name)
+
+        def test_an_aborted_rebase_names_ship_with_merge(self):
+            """`git rebase --abort` after `ship --merge` stopped, then `ship --continue
+            --merge`: "run `forkflow ship` again" lost the flag. Run as printed it stops on
+            the same conflict, whose resume then merges and lands."""
+            fork = self.self_fork()
+            name = self.feature(fork, commits=0)
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "ours: two")
+            second_clone_commit(self.tmp, path="shared.tf",
+                                content=self.BASE_TF.replace("count = 1", "count = 9"))
+            with on_platform(self.platform("gitlab")):
+                self.assertEqual(run("-C", fork, "ship", "--merge")[0], 4)
+            sh("git", "rebase", "--abort", cwd=fork)
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "ship", "--continue", "--merge")
+            self.assertEqual(code, 2, err + out)
+            next_utc_second()
+            code, out, err = self.run_it(err, "forkflow ship", fork)
+            self.assertEqual(code, 4, err + out)
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
+            sh("git", "add", "shared.tf", cwd=fork)
+            sh("git", "rebase", "--continue", cwd=fork)
+            code, out, err2 = self.run_it(err, "forkflow ship --continue", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.merged_and_landed(fork, name)
+
+    @needs_tomllib
+    class TestForkMergeMode(ShipBase):
+        """`fork_merge_mode` reads `merge` only where the original project cannot write it:
+        the config committed on `origin/<trunk>` by this fork, or - while none is committed
+        there - the fork's own untracked `.forkflow.toml`. Everything else is "manual"."""
+
+        def mode(self, fork: str) -> str:
+            return fork_merge_mode(ctx_for(fork))
+
+        def advance_mirror(self, fork: str) -> None:
+            """What a sync does to the mirror and nothing else: rule 6 keeps it a pristine
+            copy of `upstream/main`, on origin and here."""
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            sh("git", "branch", "-f", "main", "upstream/main", cwd=fork)
+            sh("git", "push", "-q", "origin", "main:refs/heads/main", cwd=fork)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+
+        def tips_lack(self, fork: str, text: str) -> None:
+            for ref in ("upstream/main", "origin/main", "main"):
+                held = sh("git", "show", ref + ":" + CONFIG_FILE, cwd=fork, check=False)
+                self.assertNotEqual(config_fingerprint(held), config_fingerprint(text))
+
+        def test_no_config_anywhere_is_manual(self):
+            self.assertEqual(self.mode(make_fork(self.tmp)), "manual")
+
+        def test_the_config_committed_on_the_remote_trunk_is_read(self):
+            """And only that one: the checked-out branch committing, or the working tree
+            holding, another value changes nothing."""
+            fork = make_fork(self.tmp, config='merge = "self"\n')
+            self.assertEqual(self.mode(fork), "self")
+            sh("git", "checkout", "-q", "-b", "feat/x", cwd=fork)
+            commit_fork(fork, CONFIG_FILE, 'merge = "manual"\n', "ours: manual on a branch")
+            self.assertEqual(self.mode(fork), "self")
+            sh("git", "checkout", "-q", "develop", cwd=fork)
+            write(fork, CONFIG_FILE, 'merge = "manual"\n')         # an uncommitted edit
+            self.assertEqual(self.mode(fork), "self")
+
+        def test_the_checked_out_branch_is_not_read(self):
+            """Nothing committed on the trunk: a branch whose tree says "self" - a sync branch
+            carrying upstream's file, or a feature branch - is not this fork's config."""
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "-q", "-b", "sync/upstream-x", cwd=fork)
+            commit_fork(fork, CONFIG_FILE, 'merge = "self"\n', "a tree that says self")
+            self.assertEqual(self.mode(fork), "manual")
+
+        def test_an_untracked_file_is_read_while_nothing_is_committed(self):
+            """Untracked only: staged, the file is on its way into a commit - as a stopped
+            `git cherry-pick` of upstream's commit leaves it, with no MERGE_HEAD to tell."""
+            fork = make_fork(self.tmp)
+            write(fork, CONFIG_FILE, 'merge = "self"\n')
+            self.assertEqual(self.mode(fork), "self")
+            sh("git", "add", CONFIG_FILE, cwd=fork)
+            self.assertEqual(self.mode(fork), "manual")
+
+        def test_the_committed_config_wins_over_an_untracked_file(self):
+            """A branch from before the config was committed, with an untracked file of its
+            own: `origin/<trunk>`'s committed "manual" is what counts."""
+            fork = make_fork(self.tmp, config='merge = "manual"\n')
+            sh("git", "checkout", "-q", "-b", "old", "main", cwd=fork)
+            write(fork, CONFIG_FILE, 'merge = "self"\n')
+            self.assertIn("?? " + CONFIG_FILE, sh("git", "status", "--porcelain", cwd=fork))
+            self.assertEqual(self.mode(fork), "manual")
+
+        def test_a_file_head_or_a_merge_in_progress_holds_is_not_untracked(self):
+            """Taken out of the index by hand, a file HEAD - or the MERGE_HEAD of a merge in
+            progress - holds is still one a commit put there, and may be upstream's."""
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "-q", "-b", "side", cwd=fork)
+            commit_fork(fork, CONFIG_FILE, 'merge = "self"\n', "side: says self")
+            sh("git", "rm", "-q", "--cached", CONFIG_FILE, cwd=fork)
+            self.assertEqual(self.mode(fork), "manual")                   # HEAD holds it
+            sh("git", "reset", "-q", "--hard", "HEAD", cwd=fork)
+            sh("git", "checkout", "-q", "develop", cwd=fork)
+            commit_fork(fork, "src/app.py", "ours\n", "ours: app")
+            sh("git", "checkout", "-q", "side", cwd=fork)
+            commit_fork(fork, "src/app.py", "side\n", "side: app")
+            sh("git", "checkout", "-q", "develop", cwd=fork)
+            sh("git", "merge", "side", cwd=fork, check=False)           # stops on src/app.py
+            self.assertTrue(merge_in_progress(fork))
+            sh("git", "rm", "-q", "--cached", CONFIG_FILE, cwd=fork)
+            self.assertEqual(self.mode(fork), "manual")                   # MERGE_HEAD holds it
+
+        def test_a_config_upstream_wrote_on_the_trunk_is_not_the_forks(self):
+            """A trunk bootstrapped from an upstream that tracks the file: upstream's
+            `merge = "self"` is on `origin/<trunk>` with nobody here having written it - and
+            stays upstream's through a ship that does not touch it. A commit of this fork's
+            that writes the file makes it the fork's."""
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, CONFIG_FILE, 'merge = "self"\n', "theirs: forkflow")
+            push_upstream_into_origin(self.tmp, "develop")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertEqual(sh("git", "show", "origin/develop:" + CONFIG_FILE, cwd=fork),
+                             'merge = "self"')
+            self.assertEqual(self.mode(fork), "manual")
+            second_clone_commit(self.tmp)                                # a ship, not the file
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertEqual(self.mode(fork), "manual")
+            second_clone_commit(self.tmp, path=CONFIG_FILE,
+                                content='merge = "self"\ngate = []\n')   # the fork writes it
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertEqual(self.mode(fork), "self")
+
+        def test_upstreams_own_file_untracked_on_disk_is_not_this_forks(self):
+            """A fork that never chose `merge`: an ordinary sync brings upstream's
+            `.forkflow.toml` in and the user untracks it by hand (`git rm --cached`,
+            committed on a sync branch that is then abandoned). That leaves upstream's
+            bytes on disk in exactly the state `setup` leaves this fork's own template -
+            absent from the index, from HEAD and from MERGE_HEAD - and upstream's
+            `merge = "self"` opened the gate. Where git holds the file cannot tell the two
+            apart; the bytes can, and one character of this fork's own settles it."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch theirs"]\n'
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            write(fork, CONFIG_FILE, theirs)
+            self.assertIn("?? " + CONFIG_FILE, sh("git", "status", "--porcelain", cwd=fork))
+            self.assertEqual(self.mode(fork), "manual")
+            write(fork, CONFIG_FILE, theirs + "# ours\n")
+            self.assertEqual(self.mode(fork), "self")
+
+        def test_upstreams_bytes_are_upstreams_however_they_reached_the_trunk(self):
+            """`git log -1 <rev> -- <path>` named this fork's commit whenever the file was
+            re-added under another path - which is exactly what the case-variant `git mv`
+            remedy this tool prints does to upstream's file - so upstream's `merge` became
+            the fork's by a rename nobody read as a declaration. Built with plumbing, so it
+            holds on any filesystem: upstream tracks `.ForkFlow.toml`, and a commit of this
+            fork's adds `.forkflow.toml` holding upstream's bytes. The bytes did not
+            change, so provenance does not either."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch theirs"]\n'
+            commit_upstream(self.tmp, ".ForkFlow.toml", theirs, "theirs: variant")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            blob = sh("git", "hash-object", "-w", write(self.tmp, "blob.txt", theirs),
+                      cwd=fork)
+            sh("git", "update-index", "--add", "--cacheinfo",
+               "100644,%s,%s" % (blob, CONFIG_FILE), cwd=fork)
+            sh("git", "commit", "-q", "-m", "rename the config upstream brought in", cwd=fork)
+            sh("git", "push", "-q", "origin", "develop", cwd=fork)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertEqual(sh("git", "log", "-1", "--format=%s", "origin/develop", "--",
+                                CONFIG_FILE, cwd=fork),
+                             "rename the config upstream brought in")   # this fork's commit
+            self.assertEqual(self.mode(fork), "manual")
+            commit_fork(fork, CONFIG_FILE, theirs + "# ours\n", "ours: our own config")
+            sh("git", "push", "-q", "origin", "develop", cwd=fork)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertEqual(self.mode(fork), "self")
+
+        def test_a_config_upstream_no_longer_has_at_its_tip_is_still_upstreams(self):
+            """The scope `upstream_config_digests` reads is every version the history of
+            `<upstream>/<branch>` and of the mirror has carried, not their tips. So a
+            config the fork adopted whole at its last sync stays upstream's after upstream
+            has edited its own since - here it is still the merge base of upstream and the
+            trunk, which the tip-sampling scope read, and the two tests below are the same
+            question where nothing but the walk can answer it."""
+            fork = make_fork(self.tmp)
+            adopted = 'merge = "self"\n'
+            commit_upstream(self.tmp, CONFIG_FILE, adopted, "theirs: forkflow")
+            push_upstream_into_origin(self.tmp, "develop")          # the trunk takes it
+            commit_upstream(self.tmp, CONFIG_FILE, adopted + "# theirs, changed\n",
+                            "theirs: forkflow again")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertNotEqual(sh("git", "show", "upstream/main:" + CONFIG_FILE, cwd=fork),
+                                sh("git", "show", "origin/develop:" + CONFIG_FILE, cwd=fork))
+            self.assertEqual(self.mode(fork), "manual")
+
+        def test_a_version_upstream_has_retired_is_still_upstreams(self):
+            """The sixth route into the gate, and the one the tip-sampling scope left open.
+            Upstream's `.forkflow.toml`, brought in by a sync and untracked by hand, is
+            refused while upstream still has those bytes somewhere - and upstream then
+            edits its own config. The stale file in the working tree now matches no tip:
+            not `upstream/main`, not the mirror on origin or here, and the trunk never took
+            it (the sync MR was abandoned). Nothing this fork wrote, nobody's review - and
+            the file used to become "the fork's own" the moment upstream moved on. Only the
+            history answers it, and it does: every version upstream ever had is upstream's,
+            and one character of this fork's own still opens the gate."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch theirs"]\n'
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            self.advance_mirror(fork)
+            write(fork, CONFIG_FILE, theirs)     # a sync brought it in; untracked by hand
+            self.assertEqual(self.mode(fork), "manual")
+            commit_upstream(self.tmp, CONFIG_FILE, theirs + "# theirs, tidied\n",
+                            "theirs: forkflow again")
+            self.advance_mirror(fork)
+            self.tips_lack(fork, theirs)         # no tip holds those bytes any more
+            self.assertEqual(self.mode(fork), "manual")
+            write(fork, CONFIG_FILE, theirs + "# ours\n")
+            self.assertEqual(self.mode(fork), "self")
+
+        def test_a_config_reached_through_a_symlink_is_not_judged_at_all(self):
+            """The two sides of the comparison have to be the same kind of thing. Upstream
+            keeps its settings in `theirs-real.toml` and a LINK at `.forkflow.toml`, so every
+            blob upstream ever stored under the config's name is the string
+            "theirs-real.toml" - while reading the path gives the settings the link points
+            at. A sync brings both in, the link is left on disk, and upstream's own
+            `merge = "self"` (with upstream's `gate` behind it) used to read as this fork's
+            own file: scratchpad `f9/repro1.py` gets `untracked_own` and `self` out of the
+            body before this one. forkflow does not reproduce git's rendering rules to
+            compare like with like - it refuses, names the link, and prints the way out."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch theirs"]\n'
+            write(fork, "theirs-real.toml", theirs)
+            os.symlink("theirs-real.toml", os.path.join(fork, CONFIG_FILE))
+            ctx = ctx_for(fork)
+            self.assertEqual(fork_config_state(ctx)[0], "unprovable")
+            self.assertEqual(self.mode(fork), "manual")
+            why = fork_config_state(ctx)[2]
+            self.assertIn("symbolic link", why)
+            self.assertIn("theirs-real.toml", why)             # the link and its target
+            self.assertIn("cp -p --", why)                     # copied aside before anything
+            self.assertIn(git_path(fork, "forkflow-config-"), why)   # and the copy is named
+            self.assertIn(without_stamp(why), without_stamp(fork_merge_refusal(ctx)))
+            # a file of this fork's own, written here, is this fork's own again
+            os.unlink(os.path.join(fork, CONFIG_FILE))
+            write(fork, CONFIG_FILE, theirs + "# ours\n")
+            self.assertEqual(self.mode(fork), "self")
+
+        def theirs_as_a_link(self, fork: str, theirs: str) -> None:
+            """The original project keeps its settings in `theirs-real.toml` and a LINK at
+            `.forkflow.toml`. A sync brings both in and they are left on disk untracked -
+            the state the symlink refusal is printed in."""
+            commit_upstream(self.tmp, "theirs-real.toml", theirs, "theirs: settings")
+            seed = os.path.join(self.tmp, "seed")
+            os.symlink("theirs-real.toml", os.path.join(seed, CONFIG_FILE))
+            sh("git", "add", "-A", cwd=seed)
+            sh("git", "commit", "-m", "theirs: the config is a link", cwd=seed)
+            sh("git", "push", "origin", "main", cwd=seed)
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            sh("git", "checkout", "-q", "upstream/main", "--", "theirs-real.toml",
+               CONFIG_FILE, cwd=fork)
+            sh("git", "rm", "-q", "--cached", "--", "theirs-real.toml", CONFIG_FILE, cwd=fork)
+
+        def test_the_symlink_remedy_leaves_no_config_behind(self):
+            """A REMEDY MUST NEVER PRODUCE CONFIG BYTES, and this one did. It ended
+            `cp -p -- <the copy> .forkflow.toml`, so following it put the LINK TARGET's
+            contents at the config's path - bytes no `.forkflow.toml` git stores has ever
+            held, matching nothing in `upstream_config_digests`, reading as this fork's own.
+            Run exactly as printed it turned the original project's `merge = "self"`, with
+            the original project's `gate` behind it, into this fork's declaration
+            (`f10/repro23.py`).
+
+            What it prints now takes the link away, names where what it read went, and stops
+            there. This test runs every command it prints, in the state it is printed in."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch pwned"]\n'
+            self.theirs_as_a_link(fork, theirs)
+            ctx = ctx_for(fork)
+            self.assertEqual(fork_config_state(ctx)[0], "unprovable")
+            why = fork_config_state(ctx)[2]
+
+            ran = run_every_printed(why, fork)
+            self.assertTrue(ran)
+            self.assertEqual([rc for _, rc in ran], [0] * len(ran), ran)
+
+            # nothing the tool produced is at the config's path - there is no file there
+            self.assertFalse(os.path.lexists(os.path.join(fork, CONFIG_FILE)))
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "none")
+            self.assertEqual(self.mode(fork), "manual")
+            # and what was there is kept, at the one path the refusal named
+            kept = kept_configs(fork)
+            self.assertEqual(len(kept), 1)
+            self.assertIn(kept[0], why)
+            with open(kept[0]) as fh:
+                self.assertEqual(fh.read(), theirs)
+            self.assertTrue(os.path.exists(os.path.join(fork, "theirs-real.toml")))
+            # the way forward is the user's own file, and it works
+            write(fork, CONFIG_FILE, 'merge = "self"\n# ours\n')
+            self.assertEqual(self.mode(fork), "self")
+
+        def test_the_attribute_remedy_leaves_no_config_behind(self):
+            """The other half of the same defect. Turning the attribute off in
+            `info/attributes` fixes what git does NEXT time and leaves the already-converted
+            file exactly where it is - and that file is the dangerous one: `ident` expanded
+            `$Id$` into it, so its bytes are in no upstream digest set and it reads as this
+            fork's own. Run as printed, the remedy opened `--merge` on the original
+            project's settings (`f10/repro23.py`).
+
+            It now ends by taking that file off disk, with what was there copied aside and
+            named first, and says to write your own."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch pwned"]\n# $Id$\n'
+            rendered = self.theirs_through_an_attribute(fork, "ident", theirs)
+            self.assertIn(b"$Id: ", rendered)       # git really expanded it
+            ctx = ctx_for(fork)
+            self.assertEqual(fork_config_state(ctx)[0], "unprovable")
+            why = fork_config_state(ctx)[2]
+
+            ran = run_every_printed(why, fork)
+            self.assertTrue(ran)
+            self.assertEqual([rc for _, rc in ran], [0] * len(ran), ran)
+
+            self.assertFalse(os.path.lexists(os.path.join(fork, CONFIG_FILE)))
+            state = fork_config_state(ctx_for(fork))
+            self.assertEqual(state[2], "")          # the attribute is off, nothing refused
+            self.assertEqual(state[0], "none")      # and no config was produced
+            self.assertEqual(self.mode(fork), "manual")
+            kept = kept_configs(fork)
+            self.assertEqual(len(kept), 1)
+            self.assertIn(kept[0], why)
+            with open(kept[0], "rb") as fh:
+                self.assertEqual(fh.read(), rendered)
+            # the way back here is NOT another untracked file: the original project's own
+            # history sets `ident` on that path, so anything untracked at it can be
+            # something git wrote (`config_history_render_unprovable`). The way the refusal
+            # names is the trunk, where a config is read as a blob
+            write(fork, CONFIG_FILE, 'merge = "self"\n# ours\n')
+            self.assertEqual(self.mode(fork), "manual")
+            self.assertIn("committed on `origin/develop`",
+                          fork_config_state(ctx_for(fork))[2])
+            self.ship_the_config(fork)
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "trunk_own")
+            self.assertEqual(self.mode(fork), "self")
+
+        def ship_the_config(self, fork: str) -> None:
+            """The fork's own `.forkflow.toml` on `origin/<trunk>`, the way the refusals
+            here name: committed on a branch off the trunk and merged onto it."""
+            sh("git", "add", "--", CONFIG_FILE, cwd=fork)
+            sh("git", "commit", "-q", "-m", "ours: our own config", cwd=fork)
+            sh("git", "push", "-q", "origin", "HEAD:refs/heads/develop", cwd=fork)
+            sh("git", "fetch", "-q", "--prune", "origin", cwd=fork)
+
+        def test_following_only_the_first_printed_command_is_still_refused(self):
+            """THE ATTRIBUTE IS A FACT ABOUT NOW AND THE CONVERSION HAPPENED AT CHECKOUT.
+
+            The refusal prints two commands and labels the first "First,". Running only that
+            one - the likeliest way a person follows a two-part instruction - turned the
+            attribute off in `info/attributes` and left the converted file exactly where it
+            was: `check-attr` then said `unset`, NO refusal was produced at all, and the
+            `ident`-expanded bytes of the original project's config read as `untracked_own`
+            with `merge = "self"` in them. Scratchpad `q1/E4.sh` runs it end to end and
+            upstream's `gate` runs as shell at the end of it.
+
+            The round before answered the same defect by printing a SECOND command rather
+            than by making the state safe, and its test ran every command printed, so the
+            half-followed case was never exercised. This one runs the first and stops."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch pwned"]\n# $Id$\n'
+            rendered = self.theirs_through_an_attribute(fork, "ident", theirs)
+            ctx = ctx_for(fork)
+            self.assertEqual(fork_config_state(ctx)[0], "unprovable")
+            why = fork_config_state(ctx)[2]
+            printed = [c for c in re.findall(r"`([^`]+)`", why)
+                       if c.startswith(SHELL_VERBS)]
+            self.assertGreater(len(printed), 1, printed)     # it really is a two-part remedy
+            for cmd in printed[:-1]:                         # everything but the last step,
+                self.assertEqual(subprocess.run(["sh", "-c", cmd], cwd=fork,   # which is the
+                                                capture_output=True).returncode, 0, cmd)
+                                                             # one that takes the file away
+
+            # the attribute is off now, and the file git converted is untouched
+            self.assertTrue(sh("git", "check-attr", "ident", "--", CONFIG_FILE,
+                               cwd=fork).endswith("unset"))
+            with open(os.path.join(fork, CONFIG_FILE), "rb") as fh:
+                self.assertEqual(fh.read(), rendered)
+
+            state = fork_config_state(ctx_for(fork))
+            self.assertEqual(state[0], "unprovable")         # and it is STILL refused
+            self.assertIn("already judged unprovable", state[2])
+            self.assertIn(CONFIG_FILE, state[2])
+            self.assertEqual(self.mode(fork), "manual")
+            # the verdict is about these bytes, so it is written down where the original
+            # project cannot reach it
+            self.assertEqual(read_state(ctx, shared=True)[RENDERED_CONFIGS],
+                             [config_digest(rendered.decode("utf-8"))])
+            # and what this refusal prints, run as printed, ends with no config at all
+            self.assertEqual([rc for _, rc in run_every_printed(state[2], fork)], [0])
+            self.assertFalse(os.path.lexists(os.path.join(fork, CONFIG_FILE)))
+
+        def test_an_attribute_the_project_has_since_deleted_still_refuses_what_it_wrote(self):
+            """The other way the condition ends with the converted file still on disk, and
+            this one needs no user action at all: the original project deletes the
+            `.gitattributes` that set the attribute, and the fork syncs. The converted file
+            is untracked, so the sync leaves it while taking the attribute away
+            (`q1/render2.py` case B, `q1/E3.sh`).
+
+            Nothing is written down here - this clone has never looked before - so the only
+            thing that can answer is what the project's own history sets on that path
+            (`config_history_render_unprovable`). An untracked config cannot answer for
+            `merge` while that is so, and the way forward the refusal names is the one this
+            tool recommends anyway: the config on the trunk, which is read as a blob."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch pwned"]\n# $Id$\n'
+            rendered = self.theirs_through_an_attribute(fork, "ident", theirs)
+            os.unlink(os.path.join(fork, ".gitattributes"))   # the project dropped it
+            ctx = ctx_for(fork)
+            self.assertEqual(git("check-attr", "ident", "--", CONFIG_FILE,
+                                 cwd=fork).split(": ")[-1], "unspecified")
+            self.assertEqual(read_state(ctx, shared=True).get(RENDERED_CONFIGS), None)
+            with open(os.path.join(fork, CONFIG_FILE), "rb") as fh:
+                self.assertEqual(fh.read(), rendered)        # still there, still converted
+
+            state = fork_config_state(ctx)
+            self.assertEqual(state[0], "unprovable")
+            self.assertIn("ident", state[2])
+            self.assertIn("does not have to be set NOW", state[2])
+            self.assertEqual(self.mode(fork), "manual")
+            # the way forward it names, taken: the fork's own config on the trunk
+            os.unlink(os.path.join(fork, CONFIG_FILE))
+            write(fork, CONFIG_FILE, 'merge = "self"\n# ours\n')
+            self.ship_the_config(fork)
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "trunk_own")
+            self.assertEqual(self.mode(fork), "self")
+
+        @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                         "root reads a mode-000 file anyway")
+        def test_a_gitattributes_the_history_lists_and_cannot_be_read_is_a_refusal(self):
+            """FAIL CLOSED, here as everywhere else the reading can fail: a version of the
+            project's `.gitattributes` this clone cannot open is not evidence that it never
+            set anything. Skipped over, the one version that set `ident` on the config's
+            path would be the one that is unreadable."""
+            fork = make_fork(self.tmp)
+            write(fork, CONFIG_FILE, 'merge = "self"\n')     # the fork's own, untracked
+            self.assertEqual(self.mode(fork), "self")
+            commit_upstream(self.tmp, ".gitattributes", "* text=auto\n", "theirs: attributes")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            blob = sh("git", "rev-parse", "upstream/main:.gitattributes", cwd=fork)
+            loose = os.path.join(fork, ".git", "objects", blob[:2], blob[2:])
+            self.assertTrue(os.path.exists(loose), loose)
+            os.chmod(loose, 0o000)
+            self.addCleanup(os.chmod, loose, 0o444)
+            state = fork_config_state(ctx_for(fork))
+            self.assertEqual(state[0], "unprovable")
+            self.assertIn(short(blob), state[2])
+            self.assertIn("cannot be read", state[2])
+            self.assertEqual(self.mode(fork), "manual")
+
+        def test_a_gitattributes_walk_git_refuses_is_a_refusal(self):
+            """The other half: a walk that fails answers with the reason and never with an
+            empty set. Asked of the walker directly - the same failure reaches the config
+            walk first in any real clone, and a guard that only a broken repository could
+            show is still the difference between "nothing set one" and "nothing was
+            read"."""
+            ctx = ctx_for(make_fork(self.tmp))
+            found, why = attrs_render_the_config(ctx, ["refs/remotes/upstream/main",
+                                                       "no-such-ref-at-all"])
+            self.assertEqual(found, "")
+            self.assertIn("cannot be walked", why)
+            self.assertIn("merged by hand", why)
+
+        def test_a_rendering_attribute_cannot_reach_a_config_on_the_trunk(self):
+            """The rendering question asked where it cannot matter, which is where it used
+            to be asked: before `fork_config_state` decided which file answers for `merge`.
+
+            In the `trunk_*` states the config is read with `git show <origin/trunk>:<name>`
+            - raw blob against raw blobs, the working tree never consulted - so nothing in
+            the working tree can change the answer. A fork in the state this tool RECOMMENDS
+            was nevertheless refused by any `filter`, `ident` or `working-tree-encoding` on
+            the config's path, and told that "the file sitting there was written by git's
+            conversion" and to `rm -- .forkflow.toml`: a fork following that deletes its own
+            reviewed config for a condition that cannot change the decision."""
+            fork = make_fork(self.tmp, config='merge = "self"\n')
+            for attr in ("ident", "filter=mangle", "working-tree-encoding=UTF-16"):
+                write(fork, ".gitattributes", CONFIG_FILE + " " + attr + "\n")
+                state = fork_config_state(ctx_for(fork))
+                self.assertEqual(state[0], "trunk_own", attr)
+                self.assertEqual(state[2], "", attr)
+                self.assertEqual(self.mode(fork), "self", attr)
+                self.assertNotIn("rm -- ", fork_merge_refusal(ctx_for(fork)))
+            # and the same for a symlink at the config's path: the trunk answers, not it
+            os.unlink(os.path.join(fork, CONFIG_FILE))
+            write(fork, "theirs-real.toml", 'merge = "self"\n')
+            os.symlink("theirs-real.toml", os.path.join(fork, CONFIG_FILE))
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "trunk_own")
+            self.assertEqual(self.mode(fork), "self")
+
+        def test_the_attribute_remedy_with_no_file_on_disk_removes_nothing(self):
+            """The attribute can be set on a path with no file at it - a tracked variant on
+            a case-sensitive filesystem. There is then nothing converted to take away, and
+            the remedy says so rather than printing an `rm` of a file that is not there.
+
+            No config on the trunk here: with one there the trunk answers and the working
+            tree is not read at all, which is what
+            `test_a_rendering_attribute_cannot_reach_a_config_on_the_trunk` is about."""
+            fork = make_fork(self.tmp)
+            sh("git", "config", "core.ignorecase", "false", cwd=fork)
+            write(fork, ".gitattributes", ".ForkFlow.toml ident\n")
+            blob = sh("git", "hash-object", "-w", write(self.tmp, "v.txt", "theirs\n"),
+                      cwd=fork)
+            sh("git", "update-index", "--add", "--cacheinfo",
+               "100644,%s,.ForkFlow.toml" % blob, cwd=fork)
+            ctx = ctx_for(fork)
+            why = fork_config_state(ctx)[2]
+            self.assertIn("nothing to undo on disk", why)
+            for cmd in re.findall(r"`([^`]+)`", why):
+                self.assertFalse(cmd.startswith(("cp ", "mv ", "rm ", "test ")), cmd)
+            self.assertEqual([rc for _, rc in run_every_printed(why, fork)], [0, 0])
+            self.assertEqual(fork_config_state(ctx_for(fork))[2], "")
+
+        def test_an_attribute_that_renders_the_config_is_not_judged_at_all(self):
+            """`ident` expands `$Id$` into the blob's own hash on checkout, so the file in
+            the working tree is not the bytes of any blob that could have produced it, and
+            upstream's config - `.gitattributes` and all, brought in by a sync - read as this
+            fork's own (`f9/repro1.py`). Every attribute that rewrites the file between the
+            object store and the working tree is refused the same way - but only those. The
+            attributes that do line endings (`text`, `eol`) and the one that does diff
+            output (`diff`) are NOT here, and the test below says why."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\n# $Id$\n'
+            for attr in ("ident", "filter=mangle", "working-tree-encoding=UTF-16"):
+                write(fork, ".gitattributes", CONFIG_FILE + " " + attr + "\n")
+                write(fork, CONFIG_FILE, theirs)
+                ctx = ctx_for(fork)
+                self.assertEqual(fork_config_state(ctx)[0], "unprovable", attr)
+                self.assertEqual(self.mode(fork), "manual", attr)
+                why = fork_config_state(ctx)[2]
+                self.assertIn(attr.split("=")[0], why)          # the attribute is named
+                self.assertIn(CONFIG_FILE, why)
+                self.assertIn(git_path(fork, os.path.join("info", "attributes")), why)
+                self.assertIn(without_stamp(why), without_stamp(fork_merge_refusal(ctx)))
+            # the way out the message prints, run as printed: the attribute is turned off
+            # for that one path in this clone's own attributes file (additive, nothing of
+            # anybody's overwritten) AND the converted file is taken off disk. It does not
+            # put a config back - `test_the_attribute_remedy_leaves_no_config_behind` is
+            # about why not - so what is left is no config at all
+            self.assertEqual([rc for _, rc in run_every_printed(why, fork)], [0, 0, 0])
+            self.assertFalse(os.path.lexists(os.path.join(fork, CONFIG_FILE)))
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "none")
+            write(fork, CONFIG_FILE, 'merge = "self"\n# ours\n')
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "untracked_own")
+            self.assertEqual(self.mode(fork), "self")
+
+        def theirs_through_an_attribute(self, fork: str, attr: str, theirs) -> bytes:
+            """Upstream's `.gitattributes` and upstream's `.forkflow.toml`, checked out into
+            this fork's working tree and untracked by hand - the shape a sync leaves behind,
+            and the one the whole rendering question is about. Answers the raw bytes that
+            landed on disk, so a test can say what git actually did to them."""
+            commit_upstream(self.tmp, ".gitattributes", CONFIG_FILE + " " + attr + "\n",
+                            "theirs: attributes")
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            sh("git", "checkout", "-q", "upstream/main", "--", ".gitattributes", cwd=fork)
+            sh("git", "checkout", "-q", "upstream/main", "--", CONFIG_FILE, cwd=fork)
+            sh("git", "rm", "-q", "--cached", "--ignore-unmatch", "--",
+               CONFIG_FILE, ".gitattributes", cwd=fork)
+            with open(os.path.join(fork, CONFIG_FILE), "rb") as fh:
+                return fh.read()
+
+        def test_line_endings_are_normalised_so_text_and_eol_are_safe_to_allow(self):
+            """`text` and `eol` were refused with `filter` and `ident`, and they do not
+            belong there: they change LINE ENDINGS and nothing else, and both sides of the
+            provenance comparison already have their line endings taken off them
+            (`working_config_text` reads in text mode, `config_fingerprint` normalises the
+            blob). This is the claim the narrowing rests on, so it is measured rather than
+            assumed - CRLF really reaches the working tree here, and upstream's config is
+            STILL read as upstream's afterwards.
+
+            Both sides of the comparison, one each way round: the blob stored with LF while
+            `eol=crlf` puts CRLF on disk, and the blob stored with CRLF while the file on
+            disk has LF."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch theirs"]\n'
+            raw = self.theirs_through_an_attribute(fork, "eol=crlf", theirs)
+            self.assertIn(b"\r\n", raw)                  # git really did convert it
+            ctx = ctx_for(fork)
+            self.assertEqual(working_config_text(ctx), theirs)    # and it reads back as LF
+            self.assertEqual(fork_config_state(ctx)[0], "untracked_upstreams")
+            self.assertEqual(self.mode(fork), "manual")           # still upstream's
+            write(fork, CONFIG_FILE, theirs + "# ours\n")         # the way back, unchanged
+            self.assertEqual(self.mode(fork), "self")
+
+            # and the blob's own side: upstream STORED a version with CRLF in it (`-text`
+            # keeps git's hands off the bytes on the way in), and this working tree holds
+            # the same settings with LF. Same file, different line endings, still upstream's
+            crlf = 'merge = "self"\r\ngate = ["touch crlf"]\r\n'
+            commit_upstream(self.tmp, ".gitattributes", CONFIG_FILE + " -text\n",
+                            "theirs: attributes, verbatim")
+            commit_upstream(self.tmp, CONFIG_FILE, crlf, "theirs: forkflow with CRLF")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            stored = sh("git", "cat-file", "blob", "upstream/main:" + CONFIG_FILE, cwd=fork)
+            self.assertIn("\r", stored)                  # CRLF really is what git holds
+            write(fork, CONFIG_FILE, crlf.replace("\r\n", "\n"))
+            ctx = ctx_for(fork)
+            self.assertEqual(fork_config_state(ctx)[2], "")       # and nothing is refused
+            self.assertEqual(fork_config_state(ctx)[0], "untracked_upstreams")
+            self.assertEqual(self.mode(fork), "manual")
+            write(fork, CONFIG_FILE, 'merge = "self"\n# ours\n')
+            self.assertEqual(self.mode(fork), "self")
+
+        def test_a_diff_attribute_never_reaches_the_working_tree(self):
+            """`diff` names a diff driver, and a driver's `textconv` is run to produce DIFF
+            OUTPUT - never as part of a checkout. It was in the refusing set anyway; the
+            bytes say it does not belong there, and upstream's config stays upstream's."""
+            theirs = 'merge = "self"\ngate = ["touch theirs"]\n'
+            fork = make_fork(self.tmp)
+            sh("git", "config", "diff.toml.textconv", "sed s/self/ZZZZ/", cwd=fork)
+            raw = self.theirs_through_an_attribute(fork, "diff=toml", theirs)
+            self.assertEqual(raw.decode(), theirs)      # the textconv changed nothing here
+            ctx = ctx_for(fork)
+            self.assertEqual(fork_config_state(ctx)[0], "untracked_upstreams")
+            self.assertEqual(self.mode(fork), "manual")
+
+        def test_an_ordinary_fork_is_never_refused_for_its_gitattributes(self):
+            """The over-refusal this narrowing exists for. `* text=auto` is in an enormous
+            number of repositories and says nothing at all about whose config this is; a
+            fork carrying it used to be told `--merge` could not be proven here, with a
+            remedy to write into its git directory. A plain clone with one `upstream`
+            remote, its own `.forkflow.toml` on the trunk and that line in `.gitattributes`
+            reaches `--merge` like any other fork."""
+            fork = make_fork(self.tmp, config='merge = "self"\n# ours\n')
+            for rules in ("* text=auto\n",
+                          "* text=auto eol=lf\n",
+                          "*.md text\n*.png binary\n" + CONFIG_FILE + " diff=toml\n",
+                          CONFIG_FILE + " text eol=crlf diff\n"):
+                write(fork, ".gitattributes", rules)
+                ctx = ctx_for(fork)
+                self.assertEqual(fork_config_state(ctx)[2], "", rules)   # nothing refused
+                self.assertEqual(fork_config_state(ctx)[0], "trunk_own", rules)
+                self.assertEqual(self.mode(fork), "self", rules)
+
+        def test_an_attribute_on_a_case_variant_of_the_name_is_looked_at_too(self):
+            """A case-insensitive filesystem makes `.ForkFlow.toml` and `.forkflow.toml` one
+            file, so an attribute set on the variant reaches the file forkflow reads. The
+            question is asked of every path that case-folds to the name - the one on disk,
+            any variant beside it, and every variant git tracks - and not of the exact
+            spelling alone.
+
+            Built with plumbing and with `core.ignorecase` off, so it holds on any
+            filesystem: where git has it on (the macOS and Windows default) git matches the
+            attribute pattern itself case-insensitively and the refusal comes either way,
+            which would make the test pass without asking about the variant at all."""
+            fork = make_fork(self.tmp)
+            sh("git", "config", "core.ignorecase", "false", cwd=fork)
+            write(fork, ".gitattributes", ".ForkFlow.toml ident\n")
+            write(fork, CONFIG_FILE, 'merge = "self"\n')
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "untracked_own")
+            blob = sh("git", "hash-object", "-w", write(self.tmp, "v.txt", "theirs\n"),
+                      cwd=fork)
+            sh("git", "update-index", "--add", "--cacheinfo",
+               "100644,%s,.ForkFlow.toml" % blob, cwd=fork)
+            ctx = ctx_for(fork)
+            self.assertEqual(fork_config_state(ctx)[0], "unprovable")
+            self.assertIn(".ForkFlow.toml", fork_config_state(ctx)[2])
+
+        def test_attributes_git_cannot_be_asked_about_are_a_refusal_too(self):
+            """A `check-attr` that fails is not evidence that nothing is set on the file -
+            a `.gitattributes` git refuses to parse is exactly where one would hide. It
+            fails closed, like every other reading this answer depends on."""
+            fork = make_fork(self.tmp)
+            write(fork, CONFIG_FILE, 'merge = "self"\n')
+            self.assertEqual(self.mode(fork), "self")
+            real = git_rc
+
+            def refuses(*argv, **kw):
+                if argv[:1] == ("check-attr",):
+                    return (128, "", "fatal: bad attributes line\n")
+                return real(*argv, **kw)
+
+            with mock.patch.object(sys.modules[__name__], "git_rc", refuses):
+                ctx = ctx_for(fork)
+                self.assertEqual(fork_config_state(ctx)[0], "unprovable")
+                self.assertIn("bad attributes line", fork_config_state(ctx)[2])
+                self.assertEqual(fork_merge_mode(ctx), "manual")
+
+        def test_attributes_that_say_nothing_about_the_config_change_nothing(self):
+            """The refusals above must never reach an ordinary fork. A `.gitattributes` that
+            covers other paths, and one that turns the attributes OFF for this one, both
+            leave the config exactly as readable as it was."""
+            fork = make_fork(self.tmp, config='merge = "self"\n')
+            self.assertEqual(self.mode(fork), "self")
+            write(fork, ".gitattributes",
+                  "*.md text\n*.png binary\nsrc/** diff=python\n" + CONFIG_FILE + " -text\n")
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "trunk_own")
+            self.assertEqual(self.mode(fork), "self")
+
+        def withdraw_and_replace(self, gone: str, instead: str) -> None:
+            """Upstream rewrites its branch: the commit that carried `gone` is not in the
+            history any more and `instead` is what the branch carries now. A force-push, a
+            withdrawn branch and a pruned fetch all leave this behind - a history with every
+            other version of upstream's in it and not that one."""
+            seed = os.path.join(self.tmp, "seed")
+            sh("git", "reset", "-q", "--hard", "HEAD~1", cwd=seed)
+            write(seed, CONFIG_FILE, instead)
+            sh("git", "add", "-A", cwd=seed)
+            sh("git", "commit", "-q", "-m", "theirs: forkflow, rewritten", cwd=seed)
+            sh("git", "push", "-q", "--force", "origin", "main", cwd=seed)
+            self.assertNotEqual(gone, instead)
+
+        def test_whitespace_only_differences_are_still_the_projects_bytes(self):
+            """`config_fingerprint`'s trailing-whitespace guard, which nothing covered - a
+            SURVIVING MUTANT until now: replacing the normalising line with `return text`
+            passed the whole suite (`q1/mutrun2.py` over
+            `mut/g24-no-trailing-space-strip.py`).
+
+            It is load-bearing. An editor that trims trailing whitespace on save, or drops
+            or adds the final newline, would otherwise make the original project's own
+            config read as bytes this fork authored - upstream's `merge = "self"` and
+            upstream's `gate`, which this tool runs as shell, taken as this fork's own word
+            for a keystroke nobody made. A real edit still makes the file the fork's, which
+            is the way back every refusal prints, and that is the line this draws."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch theirs"]\n'
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            self.advance_mirror(fork)
+            for label, variant in (
+                    ("no final newline", theirs.rstrip("\n")),
+                    ("an extra final newline", theirs + "\n"),
+                    ("a trailing space", theirs.replace('"self"\n', '"self" \n')),
+                    ("a trailing tab", theirs.replace('"self"\n', '"self"\t\n'))):
+                self.assertNotEqual(variant, theirs, label)
+                write(fork, CONFIG_FILE, variant)
+                ctx = ctx_for(fork)
+                self.assertEqual(fork_config_state(ctx)[0], "untracked_upstreams", label)
+                self.assertEqual(self.mode(fork), "manual", label)
+            write(fork, CONFIG_FILE, theirs + "# ours\n")   # a character of the fork's own
+            self.assertEqual(self.mode(fork), "self")
+
+        def test_a_version_upstream_withdrew_from_every_ref_is_still_upstreams(self):
+            """You cannot prove absence from a history you no longer hold. Upstream's
+            `.forkflow.toml`, brought in by a sync and untracked by hand, is refused while
+            upstream still carries those bytes - and upstream then FORCE-PUSHES that commit
+            away and puts another version in its place. The walk now reads a history holding
+            every version of upstream's but that one, so the answer is not empty, no
+            fail-closed condition fires, and a file this fork never wrote read as the fork's
+            own - with upstream's `merge = "self"` in it, and upstream's `gate` behind it.
+
+            So the fork REMEMBERS, in the one place upstream cannot write: what was once the
+            original project's stays the original project's, and the withdrawal changes
+            nothing. The way back is the one every refusal here prints - edit the file, and
+            edited bytes are new bytes that no memory holds."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch theirs"]\n'
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            self.advance_mirror(fork)
+            write(fork, CONFIG_FILE, theirs)     # a sync brought it in; untracked by hand
+            self.assertEqual(self.mode(fork), "manual")
+            self.assertEqual(remembered_upstream_configs(ctx_for(fork)),
+                             [config_digest(theirs)])       # written down while it was there
+
+            self.withdraw_and_replace(theirs, theirs + "# theirs, rewritten\n")
+            sh("git", "fetch", "-q", "--prune", "upstream", cwd=fork)
+            sh("git", "branch", "-f", "main", "upstream/main", cwd=fork)
+            sh("git", "push", "-q", "--force", "origin", "main:refs/heads/main", cwd=fork)
+            sh("git", "fetch", "-q", "--prune", "origin", cwd=fork)
+            ctx = ctx_for(fork)
+            walked, why = config_versions_in(ctx, upstream_scope_refs(ctx))
+            self.assertEqual(why, "")
+            self.assertTrue(walked)                         # the baseline is NOT empty
+            self.assertNotIn(config_digest(theirs), walked)  # and no history holds these
+
+            self.assertEqual(self.mode(fork), "manual")     # remembered, so still upstream's
+
+            # and the memory cannot be flushed into an open gate. Damage the file it lives
+            # in - a truncated write, a full disk, a hand edit - and the answer used to be
+            # `{}`: the record simply gone, in silence, and upstream's own file read as this
+            # fork's own with `merge = "self"` in it (`f10/repro15.py`)
+            shared = state_path(ctx, shared=True)
+            with open(shared) as fh:
+                whole = fh.read()
+            with open(shared, "w") as fh:
+                fh.write(whole[:len(whole) // 2])
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "unprovable")
+            self.assertEqual(self.mode(fork), "manual")
+            self.assertIn(shared, fork_config_state(ctx_for(fork))[2])
+            with open(shared, "w") as fh:                   # put it back as it was
+                fh.write(whole)
+
+            write(fork, CONFIG_FILE, theirs + "# ours\n")
+            self.assertEqual(self.mode(fork), "self")       # an edit of the fork's own
+
+        def test_what_is_written_down_comes_only_from_the_refs_upstream_cannot_choose(self):
+            """The memory is permanent, so what goes into it is taken from the frame upstream
+            cannot choose (`foreign_remote_refs`) and from nowhere else. The refs the CONFIG
+            names widen the answer for the run that reads them and are left out on purpose:
+            a config aiming the walk at this fork's own trunk would otherwise write the
+            fork's own bytes in for good, and no later edit of the config could take them
+            out again.
+
+            Here the config on the trunk calls a branch of the FORK's the `mirror`, and that
+            branch carries the fork's own config, so the walk reads the fork's own bytes as
+            upstream's and refuses - which is the safe direction, and is what the superset
+            scope is for. What must not happen is the refusal outliving the config that
+            caused it: the fork edits the file, and the gate opens again."""
+            config = 'merge = "self"\nmirror = "ours"\n'
+            fork = make_fork(self.tmp, config=config)
+            sh("git", "push", "-q", "origin", "develop:refs/heads/ours", cwd=fork)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            ctx = ctx_for(fork)
+            self.assertIn("refs/remotes/origin/ours", upstream_scope_refs(ctx))
+            self.assertEqual(fork_config_state(ctx)[0], "trunk_upstreams")
+            self.assertEqual(self.mode(fork), "manual")     # it aimed the walk at the fork
+            self.assertNotIn(config_digest(config), remembered_upstream_configs(ctx))
+            second_clone_commit(self.tmp, path=CONFIG_FILE, content='merge = "self"\n')
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertEqual(self.mode(fork), "self")       # nothing was written down about it
+
+        def test_a_second_remote_for_this_forks_own_repository_is_not_the_project(self):
+            """"Not `origin`" was standing in for "the original project", and the two are
+            not one question. A second remote for the FORK ITSELF - the same repository over
+            ssh rather than https, a backup mirror, the fork on a second host - made this
+            fork's own reviewed `merge = "self"` read as the original project's, byte for
+            byte, and refused `--merge` with nobody else involved at all; the digest went
+            into the memory, so removing the remote again changed nothing (`q2/A4.sh`,
+            `q1/mem2.py n03`).
+
+            What a remote is a remote OF is `repo_id`, off `origin`'s own URL - local git
+            config, which upstream cannot write - so this is not a narrowing a
+            `.forkflow.toml` can reach."""
+            fork = make_fork(self.tmp)
+            mine = 'upstream = "upstream"\nmerge = "self"\ngate = ["make test"]\n'
+            write(fork, CONFIG_FILE, mine)                  # where `setup` leaves it
+            self.assertEqual(self.mode(fork), "self")
+            origin_git = os.path.join(self.tmp, "origin.git")
+            sh("git", "remote", "add", "fork", "file://" + origin_git, cwd=fork)
+            sh("git", "fetch", "-q", "fork", cwd=fork)
+            ctx = ctx_for(fork)
+            self.assertEqual(same_repo_remotes(ctx), ["fork"])
+            self.assertEqual([r for r in foreign_remote_refs(ctx)
+                              if r.startswith("refs/remotes/fork/")], [])
+            self.assertEqual(fork_config_state(ctx)[0], "untracked_own")
+            self.assertEqual(self.mode(fork), "self")
+            # and nothing of the fork's own was written down on the way
+            self.assertEqual(remembered_config_record(ctx), {})
+
+        def test_another_forks_remote_refuses_and_removing_it_gives_merge_back(self):
+            """A teammate's fork of this fork, added as a remote to review a branch, carries
+            the same team `.forkflow.toml`. It IS another repository, so it stays in the walk
+            - the scope has to be a superset the config cannot narrow, and the refusal is the
+            safe direction. What must not happen is the refusal being PERMANENT: the digest
+            used to go into the memory unqualified, and `git remote remove` plus a prune left
+            `--merge` refused for good, with the only way back nobody names - deleting the
+            state file (`q2/A2.sh`, `q1/colleague.py`).
+
+            So the record carries the repository each digest came from, the refusal NAMES the
+            remote whose history matched, and the way back it prints is run here exactly as
+            printed. Nothing is dropped: re-adding the remote refuses again."""
+            fork = make_fork(self.tmp)
+            team = 'upstream = "upstream"\nmerge = "self"\ngate = ["make test"]\n'
+            write(fork, CONFIG_FILE, team)
+            self.assertEqual(self.mode(fork), "self")
+
+            mate = os.path.join(self.tmp, "mate.git")
+            work = os.path.join(self.tmp, "matework")
+            sh("git", "init", "-q", "--bare", "-b", "develop", mate)
+            sh("git", "clone", "-q", os.path.join(self.tmp, "origin.git"), work)
+            identity(work)
+            sh("git", "checkout", "-q", "-B", "develop", "origin/develop", cwd=work)
+            write(work, CONFIG_FILE, team)          # the same team config, on their trunk
+            sh("git", "add", "-f", CONFIG_FILE, cwd=work)
+            sh("git", "commit", "-q", "-m", "mate: the team config", cwd=work)
+            sh("git", "push", "-q", mate, "develop", cwd=work)
+            sh("git", "remote", "add", "mate", mate, cwd=fork)
+            sh("git", "fetch", "-q", "mate", cwd=fork)
+
+            ctx = ctx_for(fork)
+            self.assertEqual(fork_config_state(ctx)[0], "untracked_upstreams")
+            self.assertEqual(self.mode(fork), "manual")
+            why = fork_merge_refusal(ctx)
+            self.assertIn("the remote `mate`", why)         # WHICH history matched
+            self.assertNotIn("A sync brought it in", why)   # a cause it cannot know
+            record = remembered_config_record(ctx)
+            self.assertEqual(sorted(sum(record.values(), [])), [config_digest(team)])
+            self.assertNotIn("", record)                    # under the repository, not loose
+
+            # the way back, run exactly as printed
+            cmd = printed_cmd(why, "git remote remove")
+            self.assertEqual(cmd, "git remote remove mate")
+            self.assertEqual(subprocess.run(["sh", "-c", cmd], cwd=fork,
+                                            capture_output=True).returncode, 0)
+            self.assertEqual(self.mode(fork), "self")
+            # nothing was dropped to do it: the record still holds what it held
+            self.assertEqual(remembered_config_record(ctx_for(fork)), record)
+            sh("git", "remote", "add", "mate", mate, cwd=fork)
+            sh("git", "fetch", "-q", "mate", cwd=fork)
+            self.assertEqual(self.mode(fork), "manual")     # and answers the same again
+
+        def test_a_version_only_a_fetched_tag_still_carries_is_still_the_projects(self):
+            """`refs/tags/*` was in no scope at all. A tag is a ref like any other: this
+            clone can hold the original project's config version under a tag it fetched
+            while every branch that carried it has moved on, and nothing walked it
+            (`q1/withdraw.py` case B). Here the fork takes the file straight off
+            `upstream/main` without a sync - so the mirror never carried it - and the project
+            then force-pushes that commit away. The tag is all that is left, and it is
+            enough."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = ["touch theirs"]\n'
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            seed = os.path.join(self.tmp, "seed")
+            sh("git", "tag", "v9", cwd=seed)
+            sh("git", "push", "-q", "origin", "v9", cwd=seed)
+            sh("git", "fetch", "-q", "--tags", "upstream", cwd=fork)
+            sh("git", "checkout", "-q", "upstream/main", "--", CONFIG_FILE, cwd=fork)
+            sh("git", "rm", "-q", "--cached", CONFIG_FILE, cwd=fork)   # untracked by hand
+
+            sh("git", "reset", "-q", "--hard", "HEAD~1", cwd=seed)     # withdrawn upstream
+            sh("git", "push", "-q", "--force", "origin", "main", cwd=seed)
+            sh("git", "fetch", "-q", "--prune", "upstream", cwd=fork)
+            self.assertEqual(sh("git", "show", "upstream/main:" + CONFIG_FILE, cwd=fork,
+                                check=False), "")           # no branch here carries it
+            self.assertTrue(sh("git", "rev-parse", "-q", "--verify", "refs/tags/v9",
+                               cwd=fork, check=False))
+            ctx = ctx_for(fork)
+            self.assertIn(config_digest(theirs), upstream_tag_versions(ctx)[0])
+            self.assertEqual(fork_config_state(ctx)[0], "untracked_upstreams")
+            self.assertEqual(self.mode(fork), "manual")
+
+        def test_this_forks_own_tags_are_not_the_original_projects(self):
+            """Tags are one flat namespace: the project's fetched tags and the fork's own
+            release tags sit side by side under it with nothing to tell them apart by name.
+            A plain `refs/tags/*` would read a fork's own release tag as the original
+            project's and refuse `--merge` to every fork that tags a release with its own
+            config committed - a false refusal, which on this branch is as serious as a false
+            pass. What the fork's own repository reaches is taken out of that walk: its
+            `origin` refs, and its branches for a tag that has not been pushed yet."""
+            fork = make_fork(self.tmp, config='merge = "self"\n')
+            self.assertEqual(self.mode(fork), "self")
+            sh("git", "tag", "v1", cwd=fork)                # a release, tagged and pushed
+            sh("git", "push", "-q", "origin", "v1", cwd=fork)
+            sh("git", "fetch", "-q", "--tags", "origin", cwd=fork)
+            self.assertEqual(fork_config_state(ctx_for(fork))[0], "trunk_own")
+            self.assertEqual(self.mode(fork), "self")
+
+        def test_a_tag_on_a_commit_only_a_branch_here_has_is_still_this_forks_own(self):
+            """The other half of the same narrowing, and the one the `origin` refs do not
+            cover: a tag on a commit this clone has not pushed yet - tagged on a feature
+            branch before the ship - carries the fork's OWN config, and reading it as the
+            original project's would refuse `--merge` on the fork's own bytes. `--branches`
+            is what takes those out."""
+            fork = make_fork(self.tmp)
+            mine = 'merge = "self"\ngate = ["make test"]\n'
+            write(fork, CONFIG_FILE, mine)                  # where `setup` leaves it
+            self.assertEqual(self.mode(fork), "self")
+            sh("git", "switch", "-q", "-c", "feat/x", cwd=fork)
+            sh("git", "add", "-f", CONFIG_FILE, cwd=fork)
+            sh("git", "commit", "-q", "-m", "ours: our config, on a branch here", cwd=fork)
+            sh("git", "tag", "v2", cwd=fork)          # tagged here, pushed nowhere
+            sh("git", "switch", "-q", "develop", cwd=fork)
+            write(fork, CONFIG_FILE, mine)            # untracked again, as `setup` leaves it
+            ctx = ctx_for(fork)
+            self.assertNotIn(config_digest(mine), upstream_tag_versions(ctx)[0])
+            self.assertEqual(fork_config_state(ctx)[0], "untracked_own")
+            self.assertEqual(self.mode(fork), "self")
+
+        def blank_upstream_branch(self, name: str = "blank") -> None:
+            """A branch of the original project's own that never carried a config - the ref
+            upstream points the walk at when it gets to choose the walk's scope."""
+            seed = os.path.join(self.tmp, "seed")
+            sh("git", "checkout", "-q", "--orphan", name, cwd=seed)
+            sh("git", "rm", "-q", "-rf", ".", cwd=seed)
+            write(seed, "BLANK.md", "nothing here\n")
+            sh("git", "add", "-A", cwd=seed)
+            sh("git", "commit", "-q", "-m", "theirs: a branch with no config in it", cwd=seed)
+            sh("git", "push", "-q", "origin", name, cwd=seed)
+            sh("git", "checkout", "-q", "main", cwd=seed)
+
+        def test_upstream_does_not_choose_the_refs_the_walk_reads(self):
+            """The seventh route into the gate: the provenance walk's own SCOPE was read
+            off the `.forkflow.toml` whose provenance it decides. Upstream's file names an
+            `upstream_branch` of upstream's that never carried a config and swaps `trunk`
+            and `mirror`, so every ref the old walk read - `<upstream>/<branch>` and the
+            mirror - held no config at all. The set came back empty, upstream's own bytes
+            matched nothing, and the config sitting on `origin/main` (the MIRROR, a pristine
+            copy of upstream) was read as this fork's reviewed declaration: `merge = "self"`,
+            gate open, upstream's `gate` run here as shell.
+
+            `upstream_scope_refs` takes the scope from every remote-tracking ref that is not
+            `origin`'s instead - remotes are local git config, which upstream cannot write -
+            so `upstream/main` is walked however the config is spelled."""
+            fork = make_fork(self.tmp)
+            self.blank_upstream_branch()
+            theirs = ('merge = "self"\ngate = ["touch theirs"]\n'
+                      'upstream_branch = "blank"\ntrunk = "main"\nmirror = "develop"\n')
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            self.advance_mirror(fork)
+            write(fork, CONFIG_FILE, theirs)     # a sync brought it in; untracked by hand
+            ctx = ctx_for(fork)
+            self.assertEqual((ctx.upstream_branch, ctx.trunk, ctx.mirror),
+                             ("blank", "main", "develop"))      # the config got its way here
+            self.assertIn("refs/remotes/upstream/main", upstream_scope_refs(ctx))
+            # the file read for `merge` is the one the renamed "trunk" carries - which is
+            # the MIRROR, upstream's own pristine copy, and the walk says so
+            self.assertEqual(fork_config_state(ctx)[0], "trunk_upstreams")
+            self.assertEqual(self.mode(fork), "manual")
+
+        def test_the_walk_reads_a_remote_the_config_never_names(self):
+            """The scope is EVERY non-origin remote-tracking ref, not the one the config
+            calls `upstream`: a second remote for the same project - a mirror of it, a
+            colleague's fork of it - carries upstream's configs too, and a config pointing
+            `upstream` at a remote with nothing fetched under it must not make them this
+            fork's. `upstream/main` is deleted here and the mirror with it, so only the
+            other remote's refs can answer - and they do."""
+            fork = make_fork(self.tmp)
+            theirs = ('merge = "self"\nupstream = "upstream"\n'
+                      '# theirs, fetched under another remote\n')
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            sh("git", "remote", "add", "elsewhere", os.path.join(self.tmp, "upstream.git"),
+               cwd=fork)
+            sh("git", "fetch", "-q", "elsewhere", cwd=fork)
+            sh("git", "update-ref", "-d", "refs/remotes/upstream/main", cwd=fork)
+            sh("git", "branch", "-q", "-D", "main", cwd=fork)    # the mirror is not advanced
+            write(fork, CONFIG_FILE, theirs)
+            ctx = ctx_for(fork)
+            self.assertEqual(ctx.upstream, "upstream")           # the config named that one
+            self.assertEqual([r for r in foreign_remote_refs(ctx) if r.endswith("/main")],
+                             ["refs/remotes/elsewhere/main"])
+            self.assertNotIn("theirs", sh("git", "show", "origin/main:" + CONFIG_FILE,
+                                          cwd=fork, check=False))
+            self.assertEqual(self.mode(fork), "manual")
+
+        def test_a_version_upstream_only_ever_had_on_a_side_branch_is_upstreams(self):
+            """`--full-history`, not the walk's default. A config upstream carried on a
+            branch it merged keeping its own side (`-s ours`) is TREESAME to the first
+            parent, so the simplified walk follows that parent alone and never sees the
+            file at all. Upstream had those bytes and published them; a fork can hold them
+            without having written a character of them."""
+            fork = make_fork(self.tmp)
+            seed = os.path.join(self.tmp, "seed")
+            side = 'merge = "self"\n# theirs, on a branch\n'
+            commit_upstream(self.tmp, "src/app.py", "theirs\n", "theirs: app")
+            sh("git", "checkout", "-q", "-b", "theirs-side", cwd=seed)
+            write(seed, CONFIG_FILE, side)
+            sh("git", "add", "-A", cwd=seed)
+            sh("git", "commit", "-q", "-m", "theirs: a config on a side branch", cwd=seed)
+            sh("git", "checkout", "-q", "main", cwd=seed)
+            sh("git", "merge", "-q", "-s", "ours", "--no-edit", "theirs-side", cwd=seed)
+            sh("git", "push", "-q", "origin", "main", cwd=seed)
+            self.advance_mirror(fork)
+            self.tips_lack(fork, side)
+            self.assertEqual(sh("git", "rev-list", "upstream/main", "--", CONFIG_FILE,
+                                cwd=fork, check=False), "")      # the simplified walk
+            write(fork, CONFIG_FILE, side)
+            self.assertEqual(self.mode(fork), "manual")
+
+    class TestMergeModeAskedAgainBeforeTheMerge(MergeBase):
+        """The gate reads `origin/<trunk>` before the run's own fetch; `merge_mr` asks
+        `fork_merge_mode` again right before the merge command. A teammate's commit that
+        turned the fork "manual" is on origin but not fetched yet: the gate passes on the
+        stale ref, and the run must end with the request open and nothing merged - exit 6,
+        the record kept for `land`."""
+
+        def stale_self_fork(self) -> Tuple[str, str]:
+            fork = self.self_fork()
+            turned = second_clone_commit(self.tmp, path=CONFIG_FILE,
+                                         content='merge = "manual"\n')
+            self.assertEqual(sh("git", "show", "origin/develop:" + CONFIG_FILE, cwd=fork),
+                             'merge = "self"')                     # what the gate reads
+            return fork, turned
+
+        def not_merged(self, fork: str, branch: str, turned: str, code: int, out: str) -> None:
+            self.assertEqual(code, EXIT_NOT_MERGED, out)
+            self.assertEqual(self.tool_argv_for("gitlab", "merge"), [])
+            self.assertEqual(self.tool_argv_for("gitlab", "create")[:2], ["mr", "create"])
+            self.assertEqual(origin_sha(fork, "develop"), turned)
+            self.assertEqual(origin_sha(fork, branch), rev(fork, "refs/heads/" + branch))
+            self.assertEqual(self.pending_of(fork, branch)["commit"],
+                             rev(fork, "refs/heads/" + branch))
+
+        def test_a_sync(self):
+            fork, turned = self.stale_self_fork()
+            self.upstream_change()
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.not_merged(fork, sync_branch_name(), turned, code, err + out)
+
+        def test_a_ship(self):
+            fork, turned = self.stale_self_fork()
+            name = self.feature(fork)
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.not_merged(fork, name, turned, code, err + out)
+
+        def test_the_fetch_can_make_the_untracked_config_upstreams(self):
+            """What upstream's configs ARE is read again too, not only what the fork's file
+            says. The untracked `.forkflow.toml` here holds bytes no ref in this clone has,
+            so the gate reads it as this fork's own - and the run's own fetch brings the
+            mirror onto the upstream commit that carries exactly those bytes. Kept from the
+            first read, the set would still lack them and the request would be merged on
+            upstream's word; read again, the file is upstream's and nothing this fork wrote
+            says `merge = "self"`."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\n# copied out of the project\n'
+            write(fork, CONFIG_FILE, theirs)
+            self.assertEqual(fork_merge_mode(ctx_for(fork)), MERGE_SELF)
+            second_clone_commit(self.tmp, branch="main", path=CONFIG_FILE, content=theirs)
+            base = origin_sha(fork, "develop")
+            name = self.feature(fork, only_own=True)
+            with on_platform(self.platform("gitlab")):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, EXIT_NOT_MERGED, err + out)
+            self.assertEqual(self.tool_argv_for("gitlab", "merge"), [])
+            self.assertEqual(self.tool_argv_for("gitlab", "create")[:2], ["mr", "create"])
+            self.assertEqual(origin_sha(fork, "develop"), base)        # the trunk is untouched
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+            self.assertEqual(self.pending_of(fork, name)["commit"],
+                             rev(fork, "refs/heads/" + name))
+
+    class TestMergeGate(ShipBase):
+        """`--merge` is config AND flag, refused before the fetch, the backup and any push.
+
+        A reviewed fork must never be merged by accident: the flag alone does nothing, and
+        the refusal comes before anything the run would have to undo - `origin/develop`, the
+        mirror, the backup branches, the sync branch, the feature branch on origin and the
+        state file are all exactly as they were, and the platform tool never ran. Each
+        refusal runs with the origin *named* (`on_platform`) and a merging tool on PATH, so
+        only the condition under test can be what refuses it: without the config condition
+        the run would push, open and merge."""
+
+        REFUSED = "--merge needs"
+        UNNAMED = "names no project"
+        ARRIVED = "Resume without it"
+
+        def feature(self, fork: str, name: str = "feat/x", commits: int = 1,
+                    push: bool = False) -> str:
+            """Own files only: an untracked `.forkflow.toml` must not be committed by the
+            fixture of a test about the untracked config."""
+            return ShipBase.feature(self, fork, name, commits, push, only_own=True)
+
+        def work_state(self, fork: str) -> Optional[dict]:
+            """The state file with the provenance memory taken out - what a run RECORDED,
+            which is what a refused run has to leave exactly as it found it. None when there
+            is no state file at all.
+
+            `upstream_configs` is not a record of work: it is what this clone has written
+            down of the original project's `.forkflow.toml`s (`remember_upstream_configs`),
+            and a run that asks a provenance question writes down what it read whether it
+            then goes on or refuses. That is the whole point of it - what was once
+            upstream's stays upstream's, and a refusal is exactly when it matters."""
+            path = git_path(fork, STATE_FILE)
+            if not os.path.exists(path):
+                return None
+            with open(path) as fh:
+                raw = fh.read()
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                return {"unreadable": raw}
+            if isinstance(data, dict):
+                data.pop("upstream_configs", None)
+                return data or None          # a file holding only the memory is no record
+            return {"not an object": raw}
+
+        def snapshot(self, fork: str) -> tuple:
+            """Everything a run could have changed: every ref on origin and in the clone,
+            and every record in the state file."""
+            return (sh("git", "ls-remote", "origin", cwd=fork),
+                    sh("git", "for-each-ref", "--format=%(refname) %(objectname)", cwd=fork),
+                    self.work_state(fork))
+
+        def refused(self, fork: str, *argv: str, why: str = REFUSED, named: bool = True) -> str:
+            """Exit 2 naming `why`, nothing changed and no platform tool run; answers with
+            the message, for the route it names."""
+            merging_tool(self.tmp, "glab")
+            before = self.snapshot(fork)
+            if named:
+                with on_platform("gitlab"):
+                    code, out, err = run("-C", fork, *argv)
+            else:
+                code, out, err = run("-C", fork, *argv)
+            self.assertEqual(code, 2, " ".join(argv) + ": " + err + out)
+            self.assertIn(why, err)
+            self.assertEqual(self.snapshot(fork), before)
+            self.assertEqual(tool_argv(self.tmp, "glab", "create"), [])
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
+            return err
+
+        def both_refused(self, fork: str, why: str = REFUSED, named: bool = True) -> None:
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            self.refused(fork, "sync", "--merge", why=why, named=named)
+            self.assertEqual(sh("git", "ls-remote", "--heads", "origin",
+                                "refs/heads/" + DEFAULT_BACKUP_PREFIX + "*", cwd=fork), "")
+            self.assertFalse(self.work_state(fork))      # no record of work of any kind
+            self.feature(fork)
+            self.refused(fork, "ship", "--merge", why=why, named=named)
+            self.assertEqual(origin_sha(fork, "feat/x"), "")
+            self.assertFalse(self.work_state(fork))
+
+        @needs_tomllib
+        def test_refused_on_a_manual_fork_with_the_config_committed(self):
+            self.both_refused(make_fork(self.tmp, config='merge = "manual"\n'))
+
+        @needs_tomllib
+        def test_refused_on_a_manual_fork_with_the_config_untracked(self):
+            """`setup` leaves `.forkflow.toml` untracked, and `load_config` reads the
+            working tree: the gate reads it there too - it stays untracked throughout (the
+            feature commit stages its own file only). That the untracked file is read at
+            all is `test_passes_with_merge_self_untracked_as_setup_leaves_it`."""
+            fork = make_fork(self.tmp)
+            write(fork, CONFIG_FILE, 'merge = "manual"\n')
+            self.assertIn("?? " + CONFIG_FILE, sh("git", "status", "--porcelain", cwd=fork))
+            self.both_refused(fork)
+            self.assertIn("?? " + CONFIG_FILE, sh("git", "status", "--porcelain", cwd=fork))
+
+        SELF = 'merge = "self"\n'
+
+        def self_fork(self) -> str:
+            """A fork whose own reviewed config says `merge = "self"`: everything but the
+            condition under test would let `--merge` through."""
+            fork = make_fork(self.tmp, config=self.SELF)
+            self.assertEqual(fork_merge_mode(ctx_for(fork)), MERGE_SELF)
+            self.feature(fork)            # `ship` refuses the trunk before the gate is read
+            return fork
+
+        @needs_tomllib
+        def test_refused_on_a_shallow_clone(self):
+            """Fail CLOSED: a version the walk cannot see is not a version upstream never
+            had. A shallow clone simply does not hold the commits before its cut, so
+            upstream's older `.forkflow.toml`s are missing from the comparison set and
+            upstream's own file reads as this fork's. The refusal names the condition and
+            the command that ends it."""
+            fork = self.self_fork()
+            sh("git", "fetch", "-q", "--depth=1", "upstream", "main", cwd=fork)
+            self.assertEqual(sh("git", "rev-parse", "--is-shallow-repository", cwd=fork),
+                             "true")
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn("shallow", err)
+            self.assertIn("git fetch --unshallow upstream", err)
+            self.assertIn("merged by hand", err)
+
+        @needs_tomllib
+        def test_refused_when_history_is_rewritten_by_a_replace_ref(self):
+            """`refs/replace/*` makes git answer with a history that is not the one the
+            original project published - which is the one the set has to be taken from."""
+            fork = self.self_fork()
+            head = rev(fork, "refs/remotes/upstream/main")
+            sh("git", "replace", "--graft", head, cwd=fork)       # the tip, with no parent
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn("refs/replace/", err)
+            self.assertIn("git replace -l", err)
+
+        @needs_tomllib
+        def test_refused_on_a_partial_clone(self):
+            """A promisor remote means the blobs are fetched on demand: a `.forkflow.toml`
+            upstream had can be absent here, and absence is what reads as "never had it"."""
+            fork = self.self_fork()
+            sh("git", "config", "remote.upstream.promisor", "true", cwd=fork)
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn("partial", err)
+            # the setting itself, so the user can see what the tool saw and unset it
+            self.assertIn("remote.upstream.promisor=true", err)
+
+        def upstream_ref_with_two_config_versions(self, fork: str) -> tuple:
+            """A ref of the original project's carrying two versions of the config, one
+            behind the other: (the tip, the older commit, the older blob). Built as real
+            objects in this clone so that removing one of them is git's own answer about a
+            missing object and not a mocked one."""
+            sh("git", "checkout", "-q", "-b", "tmp/theirs", cwd=fork)
+            write(fork, CONFIG_FILE, 'merge = "self"\n# the version they retired\n')
+            sh("git", "add", CONFIG_FILE, cwd=fork)
+            sh("git", "commit", "-q", "-m", "a version upstream had", cwd=fork)
+            older = rev(fork, "HEAD")
+            blob = sh("git", "rev-parse", older + ":" + CONFIG_FILE, cwd=fork)
+            write(fork, CONFIG_FILE, 'merge = "self"\n# the version they have now\n')
+            sh("git", "add", CONFIG_FILE, cwd=fork)
+            sh("git", "commit", "-q", "-m", "and the one after it", cwd=fork)
+            tip = rev(fork, "HEAD")
+            sh("git", "update-ref", "refs/remotes/upstream/theirs", tip, cwd=fork)
+            sh("git", "checkout", "-q", "feat/x", cwd=fork)
+            sh("git", "branch", "-q", "-D", "tmp/theirs", cwd=fork)
+            return (tip, older, blob)
+
+        def remove_object(self, fork: str, sha: str) -> None:
+            loose = os.path.join(fork, ".git", "objects", sha[:2], sha[2:])
+            self.assertTrue(os.path.exists(loose), loose)
+            os.remove(loose)
+
+        @needs_tomllib
+        def test_refused_when_a_config_at_a_tip_cannot_be_read(self):
+            """The object is gone from this clone, and a ref names the tree that holds it:
+            reading that as "upstream never had these bytes" is the open gate."""
+            fork = self.self_fork()
+            tip, _, _ = self.upstream_ref_with_two_config_versions(fork)
+            self.remove_object(fork, sh("git", "rev-parse", tip + ":" + CONFIG_FILE,
+                                        cwd=fork))
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn("cannot be read", err)
+            self.assertIn("merged by hand", err)
+
+        @needs_tomllib
+        @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                         "root reads a mode-000 file anyway")
+        def test_refused_when_a_config_the_history_lists_cannot_be_read(self):
+            """Not the tip - a version upstream has since replaced, which only the walk
+            lists. The tips all read fine, `rev-list` names the blob from the tree that
+            holds it without opening it, and `cat-file` then cannot produce it: the set
+            would silently be one version short, and that version is exactly the one a fork
+            ends up holding after a sync it never landed. Unreadable rather than gone,
+            because a missing object is what `rev-list` itself refuses - this is the half
+            of it that gets past the walk."""
+            fork = self.self_fork()
+            _, _, blob = self.upstream_ref_with_two_config_versions(fork)
+            loose = os.path.join(fork, ".git", "objects", blob[:2], blob[2:])
+            self.assertTrue(os.path.exists(loose), loose)
+            os.chmod(loose, 0o000)
+            self.addCleanup(os.chmod, loose, 0o444)
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn(short(blob), err)
+            self.assertIn("cannot be read", err)
+
+        @needs_tomllib
+        def test_refused_when_the_history_cannot_be_walked_at_all(self):
+            """A commit missing from the middle: the tips still read, and `rev-list` fails.
+            An empty answer from a walk that failed is not "no config was ever here"."""
+            fork = self.self_fork()
+            tip, older, _ = self.upstream_ref_with_two_config_versions(fork)
+            self.remove_object(fork, older)
+            self.assertTrue(sh("git", "show", tip + ":" + CONFIG_FILE, cwd=fork))
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn("cannot be walked", err)
+            self.assertIn("merged by hand", err)
+
+        @needs_tomllib
+        def test_refused_when_this_clone_holds_nothing_of_upstreams(self):
+            """Nothing outside `origin` is fetched here, so there is no history of the
+            original project's to compare a config against - and an empty set says every
+            file is this fork's own."""
+            fork = self.self_fork()
+            sh("git", "branch", "-q", "-D", "main", cwd=fork)
+            sh("git", "update-ref", "-d", "refs/remotes/upstream/main", cwd=fork)
+            self.assertEqual(foreign_remote_refs(ctx_for(fork)), [])   # HEAD is broken now
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn("no remote-tracking ref outside `origin`", err)
+            self.assertIn("git fetch upstream", err)
+
+        def test_refused_with_no_config_at_all(self):
+            """No file means "manual": the default is the safe side."""
+            self.both_refused(make_fork(self.tmp))
+
+        def test_refused_on_a_real_conflicted_sync_continue(self):
+            """`cmd_sync` dispatches `--continue` before any preflight, and a conflicted sync
+            is exactly when `--continue` is used: the gate sits in front of it. A real
+            conflicted sync, resolved, so nothing but the gate stops the resumed run."""
+            fork = make_fork(self.tmp)
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "ours: shared", push=True)
+            commit_upstream(self.tmp, "shared.tf", self.BASE_TF.replace("count = 1", "count = 3"),
+                            "theirs: shared")
+            self.assertEqual(run("-C", fork, "sync")[0], 4)
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
+            sh("git", "add", "shared.tf", cwd=fork)
+            self.refused(fork, "sync", "--continue", "--merge")
+            self.assertEqual(origin_sha(fork, sync_branch_name()), "")    # nothing pushed
+
+        def test_refused_on_a_real_stopped_ship_continue(self):
+            """A real ship stopped on a rebase conflict, resolved and continued by hand, so
+            `ship --continue` has a ship of ours to resume and only the gate stops it."""
+            fork, name = self.conflicting_ship()
+            self.assertEqual(run("-C", fork, "ship")[0], 4)
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
+            sh("git", "add", "shared.tf", cwd=fork)
+            sh("git", "rebase", "--continue", cwd=fork)
+            self.assertFalse(rebase_in_progress(ctx_for(fork, strict_mirror=False)))
+            self.refused(fork, "ship", "--continue", "--merge")
+            self.assertEqual(origin_sha(fork, name), "")                   # nothing pushed
+
+        @needs_tomllib
+        def test_refused_when_merge_self_arrived_with_the_sync(self):
+            """The fork has no config ("manual"); upstream's `.forkflow.toml` says `merge =
+            "self"` and comes in with a conflicted sync. On `--continue` the working tree is
+            the merge, upstream's file included - that must not switch the gate off, before
+            the merge is committed or after. `--continue --mr`, the route the refusal names,
+            still finishes the sync, opens the request and merges nothing."""
+            fork = make_fork(self.tmp)
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "ours: shared", push=True)
+            commit_upstream(self.tmp, CONFIG_FILE, 'merge = "self"\n', "theirs: forkflow")
+            commit_upstream(self.tmp, "shared.tf", self.BASE_TF.replace("count = 1", "count = 3"),
+                            "theirs: shared")
+            with on_platform("gitlab"):
+                self.assertEqual(run("-C", fork, "sync")[0], 4)
+            with open(os.path.join(fork, CONFIG_FILE)) as fh:
+                self.assertIn('merge = "self"', fh.read())               # upstream's, in the tree
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
+            sh("git", "add", "shared.tf", cwd=fork)
+            self.refused(fork, "sync", "--continue", "--merge", why=self.ARRIVED)
+            sh("git", "commit", "-q", "--no-edit", cwd=fork)             # committed by hand
+            err = self.refused(fork, "sync", "--continue", "--merge", why=self.ARRIVED)
+            name = sync_branch_name()
+            self.assertEqual(origin_sha(fork, name), "")
+            with on_platform("gitlab"):
+                code, out, err = run_printed(err, "forkflow sync --continue", fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
+            # still `--mr`: the request the reviewer merges by hand is opened
+            self.assertEqual(tool_argv(self.tmp, "glab", "create")[:2], ["mr", "create"])
+
+        @needs_tomllib
+        def test_refused_on_a_sync_branch_left_carrying_upstreams_merge_self(self):
+            """The fork has no config ("manual"); upstream's `.forkflow.toml` says `merge =
+            "self"`. `sync --mr` leaves the user on the sync branch, whose tree holds
+            upstream's file: `sync --merge` from there - and `sync --force --merge`, which the
+            old refusal printed and which published `<name>-2` and merged it - are both
+            refused before anything is pushed, and origin's trunk never gets upstream's
+            config unreviewed."""
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, CONFIG_FILE, 'merge = "self"\n', "theirs: forkflow")
+            merging_tool(self.tmp, "glab")
+            trunk = origin_sha(fork, "develop")
+            with on_platform("gitlab"):
+                self.assertEqual(run("-C", fork, "sync", "--mr")[0], 0)
+            name = sync_branch_name()
+            self.assertEqual(checked_out(fork), name)
+            with open(os.path.join(fork, CONFIG_FILE)) as fh:
+                self.assertIn('merge = "self"', fh.read())               # upstream's, in the tree
+            os.unlink(os.path.join(self.tmp, "glab-create-argv.txt"))   # that request is open
+            next_utc_second()
+            self.refused(fork, "sync", "--merge")
+            self.refused(fork, "sync", "--force", "--merge")
+            self.assertEqual(origin_sha(fork, name + "-2"), "")
+            self.assertEqual(origin_sha(fork, "develop"), trunk)
+
+        @needs_tomllib
+        def test_refused_when_upstreams_config_sits_untracked_in_the_working_tree(self):
+            """This fork chose no `merge`. A sync brought upstream's `.forkflow.toml` in and
+            the user untracked it by hand, leaving upstream's bytes on disk in the state
+            `setup` leaves this fork's template in: `ship --merge` merged and landed on
+            upstream's `merge = "self"`, and the ship's `check` ran upstream's `gate` on the
+            way, with no merge request merged by anyone. Refused on the bytes - and one
+            character of this fork's own makes the file, and the gate, this fork's."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = []\n'
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            write(fork, CONFIG_FILE, theirs)
+            self.assertIn("?? " + CONFIG_FILE, sh("git", "status", "--porcelain", cwd=fork))
+            name = self.feature(fork)
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn("byte for byte", err)
+            self.assertEqual(origin_sha(fork, name), "")
+            write(fork, CONFIG_FILE, theirs + "# ours\n")        # this fork's own, now
+            merging_tool(self.tmp, "glab")
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge")[:3], ["mr", "merge", name])
+
+        @needs_tomllib
+        def test_the_refusal_over_upstreams_config_says_whose_it_is_and_names_the_way_back(self):
+            """A sync whose `.forkflow.toml` conflict a person resolved by taking upstream's
+            text leaves upstream's bytes on the trunk. `--merge` is refused - they are not
+            this fork's word - but the message said only that this fork's own config does
+            not say `merge = "self"` about a file that plainly reads `merge = "self"`, and
+            named nothing to do about it. It now says whose file it is, and the way back it
+            prints - edit it in your fork and ship it - works."""
+            ours = 'merge = "self"\ngate = []\n'
+            theirs = 'merge = "self"\n# the project\'s own notes\n'
+            fork = make_fork(self.tmp, config=ours)
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            sh("git", "merge", "upstream/main", cwd=fork, check=False)   # conflicts on it
+            write(fork, CONFIG_FILE, theirs)                             # upstream's side
+            sh("git", "add", CONFIG_FILE, cwd=fork)
+            sh("git", "commit", "-q", "--no-edit", cwd=fork)
+            sh("git", "push", "-q", "origin", "develop", cwd=fork)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertEqual(sh("git", "show", "origin/develop:" + CONFIG_FILE, cwd=fork),
+                             theirs.strip())                     # what the user can read
+            self.feature(fork)
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn("byte for byte", err)
+            self.assertIn("`%s`" % rerun_cmd("ship", argparse.Namespace(mr=True)), err)
+            # the way back, followed: an edit of this fork's own, on a branch, merged
+            sh("git", "checkout", "-q", "-b", "cfg", "origin/develop", cwd=fork)
+            commit_fork(fork, CONFIG_FILE, theirs + "# ours\n", "ours: our own config")
+            sh("git", "push", "-q", "origin", "cfg:refs/heads/develop", cwd=fork)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            self.assertEqual(fork_merge_mode(ctx_for(fork)), "self")
+
+        @needs_tomllib
+        def test_refused_when_the_origin_names_no_project(self):
+            """Knowable at gate time, so not a push followed by a failed merge: the fixture's
+            local-path origin is on no platform and cannot be given to `--repo`."""
+            self.both_refused(make_fork(self.tmp, config='merge = "self"\n'), why=self.UNNAMED,
+                              named=False)
+
+        @needs_tomllib
+        def test_refused_for_a_branch_that_reads_as_a_request_number(self):
+            """The merge is addressed by branch name, and `glab mr merge 123` reads `123`
+            as merge request !123 - refused before anything is pushed."""
+            fork = make_fork(self.tmp, config='merge = "self"\n')
+            self.feature(fork, name="123")
+            self.refused(fork, "ship", "--merge", why="reads as a merge request number")
+            self.assertEqual(origin_sha(fork, "123"), "")
+
+        @needs_tomllib
+        def test_the_ship_that_first_commits_the_config_is_told_which_flag_to_use(self):
+            """`setup` leaves `.forkflow.toml` untracked and `--merge` reads it there. The
+            one ship that first COMMITS it is refused - on a branch the file is neither
+            untracked nor on `origin/<trunk>`, so nothing says "self" until a person has
+            merged it - and that refusal named no command at all: no `forkflow ship --mr`,
+            no `then:` line, and the user had to work the flag out alone. The `in_the_way`
+            path names it; this one does too, and what it names, run as printed, works."""
+            fork = make_fork(self.tmp)
+            write(fork, CONFIG_FILE, 'merge = "self"\n')
+            sh("git", "checkout", "-q", "-b", "cfg", "develop", cwd=fork)
+            sh("git", "add", CONFIG_FILE, cwd=fork)
+            sh("git", "commit", "-q", "-m", "ours: track our config", cwd=fork)
+            err = self.refused(fork, "ship", "--merge")
+            self.assertIn("`%s`" % rerun_cmd("ship", argparse.Namespace(mr=True)), err)
+            self.assertIn("then: forkflow land", err)
+            with on_platform("gitlab"):
+                code, out, err2 = run_printed(err, "forkflow ship", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.assertEqual(tool_argv(self.tmp, "glab", "create")[:2], ["mr", "create"])
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])   # merged by hand
+
+        @needs_tomllib
+        def test_passes_on_a_self_fork_whose_origin_is_named(self):
+            """Both conditions met: the run goes on (a dry run here, which pushes nothing
+            and reaches the merge-request step)."""
+            fork = make_fork(self.tmp, config='merge = "self"\n')
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)   # the dry run does not fetch, and
+            with on_platform("gitlab"):                   # will not conclude from a stale ref
+                code, out, err = run("-C", fork, "sync", "--merge", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertNotIn(self.REFUSED, err)
+            self.feature(fork)
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "ship", "--merge", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertNotIn(self.REFUSED, err)
+            self.assertIn("not run (dry run)", out)              # `--merge` implied `--mr`
+
+        @needs_tomllib
+        def test_passes_with_merge_self_untracked_as_setup_leaves_it(self):
+            """The ordinary solo fork after `setup`: `merge = "self"` in an UNTRACKED
+            `.forkflow.toml`. The gate passes on the file as it is - not only on a committed
+            one - and the run merges and lands, the file still untracked afterwards."""
+            fork = make_fork(self.tmp)
+            write(fork, CONFIG_FILE, 'merge = "self"\n')
+            name = self.feature(fork)
+            self.assertIn("?? " + CONFIG_FILE, sh("git", "status", "--porcelain", cwd=fork))
+            merging_tool(self.tmp, "glab")
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "ship", "--merge")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge")[:3], ["mr", "merge", name])
+            self.assertEqual(origin_sha(fork, "develop"), rev(fork, "refs/heads/develop"))
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(self.pending_of(fork), {})                    # landed, forgotten
+            self.assertIn("?? " + CONFIG_FILE, sh("git", "status", "--porcelain", cwd=fork))
+            # and the sync: upstream tracks no config, so the untracked file is not in the way
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge")[:3],
+                             ["mr", "merge", sync_branch_name()])
+            self.assertEqual(origin_sha(fork, "develop"), rev(fork, "refs/heads/develop"))
+            self.assertEqual(self.pending_of(fork), {})
+
+    def case_insensitive(path: str) -> bool:
+        """Whether the filesystem under `path` opens a file under another case of its name."""
+        probe = os.path.join(path, "forkflow-case-probe")
+        with open(probe, "w"):
+            pass
+        try:
+            return os.path.exists(os.path.join(path, "FORKFLOW-CASE-PROBE"))
+        finally:
+            os.unlink(probe)
+
+    class TestConfigNameCase(ShipBase):
+        """`.forkflow.toml` under another case of its name.
+
+        On a case-insensitive filesystem (the macOS and Windows default) an upstream that
+        commits `.ForkFlow.toml` puts a file in the tree that `open(".forkflow.toml")` reads
+        and git's case-exact `<rev>:.forkflow.toml` and `ls-files` do not see: every check of
+        what the sync merge brought in read "no config on either side", and upstream's `gate`
+        ran with `sh -c` and its `merge = "self"` merged the sync MR. The first two cases hold
+        on any filesystem; the end-to-end ones need a case-insensitive one and skip
+        elsewhere."""
+
+        VARIANT = ".ForkFlow.toml"
+
+        def upstream_variant(self, flag: str) -> None:
+            commit_upstream(self.tmp, self.VARIANT,
+                            'merge = "self"\ngate = ["touch %s"]\n' % flag,
+                            "theirs: forkflow, spelled differently")
+
+        def test_check_refuses_a_variant_in_the_tree_and_runs_no_gate(self):
+            fork = make_fork(self.tmp)
+            flag = os.path.join(self.tmp, "variant-gate-ran")
+            write(fork, self.VARIANT, 'gate = ["touch %s"]\n' % flag)
+            self.assertNotIn(CONFIG_FILE, os.listdir(fork))
+            code, out, err = run("-C", fork, "check")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("`%s`" % self.VARIANT, err)
+            self.assertFalse(os.path.exists(flag))
+
+        def test_a_committed_variant_counts_as_the_config(self):
+            """What "is the config tracked" and "what did this revision carry" answer for a
+            variant - built with plumbing, so no working-tree file is involved and it holds on
+            any filesystem. The exact name wins where a tree holds both."""
+            fork = make_fork(self.tmp)
+            ctx = ctx_for(fork)
+            self.assertFalse(tracked_config_names(fork))
+            self.assertIsNone(config_text(ctx, "HEAD"))
+
+            def blob(text: str) -> str:
+                path = write(self.tmp, "blob.txt", text)
+                return sh("git", "hash-object", "-w", path, cwd=fork)
+
+            sh("git", "update-index", "--add", "--cacheinfo",
+               "100644,%s,%s" % (blob("theirs\n"), self.VARIANT), cwd=fork)
+            self.assertTrue(tracked_config_names(fork))
+            one = sh("git", "commit-tree", sh("git", "write-tree", cwd=fork), "-p", "HEAD",
+                     "-m", "variant only", cwd=fork)
+            self.assertEqual(config_text(ctx, one), "theirs\n")
+            sh("git", "update-index", "--add", "--cacheinfo",
+               "100644,%s,%s" % (blob("ours\n"), CONFIG_FILE), cwd=fork)
+            both = sh("git", "commit-tree", sh("git", "write-tree", cwd=fork), "-p", "HEAD",
+                      "-m", "both", cwd=fork)
+            self.assertEqual(config_text(ctx, both), "ours\n")
+            self.assertIsNone(config_text(ctx, "HEAD"))                   # still none there
+
+        @needs_tomllib
+        def test_a_clean_sync_bringing_a_variant_runs_no_gate(self):
+            """A plain `sync` on a fork with no config of its own: the merge is clean, and
+            before the fix `check` ran upstream's gate from the variant."""
+            fork = make_fork(self.tmp)
+            if not case_insensitive(fork):
+                self.skipTest("the filesystem is case-sensitive")
+            flag = os.path.join(self.tmp, "upstream-gate-ran")
+            self.upstream_variant(flag)
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("`%s`" % self.VARIANT, err)
+            self.assertFalse(os.path.exists(flag))
+            name = sync_branch_name()
+            self.assertEqual(checked_out(fork), name)                    # the merge is made
+            self.assertEqual(origin_sha(fork, name), "")                   # nothing pushed
+            # the route the refusal names, run as printed: the fork has no config of its own,
+            # so the variant takes the exact name, content kept (and a copy kept first),
+            # committed on the sync branch
+            with open(os.path.join(fork, self.VARIANT)) as fh:
+                theirs = fh.read()
+            cmd, kept = remedy_of(err)
+            sh("sh", "-c", cmd, cwd=fork)
+            self.assertIn(CONFIG_FILE, os.listdir(fork))
+            with open(os.path.join(fork, CONFIG_FILE)) as fh:
+                self.assertEqual(fh.read(), theirs)
+            with open(kept) as fh:
+                self.assertEqual(fh.read(), theirs)
+            sh("git", "commit", "-q", "-m", "upstream's config under the name forkflow reads",
+               cwd=fork)
+            code, out, err2 = run_printed(err, "forkflow sync --continue", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+            self.assertFalse(os.path.exists(flag))       # still upstream's gate: shown, not run
+
+        @needs_tomllib
+        def test_a_conflicted_sync_bringing_a_variant_is_not_merged_on_continue(self):
+            fork = make_fork(self.tmp)
+            if not case_insensitive(fork):
+                self.skipTest("the filesystem is case-sensitive")
+            flag = os.path.join(self.tmp, "upstream-gate-ran")
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "ours: shared", push=True)
+            self.upstream_variant(flag)
+            commit_upstream(self.tmp, "shared.tf", self.BASE_TF.replace("count = 1", "count = 3"),
+                            "theirs: shared")
+            merging_tool(self.tmp, "glab")
+            trunk = origin_sha(fork, "develop")
+            with on_platform("gitlab"):
+                self.assertEqual(run("-C", fork, "sync")[0], 4)
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
+            sh("git", "add", "shared.tf", cwd=fork)
+            name = sync_branch_name()
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--continue", "--merge")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("`%s`" % self.VARIANT, err)
+            self.assertFalse(os.path.exists(flag))
+            self.assertEqual(origin_sha(fork, name), "")
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
+            self.assertEqual(origin_sha(fork, "develop"), trunk)
+            # renamed to the exact name, it is upstream's config arriving with the merge:
+            # `--merge` is refused (the fork's own config says nothing), and the gate is
+            # shown rather than run
+            sh("git", "mv", self.VARIANT, CONFIG_FILE, cwd=fork)
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--continue", "--merge")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("--merge needs", err)
+            with on_platform("gitlab"):
+                code, out, err = run_printed(err, "forkflow sync --continue", fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("NOT RUN", out)
+            self.assertFalse(os.path.exists(flag))
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
+            self.assertEqual(origin_sha(fork, "develop"), trunk)
+
+        # -- the remedies: on a case-insensitive filesystem the variant and `.forkflow.toml`
+        # -- are ONE file, so a remedy that deletes or renames "the variant" takes the fork's
+        # -- own config with it. Each is run here exactly as printed, and each must leave the
+        # -- fork's config in place and the file as it was in the copy the message names.
+        # -- On the trunk, the mirror or a detached HEAD nothing is printed to run at all.
+
+        OURS = 'trunk = "develop"\ngate = ["true"]\n'
+
+        def refusal(self, fork: str) -> str:
+            with self.assertRaises(Fail) as cm:
+                load_config(fork)
+            self.assertEqual(cm.exception.code, 2)
+            return str(cm.exception)
+
+        def variant_beside_ours(self, variant_text: str, branch: Optional[str] = "feat/cfg",
+                                on_disk: Optional[str] = None) -> str:
+            """The state a sync leaves on a case-insensitive filesystem, built on any: the
+            fork's `.forkflow.toml` committed, a variant staged beside it, and on disk only
+            the variant's name, holding `on_disk` (`variant_text`, unless the user has edited
+            it since). On `branch` - None stays on the trunk. The index is refreshed (`git
+            status`), as any status the user runs does."""
+            fork = make_fork(self.tmp, config=self.OURS)
+            if branch:
+                sh("git", "checkout", "-q", "-b", branch, cwd=fork)
+            blob = sh("git", "hash-object", "-w", write(self.tmp, "blob.txt", variant_text),
+                      cwd=fork)
+            sh("git", "update-index", "--add", "--cacheinfo",
+               "100644,%s,%s" % (blob, self.VARIANT), cwd=fork)
+            os.unlink(os.path.join(fork, CONFIG_FILE))
+            write(fork, self.VARIANT, variant_text if on_disk is None else on_disk)
+            self.assertNotIn(CONFIG_FILE, os.listdir(fork))
+            sh("git", "status", "--porcelain", cwd=fork)
+            return fork
+
+        def assert_ours_back(self, fork: str) -> None:
+            """The fork's own config back under its exact name, content and index alike, and
+            the variant out of the index."""
+            self.assertIn(CONFIG_FILE, os.listdir(fork))
+            with open(os.path.join(fork, CONFIG_FILE)) as fh:
+                self.assertEqual(fh.read(), self.OURS)
+            self.assertEqual(load_config(fork), {"trunk": "develop", "gate": ["true"]})
+            self.assertEqual(sh("git", "show", ":" + CONFIG_FILE, cwd=fork), self.OURS.strip())
+            self.assertNotIn(self.VARIANT, sh("git", "ls-files", cwd=fork).splitlines())
+
+        def run_remedy(self, fork: str, was: str) -> None:
+            """The printed remedy, run as printed: it succeeds, and the copy it names holds
+            `was` - what the working file held before it ran."""
+            cmd, kept = remedy_of(self.refusal(fork))
+            sh("sh", "-c", cmd, cwd=fork)
+            self.assertEqual(os.path.dirname(kept), os.path.dirname(git_path(fork, "x")))
+            with open(kept) as fh:
+                self.assertEqual(fh.read(), was)
+
+        @needs_tomllib
+        def test_the_index_only_remedy_brings_the_forks_config_back(self):
+            fork = self.variant_beside_ours('gate = ["touch theirs"]\n')
+            self.run_remedy(fork, 'gate = ["touch theirs"]\n')
+            self.assert_ours_back(fork)
+
+        @needs_tomllib
+        def test_the_index_only_remedy_holds_when_the_two_hold_the_same_bytes(self):
+            """`git rm --cached <variant> && git checkout -- .forkflow.toml` leaves the file
+            under the variant's name when the bytes match and the index is fresh: checkout
+            sees an up-to-date entry and writes nothing, and the refusal comes straight back.
+            Both names leave the index, so the checkout from HEAD writes the file anew."""
+            fork = self.variant_beside_ours(self.OURS)
+            self.run_remedy(fork, self.OURS)
+            self.assert_ours_back(fork)
+
+        @needs_tomllib
+        def test_an_edit_made_before_the_remedy_is_in_the_copy(self):
+            """The refusal used to invite an edit of the file, and the checkout from HEAD
+            then overwrote it with no copy anywhere: the copy is made first."""
+            fork = self.variant_beside_ours(self.OURS, on_disk=self.OURS + "# mine\n")
+            self.run_remedy(fork, self.OURS + "# mine\n")
+            self.assert_ours_back(fork)
+
+        @needs_tomllib
+        def test_the_remedy_goes_through_where_git_rm_cached_refuses(self):
+            """The staged variant differs from both the file and HEAD - the middle of a merge
+            with the file edited since: `git rm --cached` refuses and suggests `-f`, which
+            the user would follow. The remedy asks neither."""
+            fork = self.variant_beside_ours('gate = ["touch theirs"]\n', on_disk="# mine\n")
+            p = subprocess.run(["git", "rm", "--cached", "-q", "--", self.VARIANT], cwd=fork,
+                               capture_output=True)
+            self.assertNotEqual(p.returncode, 0)                           # the refusing state
+            self.run_remedy(fork, "# mine\n")
+            self.assert_ours_back(fork)
+
+        def test_the_rename_remedy_warns_that_a_config_a_sync_brought_stays_upstreams(self):
+            """`git mv` gives upstream's file the exact name and nothing more: the sync
+            still treats it as upstream's - its `gate` shown rather than run - and `--merge`
+            is refused while the bytes are upstream's, until this fork edits the file
+            itself. The clause naming `--merge` was dropped once, and the remedy then read
+            as "rename it and it is yours"."""
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "-q", "-b", "feat/cfg", cwd=fork)
+            write(fork, self.VARIANT, 'trunk = "develop"\n')
+            sh("git", "add", self.VARIANT, cwd=fork)
+            sh("git", "commit", "-q", "-m", "a config, spelled differently", cwd=fork)
+            err = self.refusal(fork)
+            self.assertIn("git mv", err)
+            self.assertIn("`gate` is shown rather than run", err)
+            self.assertIn("`--merge` is refused", err)
+
+        @needs_tomllib
+        def test_a_tracked_variant_alone_is_renamed_with_its_content(self):
+            """No `.forkflow.toml` is tracked: the variant is the only config there is, and
+            `git mv` gives it the exact name - nothing deleted."""
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "-q", "-b", "feat/cfg", cwd=fork)
+            write(fork, self.VARIANT, 'trunk = "develop"\n')
+            sh("git", "add", self.VARIANT, cwd=fork)
+            sh("git", "commit", "-q", "-m", "a config, spelled differently", cwd=fork)
+            self.run_remedy(fork, 'trunk = "develop"\n')
+            self.assertIn(CONFIG_FILE, os.listdir(fork))
+            self.assertNotIn(self.VARIANT, os.listdir(fork))
+            self.assertEqual(load_config(fork), {"trunk": "develop"})
+            self.assertEqual(sh("git", "ls-files", CONFIG_FILE, cwd=fork), CONFIG_FILE)
+
+        @needs_tomllib
+        def test_on_the_trunk_nothing_is_run_and_the_fix_goes_on_a_branch(self):
+            """The fork's config committed on its trunk under a variant name - which worked
+            before variants were refused. On `develop`, and on a detached HEAD, the refusal
+            names nothing to run: a commit there never reaches origin and every later `land`
+            refuses the trunk. On a branch off `origin/develop` it names the rename, which run
+            as printed and committed leaves the trunk, local and on origin, as it was."""
+            fork = make_fork(self.tmp)
+            write(fork, self.VARIANT, 'trunk = "develop"\n')
+            sh("git", "add", self.VARIANT, cwd=fork)
+            sh("git", "commit", "-q", "-m", "fork: config, spelled differently", cwd=fork)
+            sh("git", "push", "-q", "origin", "develop", cwd=fork)
+            sh("git", "fetch", "-q", "origin", cwd=fork)
+            trunk = rev(fork, "refs/heads/develop")
+            no_remedy(self.refusal(fork))
+            sh("git", "checkout", "-q", "--detach", cwd=fork)
+            no_remedy(self.refusal(fork))
+            sh("git", "checkout", "-q", "-b", "fix/config", "origin/develop", cwd=fork)
+            self.run_remedy(fork, 'trunk = "develop"\n')
+            sh("git", "commit", "-q", "-m", "the config under its exact name", cwd=fork)
+            self.assertEqual(load_config(fork), {"trunk": "develop"})
+            self.assertEqual(rev(fork, "refs/heads/develop"), trunk)
+            self.assertEqual(origin_sha(fork, "develop"), trunk)
+            self.assertEqual(sh("git", "ls-files", "--", CONFIG_FILE, cwd=fork), CONFIG_FILE)
+
+        @needs_tomllib
+        def test_the_index_state_on_the_trunk_names_nothing_to_run(self):
+            fork = self.variant_beside_ours('gate = ["touch theirs"]\n', branch=None)
+            no_remedy(self.refusal(fork))
+
+        def test_a_trunk_of_another_name_is_known_by_origins_default_branch(self):
+            """The config naming the trunk is the file that cannot be read: `origin/HEAD`
+            (which `setup` sets, and whose platform default its report insists on) says it."""
+            fork = make_fork(self.tmp, trunk="trunk")
+            self.assertEqual(checked_out(fork), "trunk")
+            write(fork, self.VARIANT, 'trunk = "trunk"\n')
+            sh("git", "add", self.VARIANT, cwd=fork)
+            sh("git", "commit", "-q", "-m", "fork: config, spelled differently", cwd=fork)
+            no_remedy(self.refusal(fork))
+
+        def test_the_trunk_and_the_mirror_are_the_only_branches_that_refuse_a_commit(self):
+            """`no_commit_here` encodes rules 2 and 6 and nothing besides. The mirror is
+            known by its name, the config that would name it being the file that cannot be
+            read: the default, and any name the original project's remote has a branch of
+            (`main` beside `upstream/main`, which is what `setup` bootstraps). A branch of
+            the fork's own refuses nothing, however little of its own it carries - it used
+            to refuse whenever it held only upstream's commits, which on a fresh fork is
+            every branch there is."""
+            fork = make_fork(self.tmp)
+            sh("git", "push", "-q", "origin", "main:refs/heads/release",
+               cwd=os.path.join(self.tmp, "seed"))              # another upstream branch
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            sh("git", "branch", "release", "develop", cwd=fork)
+            sh("git", "branch", "feat/x", "develop", cwd=fork)
+            for branch, why in (("develop", "origin's default branch"),
+                                ("main", "is the mirror"), ("release", "is the mirror"),
+                                ("feat/x", "")):
+                sh("git", "checkout", "-q", branch, cwd=fork)
+                answer = no_commit_here(fork, "develop")
+                if why:
+                    self.assertIn(why, answer, branch)
+                else:
+                    self.assertEqual(answer, "", branch)
+            sh("git", "checkout", "-q", "--detach", cwd=fork)
+            self.assertEqual(no_commit_here(fork, "develop"), "HEAD is detached")
+
+        @needs_tomllib
+        def test_a_fresh_fork_of_a_project_that_tracks_a_variant_is_not_a_dead_end(self):
+            """The project itself tracks `.ForkFlow.toml`, and the fork is new: `develop`,
+            `main` and every branch off `origin/develop` are all still at upstream's tip.
+            Each of them answered "carries nothing but upstream's commits" and named no
+            command, so `forkflow setup` - the first command a new fork runs - and the very
+            branch its advice sends you to were both dead ends, with only an unrelated
+            commit leading out. The trunk and the mirror still name no command; the branch
+            they send you to names the rename, which run as printed leaves the config
+            readable."""
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, self.VARIANT, 'gate = ["true"]\n', "theirs: variant")
+            push_upstream_into_origin(self.tmp, "develop")
+            push_upstream_into_origin(self.tmp, "main")
+            sh("git", "fetch", "-q", "--prune", "origin", cwd=fork)
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            sh("git", "merge", "-q", "--ff-only", "origin/develop", cwd=fork)
+            self.assertIn(self.VARIANT, os.listdir(fork))
+            code, out, err = run("-C", fork, "setup")
+            self.assertEqual(code, 2, err + out)
+            no_remedy(err)                                   # rule 2: nothing to run here
+            self.assertIn("branch off `origin/develop`", err)
+            sh("git", "checkout", "-q", "main", cwd=fork)
+            sh("git", "merge", "-q", "--ff-only", "origin/main", cwd=fork)
+            no_remedy(self.refusal(fork))                    # rule 6: nor here
+            sh("git", "checkout", "-q", "-b", "fix/config", "origin/develop", cwd=fork)
+            self.run_remedy(fork, 'gate = ["true"]\n')
+            sh("git", "commit", "-q", "-m", "the config under its exact name", cwd=fork)
+            self.assertEqual(load_config(fork), {"gate": ["true"]})
+
+        def test_on_the_mirror_nothing_is_run(self):
+            """Upstream tracks a variant and the mirror is checked out: the file is upstream's,
+            and a commit on the mirror breaks every later sync and setup - nothing to run."""
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, self.VARIANT, 'gate = ["true"]\n', "theirs: variant")
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            sh("git", "checkout", "-q", "main", cwd=fork)
+            sh("git", "merge", "-q", "--ff-only", "upstream/main", cwd=fork)
+            mirror = rev(fork, "refs/heads/main")
+            no_remedy(self.refusal(fork))
+            self.assertEqual(rev(fork, "refs/heads/main"), mirror)
+
+        def test_a_merge_whose_copy_left_the_index_names_nothing_to_run(self):
+            """Mid-merge, upstream's variant taken out of the index by hand: the file on disk
+            is upstream's, untracked. Renamed to the exact name it would be read as this
+            fork's config - its `gate` run - so nothing is named."""
+            fork = make_fork(self.tmp)
+            sh("git", "checkout", "-q", "-b", "side", cwd=fork)
+            write(fork, self.VARIANT, 'gate = ["touch theirs"]\n')
+            commit_fork(fork, "src/app.py", "side\n", "side: variant and app")
+            sh("git", "checkout", "-q", "-b", "sync/upstream-x", "develop", cwd=fork)
+            commit_fork(fork, "src/app.py", "ours\n", "ours: app")
+            sh("git", "merge", "side", cwd=fork, check=False)
+            sh("git", "rm", "-q", "--cached", self.VARIANT, cwd=fork)
+            self.assertIn(self.VARIANT, os.listdir(fork))
+            no_remedy(self.refusal(fork))
+
+        def test_a_variant_upstream_adds_is_in_the_way_where_the_filesystem_folds_case(self):
+            """The collision check before the backup, on any filesystem: an upstream
+            `.ForkFlow.toml` is in the way of this fork's untracked `.forkflow.toml` exactly
+            when the two names open one file - asked of the filesystem, and answered here by a
+            stand-in for each kind. The name reported is the one on disk."""
+            fork = make_fork(self.tmp)
+            write(fork, CONFIG_FILE, "# ours, untracked\n")
+            target = commit_upstream(self.tmp, self.VARIANT, "gate = []\n", "theirs: forkflow")
+            sh("git", "fetch", "upstream", cwd=fork)
+            ctx = ctx_for(fork)
+
+            def one_file(a: str, b: str) -> bool:
+                return a.casefold() == b.casefold()
+
+            with mock.patch.object(os.path, "samefile", side_effect=one_file):
+                self.assertEqual(untracked_in_the_way(ctx, target), [CONFIG_FILE])
+            with mock.patch.object(os.path, "samefile", return_value=False):
+                self.assertEqual(untracked_in_the_way(ctx, target), [])
+            # git-ignored, the file is one git would write over without a word: still in the way
+            with open(os.path.join(fork, ".git", "info", "exclude"), "a") as fh:
+                fh.write(CONFIG_FILE + "\n")
+            self.assertNotIn(CONFIG_FILE, sh("git", "status", "--porcelain", cwd=fork))
+            with mock.patch.object(os.path, "samefile", side_effect=one_file):
+                self.assertEqual(untracked_in_the_way(ctx, target), [CONFIG_FILE])
+
+        @needs_tomllib
+        def test_the_in_the_way_advice_says_when_the_untracked_config_is_upstreams(self):
+            """`setup`'s untracked template and upstream's own file, left untracked after a
+            sync, are the same shape on disk. The advice called both "this fork's own
+            config" and sent the user to commit and ship it - which for upstream's bytes
+            puts upstream's word on the trunk and leaves `--merge` refused there, with
+            nothing in the message saying so. The bytes decide what the sentence says."""
+            fork = make_fork(self.tmp)
+            theirs = 'merge = "self"\ngate = []\n'
+            commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
+            write(fork, CONFIG_FILE, theirs)              # upstream's file, untracked here
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("the original project's own file", err)
+            self.assertIn("`--merge` stays refused", err)
+            # and it says WHERE those bytes were found rather than asserting a cause it
+            # cannot know: "brought in by a sync and untracked since" reads exactly the same
+            # for a teammate's fork of this fork, added as a remote (`config_match_note`)
+            self.assertIn("the history of `upstream`", err)
+            self.assertNotIn("brought in by a sync", err)
+            write(fork, CONFIG_FILE, theirs + "# ours\n")          # this fork's own, now
+            code, out, err = run("-C", fork, "sync")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("is this fork's own config, untracked", err)
+            self.assertNotIn("the original project's own file", err)
+
+        @needs_tomllib
+        def test_an_ignored_untracked_config_is_in_the_way_before_the_backup(self):
+            """setup's `.forkflow.toml`, kept out of `git status` with `info/exclude`, and
+            upstream starts tracking one: git writes over an ignored file without a word, and
+            `sync --merge` merged and landed upstream's config - this fork's `merge`, `gate`
+            and settings gone. Refused before the backup, the file untouched."""
+            fork = make_fork(self.tmp)
+            ours = 'merge = "self"\ngate = ["true"]\n# my settings\n'
+            path = write(fork, CONFIG_FILE, ours)
+            with open(os.path.join(fork, ".git", "info", "exclude"), "a") as fh:
+                fh.write(CONFIG_FILE + "\n")
+            self.assertEqual(sh("git", "status", "--porcelain", cwd=fork), "")
+            commit_upstream(self.tmp, CONFIG_FILE, 'gate = ["true"]\n', "theirs: forkflow")
+            merging_tool(self.tmp, "glab")
+            trunk = origin_sha(fork, "develop")
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.assertEqual(code, 2, err + out)
+            self.assertEqual(sh("git", "ls-remote", "origin", "refs/heads/backup/*", cwd=fork),
+                             "")
+            self.assertNotIn(sync_branch_name(), local_branches(fork))
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(origin_sha(fork, "develop"), trunk)
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
+            with open(path) as fh:
+                self.assertEqual(fh.read(), ours)
+
+        @needs_tomllib
+        def test_a_config_gone_from_the_tree_mid_sync_is_put_back_before_it_goes_on(self):
+            """A conflict on upstream's `.ForkFlow.toml` resolved with `git rm` deletes the one
+            file a case-insensitive filesystem holds for both names: the fork's
+            `.forkflow.toml` is still in the index and gone from the tree, and `sync
+            --continue` went on with no config - "gate none configured". Built on any
+            filesystem by removing the file; the command printed, run as printed, puts it back
+            and the resumed sync runs the fork's gate."""
+            flag = os.path.join(self.tmp, "fork-gate-ran")
+            config = 'gate = ["touch %s"]\n' % flag
+            fork = make_fork(self.tmp, config=config)
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "ours: shared", push=True)
+            commit_upstream(self.tmp, "shared.tf", self.BASE_TF.replace("count = 1", "count = 3"),
+                            "theirs: shared")
+            self.assertEqual(run("-C", fork, "sync")[0], 4)
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
+            sh("git", "add", "shared.tf", cwd=fork)
+            os.unlink(os.path.join(fork, CONFIG_FILE))
+            code, out, err = run("-C", fork, "sync", "--continue")
+            self.assertEqual(code, 2, err + out)
+            name = sync_branch_name()
+            self.assertEqual(origin_sha(fork, name), "")
+            self.assertFalse(os.path.exists(flag))
+            sh("sh", "-c", printed_cmd(err, "git checkout"), cwd=fork)
+            with open(os.path.join(fork, CONFIG_FILE)) as fh:
+                self.assertEqual(fh.read(), config)
+            code, out, err = run_printed(err, "forkflow sync --continue", fork)
+            self.assertEqual(code, 0, err + out)
+            self.assertTrue(os.path.exists(flag))
+            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
+
+        @needs_tomllib
+        def test_an_untracked_config_meets_upstreams_variant_before_the_backup(self):
+            """setup's untracked `.forkflow.toml` and upstream's `.ForkFlow.toml`: one file
+            here. The case-exact check let `sync --merge` push a backup and create the sync
+            branch before git refused the merge, and its "remove them" deleted this fork's
+            config for good. Now it is refused before the backup - and every command printed
+            on the way, run as printed, ends with the sync merged, landed, and this fork's
+            config and gate the ones in force."""
+            fork = make_fork(self.tmp)
+            if not case_insensitive(fork):
+                self.skipTest("the filesystem is case-sensitive")
+            ours_flag = os.path.join(self.tmp, "fork-gate-ran")
+            theirs_flag = os.path.join(self.tmp, "upstream-gate-ran")
+            ours = 'merge = "self"\ngate = ["touch %s"]\n' % ours_flag
+            path = write(fork, CONFIG_FILE, ours)
+            self.upstream_variant(theirs_flag)
+            merging_tool(self.tmp, "glab")
+            trunk = origin_sha(fork, "develop")
+
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--merge")
+            self.assertEqual(code, 2, err + out)
+            self.assertEqual(sh("git", "ls-remote", "origin", "refs/heads/backup/*", cwd=fork),
+                             "")
+            self.assertNotIn("backup/", local_branches(fork))
+            self.assertNotIn(sync_branch_name(), local_branches(fork))
+            self.assertEqual(origin_sha(fork, sync_branch_name()), "")
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(origin_sha(fork, "develop"), trunk)
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
+            self.assertIn(CONFIG_FILE, os.listdir(fork))
+            with open(path) as fh:
+                self.assertEqual(fh.read(), ours)
+
+            # commit it on a branch off the trunk and ship it - as printed, `--mr`: committed
+            # on a branch it is neither untracked nor on origin/develop, so nothing says
+            # "self" until a person has merged it - then land it
+            sh("git", "checkout", "-q", "-b", "cfg", "origin/develop", cwd=fork)
+            sh("git", "add", CONFIG_FILE, cwd=fork)
+            sh("git", "commit", "-q", "-m", "ours: forkflow config", cwd=fork)
+            with on_platform("gitlab"):
+                code, out, err2 = run_printed(err, "forkflow ship", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.assertEqual(tool_argv(self.tmp, "glab", "create")[:2], ["mr", "create"])
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
+            self.move_trunk(origin_sha(fork, "cfg"))                     # merged by a person
+            code, out, err2 = run("-C", fork, "land")
+            self.assertEqual(code, 0, err2 + out)
+            self.assertEqual(sh("git", "show", "origin/develop:" + CONFIG_FILE, cwd=fork),
+                             ours.strip())
+            # then the sync again: now the merge is made, and the variant beside the fork's
+            # own config is refused - with the index-only way back
+            os.unlink(ours_flag)
+            next_utc_second()
+            with on_platform("gitlab"):
+                code, out, err = run_printed(err, "forkflow sync", fork)
+            self.assertEqual(code, 2, err + out)
+            self.assertFalse(os.path.exists(theirs_flag))
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])    # nothing merged yet
+            with open(path) as fh:
+                theirs = fh.read()                                 # what the merge put there
+            cmd, kept = remedy_of(err)
+            sh("sh", "-c", cmd, cwd=fork)
+            with open(kept) as fh:
+                self.assertEqual(fh.read(), theirs)
+            with open(path) as fh:
+                self.assertEqual(fh.read(), ours)
+            self.assertIn(CONFIG_FILE, os.listdir(fork))
+            sh("git", "commit", "-q", "-m", "keep this fork's config", cwd=fork)
+            with on_platform("gitlab"):
+                code, out, err2 = run_printed(err, "forkflow sync --continue", fork)
+            self.assertEqual(code, 0, err2 + out)
+            self.assertTrue(os.path.exists(ours_flag))                   # the fork's gate ran
+            self.assertFalse(os.path.exists(theirs_flag))
+            self.assertEqual(tool_argv(self.tmp, "glab", "merge")[:3],
+                             ["mr", "merge", sync_branch_name()])
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(origin_sha(fork, "develop"), rev(fork, "refs/heads/develop"))
+            tree = sh("git", "ls-tree", "--name-only", "origin/develop", cwd=fork).splitlines()
+            self.assertIn(CONFIG_FILE, tree)
+            self.assertNotIn(self.VARIANT, tree)
+            with open(path) as fh:
+                self.assertEqual(fh.read(), ours)
+            self.assertEqual(self.pending_of(fork), {})
+
+        @needs_tomllib
+        def test_a_conflicted_sync_beside_the_forks_tracked_config_resumes_intact(self):
+            """The fork tracks `.forkflow.toml`; the sync conflicts elsewhere and brings
+            upstream's variant, and the user edits the file in the middle of it. `sync
+            --continue --merge` is refused with the index-only way back; run as printed -
+            where `git rm --cached` refused and suggested `-f` - committed, and resumed, this
+            fork's gate runs and its config is what lands, the edit in the copy named.
+            `git rm .ForkFlow.toml` - the old advice - took the fork's working
+            `.forkflow.toml` with it."""
+            flag = os.path.join(self.tmp, "fork-gate-ran")
+            ours = 'merge = "self"\ngate = ["touch %s"]\n' % flag
+            fork = make_fork(self.tmp, config=ours)
+            if not case_insensitive(fork):
+                self.skipTest("the filesystem is case-sensitive")
+            theirs_flag = os.path.join(self.tmp, "upstream-gate-ran")
+            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
+                        "ours: shared", push=True)
+            self.upstream_variant(theirs_flag)
+            commit_upstream(self.tmp, "shared.tf", self.BASE_TF.replace("count = 1", "count = 3"),
+                            "theirs: shared")
+            merging_tool(self.tmp, "glab")
+            with on_platform("gitlab"):
+                self.assertEqual(run("-C", fork, "sync", "--merge")[0], 4)
+            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
+            sh("git", "add", "shared.tf", cwd=fork)
+            with open(os.path.join(fork, CONFIG_FILE), "a") as fh:
+                fh.write("# my edit\n")                                    # the one file on disk
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--continue", "--merge")
+            self.assertEqual(code, 2, err + out)
+            self.assertEqual(origin_sha(fork, sync_branch_name()), "")
+            with open(os.path.join(fork, CONFIG_FILE)) as fh:
+                edited = fh.read()
+            self.assertIn("# my edit", edited)
+            cmd, kept = remedy_of(err)
+            sh("sh", "-c", cmd, cwd=fork)
+            with open(kept) as fh:
+                self.assertEqual(fh.read(), edited)
+            path = os.path.join(fork, CONFIG_FILE)
+            self.assertIn(CONFIG_FILE, os.listdir(fork))
+            with open(path) as fh:
+                self.assertEqual(fh.read(), ours)
+            sh("git", "commit", "-q", "--no-edit", cwd=fork)
+            with on_platform("gitlab"):
+                code, out, err = run("-C", fork, "sync", "--continue", "--merge")
+            self.assertEqual(code, 0, err + out)
+            self.assertTrue(os.path.exists(flag))
+            self.assertFalse(os.path.exists(theirs_flag))
+            self.assertEqual(checked_out(fork), "develop")
+            self.assertEqual(sh("git", "show", "origin/develop:" + CONFIG_FILE, cwd=fork),
+                             ours.strip())
+            self.assertNotIn(self.VARIANT, sh("git", "ls-tree", "--name-only", "origin/develop",
+                                              cwd=fork).splitlines())
 
     class TestParseArgs(unittest.TestCase):
         def test_common_flags_before_or_after_the_subcommand(self):
@@ -8607,6 +16945,20 @@ def run_tests() -> None:
                 self.assertEqual(parse_args(argv).dir, "/x", argv)
             for argv in (["--force", "setup"], ["setup", "--force"]):
                 self.assertTrue(parse_args(argv).force, argv)
+
+        def test_the_dry_run_help_does_not_promise_a_fetch(self):
+            """A flag's own help is the first place anybody reads what it does, and this one
+            still said "(it does fetch, and simulates the merge)" long after the no-write
+            contract stopped it fetching - a fetch moves `FETCH_HEAD` and `refs/remotes/*`
+            and brings objects in, so `fetch_preview` asks `git ls-remote` instead. Read out
+            of the parser, so the sentence a user is shown is the one under test."""
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+                parse_args(["--help"])
+            text = " ".join(out.getvalue().split())
+            self.assertIn("--dry-run", text)
+            self.assertIn("fetch nothing", text)
+            self.assertNotIn("does fetch", text)
 
         def test_defaults(self):
             args = parse_args(["status"])
@@ -8623,6 +16975,37 @@ def run_tests() -> None:
                 self.assertEqual(parse_args([cmd, "--title", "t"]).title, "t", cmd)
                 self.assertFalse(parse_args([cmd]).mr, cmd)
                 self.assertIsNone(parse_args([cmd]).title, cmd)
+
+        def test_merge_implies_mr_and_not_the_other_way_round(self):
+            """Merging a merge request means opening it first; opening one never means
+            merging it."""
+            for cmd in ("sync", "ship"):
+                args = parse_args([cmd, "--merge"])
+                self.assertTrue(args.merge, cmd)
+                self.assertTrue(args.mr, cmd)
+                args = parse_args([cmd, "--mr"])
+                self.assertTrue(args.mr, cmd)
+                self.assertFalse(args.merge, cmd)
+                self.assertFalse(parse_args([cmd]).merge, cmd)
+            for argv in (["--dry-run", "ship", "--merge"], ["ship", "--merge", "--dry-run"]):
+                args = parse_args(argv)
+                self.assertTrue(args.mr and args.dry_run, argv)
+
+        def test_land_takes_the_common_flags_and_one_optional_branch(self):
+            self.assertIs(COMMANDS["land"], cmd_land)
+            for argv in (["land", "--force"], ["--force", "land"]):
+                args = parse_args(argv)
+                self.assertEqual((args.cmd, args.force, args.dry_run), ("land", True, False), argv)
+                self.assertIsNone(args.branch)
+            args = parse_args(["land", "--dry-run", "-C", "/x"])
+            self.assertEqual((args.force, args.dry_run, args.dir), (False, True, "/x"))
+            for argv in (["land", "feat/a", "--force"], ["--force", "land", "feat/a"]):
+                args = parse_args(argv)
+                self.assertEqual((args.branch, args.force), ("feat/a", True), argv)
+            with self.assertRaises(SystemExit):        # `--merge` belongs to sync and ship
+                capture(parse_args, ["land", "--merge"])
+            with self.assertRaises(SystemExit):        # one branch, not a list
+                capture(parse_args, ["land", "feat/a", "feat/b"])
 
         def test_no_subcommand_is_exit_2(self):
             code, _, err = capture(main, [])
@@ -8672,6 +17055,7 @@ def run_tests() -> None:
             with open(os.path.abspath(__file__), encoding="utf-8") as fh:
                 src = fh.read()
             tree = ast.parse(src)
+            cls.tree = tree
             cls.limit = next(n.lineno for n in tree.body
                              if isinstance(n, ast.FunctionDef) and n.name == "run_tests")
             funcs = [n for n in ast.walk(tree)
@@ -8711,15 +17095,352 @@ def run_tests() -> None:
 
         def test_only_advance_mirror_moves_the_mirror(self):
             self.assertEqual(self.owners('"update-ref"'), {"advance_mirror"})
-            self.assertEqual(self.owners('"merge", "--ff-only"'), {"advance_mirror"})
+
+        def test_the_two_fast_forwards_are_the_mirror_and_the_trunk_landing(self):
+            """`land_trunk` joined `advance_mirror` as an owner of `merge --ff-only` when
+            `land` came: the local trunk moves only by fast-forward, only there, and never
+            by a ref move (`git branch -f` stays blocked, `update-ref` stays the mirror's)."""
+            self.assertEqual(self.owners('"merge", "--ff-only"'), {"advance_mirror", "land_trunk"})
+
+        def test_a_dry_run_reaches_no_command_that_writes(self):
+            """`--dry-run` promises to write nothing, and two git commands were writing
+            under it: `git fetch` rewrites `FETCH_HEAD`, moves the remote-tracking refs and
+            brings objects in, and `git merge-tree --write-tree` writes the merged tree and
+            a blob per conflict. So `fetch` is spelled in one place, which answers a dry run
+            with `ls-remote` instead (`fetch_preview` - one round trip, nothing written),
+            and `merge-tree` is spelled in one place, which sends the objects it writes to a
+            scratch directory. A caller added later cannot spell either for itself."""
+            self.assertEqual(self.owners('"merge-tree"'), {"merge_tree"})
+            self.assertEqual(self.owners('["fetch"]'), {"fetch", "fetch_preview"})
+            self.assertEqual(self.owners("fetch_preview("), {"fetch_preview", "fetch"})
 
         def test_the_only_rebase_is_of_a_feature_branch(self):
             self.assertEqual(self.owners('"rebase"'), {"rebase_onto"})
 
         def test_git_and_the_platform_tools_are_the_only_subprocesses(self):
+            """`run_tool` took over the platform-tool call from `open_mr` when the merge
+            step (`merge_mr`) came to share it: a rename of the one owner, not a widening
+            of the set."""
             self.assertEqual(self.owners("subprocess"),      # `<module>` is the import
-                             {"git", "git_ok", "git_rc", "shell", "open_mr", "api_get",
+                             {"git", "git_ok", "git_rc", "shell", "run_tool", "api_get",
                               "<module>"})
+            # `run_tool` runs whatever it is handed, so who hands it something is pinned too:
+            # the merge request's two steps and nothing else
+            self.assertEqual(self.owners("run_tool("), {"run_tool", "open_mr", "merge_mr"})
+
+        def test_every_printed_sync_and_ship_command_comes_from_rerun_cmd(self):
+            """A printed `forkflow sync ...` / `forkflow ship ...` spelled out by hand drops
+            the `--merge` (or `--mr`) the run was given, and a hand-built `forkflow land`
+            drops the `--force` or the branch - found at one site after another, for both.
+            So no string in the code spells one except the builder's own: `rerun_cmd`
+            (behind `continue_cmd`) writes every `forkflow sync` and `forkflow ship`,
+            `land_cmd` every `forkflow land`, and `header`'s title line is the one other
+            `forkflow {...}`. Every
+            string literal and f-string is read, adjacent pieces joined as Python joins them;
+            docstrings are prose and are skipped (comments never reach the tree). A string
+            that ends in the word `forkflow` is the head of one assembled with `+` or
+            `str.join` - `argparse`'s program name is the one there is."""
+            import ast
+            prose = {id(n.value) for n in ast.walk(self.tree)
+                     if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)}
+            parts = {id(v) for n in ast.walk(self.tree) if isinstance(n, ast.JoinedStr)
+                     for v in n.values}
+            spelled, built, headed = set(), set(), set()
+            for n in ast.walk(self.tree):
+                if getattr(n, "lineno", self.limit) >= self.limit:
+                    continue
+                if isinstance(n, ast.JoinedStr):
+                    text = "".join(v.value if isinstance(v, ast.Constant) else "{}"
+                                   for v in n.values)
+                elif (isinstance(n, ast.Constant) and isinstance(n.value, str)
+                      and id(n) not in prose and id(n) not in parts):
+                    text = n.value
+                else:
+                    continue
+                owner = self.owner.get(n.lineno, "<module>")
+                if re.search(r"forkflow\s+(sync|ship|land)\b", text):
+                    spelled.add(owner)
+                if re.search(r"forkflow\s+(\{|%)", text):
+                    built.add(owner)
+                if re.search(r"(^|\s)forkflow\s*$", text):
+                    headed.add(owner)
+            self.assertEqual(spelled, {"land_cmd"})
+            self.assertEqual(built, {"rerun_cmd", "header"})
+            self.assertEqual(headed, {"parse_args"})
+
+        def test_every_merge_decision_goes_through_fork_merge_mode(self):
+            """The `merge` a `--merge` run trusts was read from a place upstream can write -
+            the working tree on `--continue`, a case variant, a sync branch left checked out -
+            once per route, each closed alone. So the key has one reader, `fork_merge_mode`;
+            the gate refuses on it before anything is pushed; and the merge command is run in
+            `merge_mr` alone, only after a refusal on it - so every path to a merge, fresh or
+            resumed, passes it, and the gate sits before every road into `merge_mr`."""
+            import ast
+            funcs = {n.name: n for n in ast.walk(self.tree)
+                     if isinstance(n, ast.FunctionDef) and n.lineno < self.limit}
+
+            def calls(func: str, name: str) -> list:
+                return sorted(c.lineno for c in ast.walk(funcs[func]) if isinstance(c, ast.Call)
+                              and isinstance(c.func, ast.Name) and c.func.id == name)
+
+            def refuses_on(func: str, name: str) -> bool:
+                """An `if` whose test asks `name` and whose body raises."""
+                return any(isinstance(n, ast.If) and any(
+                    isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                    and c.func.id == name for c in ast.walk(n.test))
+                    and any(isinstance(b, ast.Raise) for b in ast.walk(n))
+                    for n in ast.walk(funcs[func]))
+
+            self.assertEqual(self.owners('get("merge")'),
+                             {"parse_config", "merge_mode_in", "fork_merge_mode"})
+            self.assertEqual(self.owners('["merge"]'), set())
+            self.assertTrue(refuses_on("merge_gate", "fork_merge_mode"))
+            self.assertTrue(refuses_on("merge_mr", "fork_merge_mode"))
+            self.assertEqual(self.owners("merge_command("), {"merge_command", "merge_mr"})
+            self.assertLess(calls("merge_mr", "fork_merge_mode")[0], calls("merge_mr", "run_tool")[0])
+            # the roads into `merge_mr`, and the gate before each
+            self.assertEqual(self.owners("merge_mr("), {"merge_mr", "publish"})
+            self.assertEqual(self.owners("publish("), {"publish", "finish_sync", "finish_ship"})
+            self.assertEqual(self.owners("finish_sync("),
+                             {"finish_sync", "cmd_sync", "cmd_sync_continue"})
+            self.assertEqual(self.owners("cmd_sync_continue("), {"cmd_sync_continue", "cmd_sync"})
+            self.assertEqual(self.owners("finish_ship("), {"finish_ship", "cmd_ship"})
+            gate = calls("cmd_sync", "merge_gate")[0]
+            self.assertLess(gate, min(calls("cmd_sync", "cmd_sync_continue")
+                                      + calls("cmd_sync", "finish_sync")))
+            self.assertLess(calls("cmd_ship", "merge_gate")[0], calls("cmd_ship", "finish_ship")[0])
+
+        def test_whose_config_it_is_is_decided_by_its_bytes_in_one_place(self):
+            """Provenance - is this `.forkflow.toml` this fork's own, or the original
+            project's? - was decided by the PATH's history in one reader and by INDEX
+            MEMBERSHIP in another, and each answer was wrong in both directions
+            (`config_is_upstreams`). There is one question now, asked of the content, and a
+            fourth check added later cannot answer it its own way: what upstream's configs
+            are is computed in one place, every provenance answer is a call to
+            `config_is_upstreams`, and the two answers `fork_config_state` reads ask nothing
+            else at all - no `git log`, no index. `fork_merge_mode` and `fork_merge_refusal`
+            both switch on the state it returns rather than deriving one of their own, so a
+            state added there cannot reach a message written for another."""
+            import ast
+            funcs = {n.name: n for n in ast.walk(self.tree)
+                     if isinstance(n, ast.FunctionDef) and n.lineno < self.limit}
+
+            def calls_in(func: str) -> set:
+                return {c.func.id for c in ast.walk(funcs[func]) if isinstance(c, ast.Call)
+                        and isinstance(c.func, ast.Name)}
+
+            # `fork_config_state` reads the set once and hands it to the two questions it
+            # asks; every other answer computes it for itself, and nothing else may
+            # decide what upstream's configs are
+            self.assertEqual(self.owners("upstream_config_digests("),
+                             {"upstream_config_digests", "config_is_upstreams",
+                              "fork_config_state"})
+            # and the parts of it that decide what may be read, whether the answer can be
+            # trusted at all, and what this clone has written down of upstream's, are its
+            # own - so none of them can be re-derived, or skipped, elsewhere
+            self.assertEqual(self.owners("upstream_scope_refs("),
+                             {"upstream_scope_refs", "upstream_config_digests",
+                              "config_history_render_unprovable"})
+            self.assertEqual(self.owners("history_unprovable("),
+                             {"history_unprovable", "upstream_config_digests"})
+            # the rendering questions belong to the states that read the WORKING TREE, so
+            # they are called from `fork_config_state` - below `trunk_*` - and nowhere else.
+            # In `upstream_config_digests` the first of them refused a fork in the
+            # recommended state, where the config is a blob off `origin/<trunk>`
+            self.assertEqual(self.owners("config_render_unprovable("),
+                             {"config_render_unprovable", "fork_config_state"})
+            self.assertEqual(self.owners("config_rendered_before("),
+                             {"config_rendered_before", "fork_config_state"})
+            self.assertEqual(self.owners("config_history_render_unprovable("),
+                             {"config_history_render_unprovable", "fork_config_state"})
+            self.assertEqual(self.owners("remember_rendered_config("),
+                             {"remember_rendered_config", "fork_config_state"})
+            # what this clone judged rendered is read where it is judged and where it is
+            # remembered, and the scratch repository that asks git what a historical
+            # `.gitattributes` sets is built in one place
+            self.assertEqual(self.owners("remembered_rendered_configs("),
+                             {"remembered_rendered_configs", "remember_rendered_config",
+                              "config_rendered_before"})
+            self.assertEqual(self.owners("attrs_render_the_config("),
+                             {"attrs_render_the_config", "config_history_render_unprovable"})
+            self.assertEqual(self.owners('"init"'), {"attrs_render_the_config"})
+            self.assertEqual(self.owners('"check-attr"'),
+                             {"config_render_unprovable", "attrs_render_the_config"})
+            self.assertEqual(self.owners("config_memory_unprovable("),
+                             {"config_memory_unprovable", "upstream_config_digests"})
+            self.assertEqual(self.owners("config_versions_in("),
+                             {"config_versions_in", "upstream_config_digests",
+                              "config_match_note"})
+            # every walk's blobs are turned into digests in one place, so the fail-closed
+            # reading cannot be written a second time and left out of one scope
+            self.assertEqual(self.owners("config_versions_walked("),
+                             {"config_versions_walked", "config_versions_in",
+                              "upstream_tag_versions"})
+            self.assertEqual(self.owners("upstream_tag_versions("),
+                             {"upstream_tag_versions", "upstream_config_digests"})
+            self.assertEqual(self.owners("remember_upstream_configs("),
+                             {"remember_upstream_configs", "upstream_config_digests"})
+            self.assertEqual(self.owners("remembered_config_record("),
+                             {"remembered_config_record", "remembered_upstream_configs",
+                              "remember_upstream_configs"})
+            self.assertEqual(self.owners("config_record_ok("),
+                             {"config_record_ok", "config_memory_unprovable"})
+            # WHAT COUNTS AS THE FORK'S OWN REPOSITORY IS ONE RULE. "Not `origin`" stood in
+            # for "the original project" and they are not the same question: a second remote
+            # for the fork itself made the fork's own config read as the project's
+            self.assertEqual(self.owners("same_repo_remotes("),
+                             {"same_repo_remotes", "foreign_remote_groups",
+                              "upstream_tag_versions"})
+            self.assertEqual(self.owners("foreign_remote_refs("),
+                             {"foreign_remote_refs", "upstream_scope_refs",
+                              "history_unprovable"})
+            # the frame with the repository each ref came from still attached: what the
+            # memory is written down under, read back by, and what the refusal names
+            self.assertEqual(self.owners("foreign_remote_groups("),
+                             {"foreign_remote_groups", "foreign_remote_refs",
+                              "remembered_upstream_configs", "config_match_note",
+                              "upstream_config_digests"})
+            # what is written down comes from the refs upstream cannot choose, and from
+            # nowhere else: `upstream_scope_refs` widens the answer for the run that reads
+            # it and never reaches the memory, and neither does a tag, which belongs to no
+            # remote and so to no repository the record could be read back by
+            self.assertEqual(calls_in("upstream_config_digests"),
+                             {"history_unprovable",
+                              "config_memory_unprovable", "foreign_remote_groups", "set",
+                              "config_versions_in", "remember_upstream_configs",
+                              "upstream_scope_refs", "upstream_tag_versions"})
+            # and the bytes are turned into what is compared and written down in one place
+            self.assertEqual(self.owners("config_digest("),
+                             {"config_digest", "config_versions_in", "config_is_upstreams",
+                              "remember_rendered_config", "config_rendered_before",
+                              "config_versions_walked", "config_match_note"})
+            # a refusal that names bytes as the original project's says WHERE it found them,
+            # in one place, and asserts no cause it cannot know
+            self.assertEqual(self.owners("config_match_note("),
+                             {"config_match_note", "fork_merge_refusal",
+                              "in_the_way_advice"})
+            self.assertEqual(calls_in("upstream_scope_refs"),
+                             {"foreign_remote_refs", "has_ref", "set",
+                              "merge_in_progress", "add"})
+            self.assertEqual(self.owners("config_is_upstreams("),
+                             {"config_is_upstreams", "written_by_upstream",
+                              "own_untracked_config", "fork_config_state",
+                              "in_the_way_advice"})
+            self.assertEqual(calls_in("written_by_upstream"), {"config_is_upstreams"})
+            self.assertEqual(calls_in("own_untracked_config"),
+                             {"working_config_text", "tracked_config_names",
+                              "merge_in_progress", "config_name_at", "config_is_upstreams",
+                              "any"})
+            self.assertEqual(self.owners("written_by_upstream("),
+                             {"written_by_upstream", "fork_config_state"})
+            self.assertEqual(self.owners("own_untracked_config("),
+                             {"own_untracked_config", "fork_config_state"})
+            # and the state both `--merge` readers switch on is decided in that one place
+            self.assertEqual(self.owners("fork_config_state("),
+                             {"fork_config_state", "fork_merge_mode", "fork_merge_refusal"})
+
+        def test_every_copy_a_remedy_prints_is_built_here(self):
+            """A REMEDY MUST NEVER PRODUCE CONFIG BYTES. Two rounds running, a remedy has
+            ended by putting something back at `.forkflow.toml` - the contents a symlink
+            read as, and a file git's own conversion had rewritten - and each time the bytes
+            that landed there had never been any `.forkflow.toml` blob, so they matched
+            nothing in `upstream_config_digests`, read as this fork's own declaration, and
+            opened `--merge` on the original project's settings. Both were found by an
+            external reviewer, in the fixes for the round before.
+
+            So the shape is pinned in two places rather than trusted to review.
+
+            One: every copy this script prints for a user to run is built by `keep_aside`,
+            whose destination is inside the git directory by construction. Nothing else in
+            the script may spell a `cp` for a user at all.
+
+            Two: the copy `keep_aside` names is a DESTINATION and never a source. That is
+            exactly the shape the symlink remedy had - `cp -p -- <the copy> <the config>` -
+            and the one thing that turns a copy-aside into a way of producing config bytes.
+            `{sh_arg(keep)}` therefore appears in a printed command only at its end, and the
+            name `keep` is reserved for that destination - `cmd_ship`'s branch of somebody
+            else's commits is `saved` so this can be asked by name."""
+            self.assertEqual(self.owners("cp -p --"), {"keep_aside"})
+            self.assertEqual(self.owners("sh_arg(keep)"), {"keep_aside"})
+            self.assertEqual(self.owners("keep_aside("),
+                             {"keep_aside", "variant_remedy", "config_render_unprovable",
+                              "config_rendered_before"})
+            # the same rule again on the printed text itself, so a copy spelled some other
+            # way is caught too. Adjacent f-string pieces are glued back together first:
+            # every remedy here is written across several lines
+            glued = re.sub(r'"\s*\n\s*f?"', "", "\n".join(self.lines[:self.limit]))
+            for cmd in re.findall(r"`([^`\n]+)`", glued):
+                words = cmd.split()
+                for i, word in enumerate(words):
+                    if "keep" in word and i != len(words) - 1:
+                        self.fail("a printed command reads back the copy it made, which is "
+                                  "how a remedy comes to produce config bytes: " + cmd)
+
+        def test_no_printed_command_needs_a_git_newer_than_the_floor(self):
+            """The README states the floor: Python 3.9+ and git 2.20+. Every command this
+            script prints is pasted by a user exactly as printed, so a spelling their git
+            does not have is a dead end in the middle of a recovery - and the spellings a
+            hand reaches for without thinking are all newer than the floor: `switch` and
+            `restore` are 2.23, `branch --show-current` is 2.22, `fetch --refetch` is 2.36,
+            `ls-remote --symref` is 2.8, `for-each-ref --exclude` is 2.38.
+
+            `merge-tree --write-tree` is the one thing here above the floor, and it is
+            never reached on an older git: every call to `merge_tree` is behind
+            `git_version() < MERGE_TREE_GIT`, and the README says the simulation wants
+            2.38+ and is skipped with a note. `%(worktreepath)` (2.23) has its own
+            fallback, tested in `test_without_worktreepath_only_this_worktree_is_seen`."""
+            import ast
+            body = "\n".join(self.lines[:self.limit])
+            for spelling in ("git switch", "git restore", "branch --show-current",
+                             "fetch --refetch", "ls-remote --symref",
+                             "for-each-ref --exclude", "rev-list --exclude-hidden"):
+                self.assertNotIn(spelling, body,
+                                 spelling + " is newer than the git floor the README states")
+            funcs = {n.name: n for n in ast.walk(self.tree)
+                     if isinstance(n, ast.FunctionDef) and n.lineno < self.limit}
+            callers = self.owners("merge_tree(") - {"merge_tree", "<module>"}
+            self.assertEqual(callers, {"simulate_merge", "still_carries"})
+            for name in callers:
+                where = funcs[name]
+                self.assertIn("MERGE_TREE_GIT",
+                              "\n".join(self.lines[where.lineno - 1:where.end_lineno]), name)
+
+        def test_the_state_file_is_written_in_one_place_and_under_its_lock(self):
+            """Every record in the state file is a read-modify-write, and `pending` lives in
+            the one file every worktree of the clone shares. `record_pending`,
+            `forget_pending` and `write_state` each read it, changed one key and wrote it
+            back on their own, so two worktrees recording at the same time each wrote the map
+            the other had just changed away. The lock belongs to `change_state` and the write
+            happens nowhere else, so a writer added later cannot go around it."""
+            self.assertEqual(self.owners("save_state("), {"save_state", "change_state"})
+            self.assertEqual(self.owners("take_state_lock("),
+                             {"take_state_lock", "change_state"})
+            # and the state file is PARSED in one place too, so "this file says nothing" and
+            # "this file cannot be read" stay two different answers. A second parser is how
+            # an unreadable file came to read as {} and forget the provenance memory
+            self.assertEqual(self.owners("json.load("), {"load_state"})
+            self.assertEqual(self.owners("load_state("),
+                             {"load_state", "read_state", "state_unreadable", "change_state"})
+            # a write over a file that cannot be read makes the damage permanent, so the
+            # decision not to lives with the one writer
+            self.assertEqual(self.owners("state_unreadable("),
+                             {"state_unreadable", "config_memory_unprovable"})
+            # nothing here may ever delete the lock file: the lock is the kernel's, on the
+            # open descriptor, and a run that unlinks the path releases whatever a third
+            # run holds by then. So the pathname is used in exactly one place - the open -
+            # and the lock calls themselves are behind one helper
+            self.assertEqual(self.owners("state_lock_path("),
+                             {"state_lock_path", "take_state_lock"})
+            self.assertEqual(self.owners("lock_exclusive("),
+                             {"lock_exclusive", "take_state_lock"})
+            self.assertEqual(self.owners("fcntl.flock("), {"lock_exclusive"})
+            self.assertEqual(self.owners("msvcrt.locking("), {"lock_exclusive"})
+            self.assertEqual(self.owners("drop_state_lock("),
+                             {"drop_state_lock", "change_state"})
+            self.assertEqual(self.owners("change_state("),
+                             {"change_state", "write_state", "record_published",
+                              "record_pending", "forget_pending",
+                              "remember_upstream_configs", "remember_rendered_config"})
 
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()

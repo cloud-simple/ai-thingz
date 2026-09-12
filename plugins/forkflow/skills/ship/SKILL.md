@@ -8,7 +8,10 @@ allowed-tools: Bash, Read, AskUserQuestion
 
 The script never pushes the trunk, never rebases it, and never commits on the mirror - and neither
 may you. `ship` rewrites only the feature branch it is on, after a backup is confirmed on origin;
-the trunk moves only through the merge request this produces, which you never merge yourself.
+the trunk moves only through the merge request this produces, which you never merge yourself -
+*unless the fork's `.forkflow.toml` says `merge = "self"` and the user asked for `--merge`*, in
+which case the script merges it, with the method rule 5 requires and a head-commit guard, and
+lands it. The local trunk catches up through `forkflow land`, never by hand.
 
 Script: `${CLAUDE_PLUGIN_ROOT}/scripts/forkflow.py`.
 Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a session.
@@ -24,9 +27,11 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/forkflow.py" ship --dry-run
    ```
 
-   Nothing is created, rebased, squashed or pushed (it does fetch). Use it to show the user the
-   commits that will become one, and the upstream-tracked WARNING list it prints where the real
-   run prints it after the squash.
+   Nothing is created, rebased, squashed or pushed, and nothing is fetched: the `fetch` line
+   shows a `git ls-remote` that says what `origin/<trunk>` is here and what origin has, and the
+   preview is built from the refs on disk. Use it to show the user the commits that will become
+   one, and the upstream-tracked WARNING list it prints where the real run prints it after the
+   squash.
 
 3. **Run it.**
 
@@ -39,7 +44,10 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    origin; "nothing to ship" and exit 0 if the branch has no commits beyond `origin/<trunk>`; back
    up HEAD as `backup/<ts>-pre-ship` and confirm it on origin; `git rebase origin/<trunk>`; squash
    to one commit and verify the tree hash is unchanged; `check`; push (with
-   `--force-with-lease` when the branch is already on origin); print the MR command.
+   `--force-with-lease` when the branch is already on origin); print the MR command. A
+   remote-tracking `origin/<branch>` whose branch origin no longer has (GitLab removed it after
+   a merge) is dropped first (`origin  $ git branch -d -r origin/<branch>  -> removed`), and the
+   branch is pushed as a new one, without a lease.
 
 4. **The commit message.** By default: the *oldest* commit's subject as the subject, then
    "Squashed from n commits (oldest first)" with each subject and its body. A single-commit branch
@@ -57,8 +65,10 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    ```
 
    `--continue` re-runs the full preflight, requires `origin/<trunk>` to be an ancestor of HEAD
-   (otherwise "the rebase did not complete", exit 2) and resumes at the squash. `git rebase
-   --abort` puts the branch back; the pre-ship backup on origin is the other way back.
+   (otherwise "the rebase did not complete", exit 2) and resumes at the squash. Resume with the
+   flag the first run had (`--mr` or `--merge`) - the conflict message prints the command with
+   it. `git rebase --abort` puts the branch back; the pre-ship backup on origin is the other way
+   back.
 
 6. **Upstream-tracked files.** The WARNING list names files the branch touches that upstream also
    owns; every one of them is a permanent merge cost. Show it, do not gate on it. Ask the user
@@ -71,29 +81,75 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    `--repo <the fork's URL>` is what keeps the merge request off the original project
    (`rules.md`).
 
+   **`--merge`** (implies `--mr`) opens the merge request and merges it in the same run, then
+   lands it (step 9). It is refused - exit 2, before the fetch, the backup and any push, on a
+   plain run and on `--continue` alike - unless **both** hold: the fork's `.forkflow.toml` says
+   `merge = "self"` (the fork has declared that whoever opens its merge requests merges them; the
+   default is `"manual"`), and the origin URL names a project the merge command can address with
+   `--repo` (`rules.md`). `merge` is read only from the `.forkflow.toml` committed on
+   `origin/<trunk>` (or, while none is, an untracked one), and only while those bytes are not a
+   `.forkflow.toml` the original project has - not from the branch being shipped, so the ship
+   that first commits the config is a plain `--mr`, merged by hand. "Not one the original project
+   has" is asked of every remote-tracking ref that is not `origin`'s - their whole histories, and
+   what those refs carried is also written down as hashes in `.git/forkflow-state.json`, so a
+   version upstream has since force-pushed or withdrawn away is still upstream's - and it fails
+   CLOSED: in a clone that cannot answer it - shallow, partial, `refs/replace/*` or grafts, nothing of
+   upstream's fetched, an object that cannot be read, a `.forkflow.toml` that is a symlink or that a
+   `.gitattributes` renders on checkout (`filter`, `ident`, `text`, `eol`, `working-tree-encoding`,
+   `diff`) - `--merge` alone is exit 2 and the message names the condition and the command that
+   ends it. Never work around that gate -
+   a reviewed fork is meant to stop here. The merge is the method rule 5 requires with a
+   head-commit guard, so only the exact commit this run pushed can be merged: GitLab `glab mr
+   merge <branch> --repo <fork> --sha <head> --auto-merge=false --remove-source-branch --yes`
+   (the project's own merge method, which `setup`'s report insists is `ff`); GitHub `gh pr merge
+   <branch> --repo <fork> --match-head-commit <head> --rebase`. A merge that does not happen -
+   tool missing, failing, the guard refusing, or no merge request created - is exit 6: the branch
+   is pushed and the merge request (when created) is open, so merge it by hand and run `forkflow
+   land`. With `--merge` the run ends on the trunk, not on the feature branch. `--dry-run` shows
+   `would: merge` and `would: land` and runs neither.
+
+   Worktrees: when the trunk is checked out in another worktree (the usual layout - the main
+   worktree on the trunk, the feature in a linked one), `--merge` from the linked worktree
+   ends - once the merge is on the trunk - with exit 2 "the merge request was merged; the local
+   catch-up did not run: trunk ... is checked out in <path>: run `forkflow land <branch>`
+   there". That is the expected end, not a failure: the merge is done, the record is kept, and
+   `land <branch>` in that worktree catches the trunk up there. A merge the tool only queued is
+   exit 6 in this layout too, naming the same `forkflow land <branch>` and worktree for once
+   it is through. It cannot delete the branch while the linked worktree has it
+   checked out (`NOT deleted`), and the linked worktree stays on the feature branch - switch it
+   off (or remove the worktree), then delete the branch by hand (`git branch -D <branch>` once
+   `status` no longer lists it as pending: it has landed).
+
 8. **Report.** The one commit (SHA and subject) replacing the n originals, the tree hash check,
    the backup name and its rollback line, the rebase result, any WARNING files, the MR URL or
-   command - and what was not done: the MR is not merged, the trunk has not moved.
+   command - and what was not done: without `--merge` the MR is not merged and the trunk has not
+   moved; with it, what the merge step and the landing did (step 9).
 
-   Close with the manual steps:
+9. **Land it.** Merge button - GitLab: fast-forward; GitHub: "Rebase and merge". Once the merge
+   request is merged, the closing step is
 
    ```bash
-   git fetch origin && git switch <trunk> && git merge --ff-only origin/<trunk>
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/forkflow.py" land
    ```
 
-   Merge button - GitLab: fast-forward; GitHub: "Rebase and merge". **On GitHub, delete the local
-   feature branch afterwards**: "Rebase and merge" rewrites the commit, so the local branch is a
-   stale copy of what landed. The script prints that reminder when the platform is GitHub.
+   (`/forkflow:land`; the run prints `next: forkflow land`). It fetches, verifies that the
+   shipped commit is on `origin/<trunk>` - by ancestry, or by patch when GitHub's "Rebase and
+   merge" rewrote its SHA - fast-forwards the local trunk, deletes the local feature branch (kept
+   instead when it carries commits made after the ship) and leaves you on the trunk. Not merged
+   yet is exit 2 and not an error. On GitHub the remote branch survives the merge; `land` prints
+   the `git push origin --delete <branch>` line for the user. `--merge` runs that landing
+   itself, right after the merge.
 
 ## Other exits
 
 | exit | what happened | what to do |
 |---|---|---|
-| 0 | done, dry run, or "nothing to ship" | nothing to land beyond `origin/<trunk>` |
+| 0 | done, dry run, or "nothing to ship"; also `--mr` when the tool is missing or fails, without `--merge` | after a done run, `forkflow land` once the MR is merged; "nothing to ship" means nothing to land beyond `origin/<trunk>` |
 | 2 | precondition: on the trunk / the mirror / a `sync/` or `backup/` branch, dirty tree, detached HEAD, rebase already in progress, `--continue` with an unfinished rebase or with no ship of ours to resume, `origin/<branch>` carrying commits this clone has no record of publishing | switch to the feature branch or finish the rebase; the message names it, and the command it names after `git rebase --continue` is the right one - `forkflow ship --continue` only when this clone has a ship in progress on that branch, plain `forkflow ship` otherwise (a `git pull --rebase` this skill asked for is not a ship). For the last one the commits that would be lost are listed - take them in (`git pull --rebase origin <branch>`), or, if they are yours from another clone, keep them in a `backup/` branch on origin first (the message prints that command too) |
 | 3 | `check` failed after the rebase and squash - a `gate` command or the tip check; nothing was pushed | fix it on the branch, commit, then `ship --continue` (the squash already happened, so that, not a fresh `ship`, is the resume); the rollback line is printed |
 | 4 | rebase conflicts | resolve, `git rebase --continue`, `ship --continue` |
 | 5 | rewrite safety: backup not confirmed, tree hash changed by the squash, `--force-with-lease` rejected (someone else pushed to the branch) | do not force past it; report it and use the printed rollback line |
+| 6 | `--merge` only: the merge request was not created by this run (or one was already open for the branch - `--merge` merges only what it opened), or was not merged (tool missing or failing, the head-commit guard refused because the branch moved, or the tool answered "merged" while nothing reached the trunk - a merge train, auto-merge) - the branch is pushed and the request, when created, is open with its URL in the message | merge it by hand with the method rule 5 requires, then `forkflow land`; the pending record is kept for it. Never retry the merge through `glab api` / `gh api` yourself |
 
 ## Notes
 
@@ -102,5 +158,7 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
 - Never `git push origin <trunk>`, never rebase the trunk, never `--force` (only the script's
   `--force-with-lease`), never `--no-verify` to get past the pre-push hook.
 - Backups live on origin as `backup/<UTC timestamp>-pre-ship`; `forkflow status` lists the newest.
-- `.forkflow.toml` (`gate`, branch names) needs Python 3.11+; a present but unreadable config is
-  exit 2 for every subcommand rather than a guessed branch name.
+- After the push the run records what is waiting to land (`forkflow status` shows it on its
+  `pending` line); `forkflow land` reads that record, so it works in a later session too.
+- `.forkflow.toml` (`gate`, `merge`, branch names) needs Python 3.11+; a present but unreadable
+  config is exit 2 for every subcommand rather than a guessed branch name.

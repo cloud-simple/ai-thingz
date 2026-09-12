@@ -1,7 +1,7 @@
 # forkflow rules
 
-Read this before running `sync`, `ship` or `setup`. The script enforces these mechanically; you
-must not work around them by driving git by hand.
+Read this before running `sync`, `ship`, `land` or `setup`. The script enforces these
+mechanically; you must not work around them by driving git by hand.
 
 ## Layout
 
@@ -46,7 +46,8 @@ develop (trunk) ─────────────────────�
      GitHub: "Create a merge commit". Never squash or rebase a sync MR: that rewrites upstream's
      SHAs out of the trunk's ancestry, and every later sync re-conflicts on the same hunks.
    - ship - GitLab: fast-forward (`merge_method=ff`); GitHub: "Rebase and merge". GitHub rewrites
-     the commit SHA, so **delete the local feature branch afterwards** instead of reusing it.
+     the commit SHA, so the local feature branch is **deleted afterwards**, never reused - `land`
+     recognises the patch and deletes it.
 6. **Never commit on the mirror.** It is only ever fast-forwarded to the upstream branch and
    pushed by `sync`, never with force. The hook rejects a mirror push that is not an ancestor of
    the last-fetched upstream ref, and rejects it when that ref is missing or unfetched.
@@ -85,6 +86,16 @@ it. The URL carries the host as well as the project, because a bare `owner/repo`
 against the tool's own default host (github.com, gitlab.com) and not the one the fork is on. Pass
 the command on exactly as printed. When the origin URL names no project at all, forkflow prints no
 command and says which URL it could not address: open that merge request in the web UI.
+
+`--merge` (on `sync` and `ship`, only on a fork whose `.forkflow.toml` says `merge = "self"`, and
+only while those bytes are not a `.forkflow.toml` the original project has - asked of every
+remote-tracking ref that is not `origin`'s, and refused outright in a clone that cannot answer it:
+shallow, partial, `refs/replace/*` or grafts, nothing of upstream's fetched) merges with the
+method the project is configured for on GitLab - which `setup`'s report insists is `ff` - and
+with the method rule 5 requires per call on GitHub (`--merge` for a sync, `--rebase` for a ship),
+always with a head-commit guard (`--sha` / `--match-head-commit`) so only the exact commit the
+run pushed can be merged; `land` warns when what landed does not have that shape (a ship's commit
+reachable only through a merge commit's second parent, not on the trunk's first-parent line).
 
 ## What is never automated
 
