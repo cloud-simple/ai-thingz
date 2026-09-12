@@ -68,6 +68,7 @@ CONFIG_FILE = ".forkflow.toml"
 STATE_FILE = "forkflow-state.json"   # in .git: ties a `--continue` run to the backup it belongs to
 HOOK_MARK = "# forkflow pre-push hook"
 DEFAULT_TRUNK = "develop"
+DEFAULT_MIRROR = "main"
 DEFAULT_SYNC_PREFIX = "sync/"
 DEFAULT_BACKUP_PREFIX = "backup/"
 README_POINTER = ("See *Adopting forkflow in an existing fork* in the project README "
@@ -285,15 +286,36 @@ def remote_trunk(root: str) -> str:
     return head[len(prefix):] if head.startswith(prefix) else DEFAULT_TRUNK
 
 
+def upstream_branch_names(root: str) -> set:
+    """The branch names the original project's remotes have here: `upstream/main` gives
+    `main`. A local branch of that name is this fork's mirror - `setup` bootstraps it by
+    that name - and the config that would say which branch the mirror is is the file that
+    cannot be read when this is asked. A mirror under a name upstream does not use is not
+    recognised here; the pre-push hook and `status` are what catch a commit on it."""
+    names = set()
+    out = git("for-each-ref", "--format=%(refname)", "refs/remotes/", cwd=root, check=False)
+    for ref in out.splitlines():
+        parts = ref.split("/", 4)                     # refs/remotes/<remote>/<branch...>
+        if len(parts) >= 4 and parts[2] != "origin" and parts[3] != "HEAD":
+            names.add("/".join(parts[3:]))
+    return names
+
+
 def no_commit_here(root: str, trunk: str) -> str:
     """Why nothing may be committed on the checked-out branch, "" when something may.
 
-    Answered without the config, which is what cannot be read: the trunk by the name
-    origin gives it (and the default), and the mirror - or any branch holding nothing but
-    the original project's history - by being contained in a remote-tracking ref that is
-    not origin's. A branch mistaken for one of those gets an explanation and no command,
-    the safe direction; the one miss is a trunk whose name neither origin/HEAD nor the
-    default gives."""
+    Rules 2 and 6, and nothing besides: the trunk, by the name origin gives it and by the
+    default, and the mirror, by its name (`upstream_branch_names`, and the default). A
+    branch mistaken for one of those gets an explanation and no command, the safe
+    direction; the one miss is a trunk or a mirror under a name nothing here gives.
+
+    It used to answer for any branch contained in a remote-tracking ref that is not
+    origin's - "carries nothing but upstream's commits". On a fresh fork every branch is
+    still at upstream's tip, so `forkflow setup` - the first command a fork runs - and the
+    branch this refusal sends the user to both hit that clause, and nothing anywhere named
+    a fix: a dead end out of which only an unrelated commit led. Committing on a branch of
+    one's own is what the workflow is for. Whose a FILE is, which that clause was also
+    standing in for, is `config_is_upstreams`'s question, and its bytes answer it."""
     branch = git("symbolic-ref", "-q", "--short", "HEAD", cwd=root, check=False)
     if not branch:
         return "HEAD is detached"
@@ -301,10 +323,8 @@ def no_commit_here(root: str, trunk: str) -> str:
         return f"`{branch}` is origin's default branch"
     if branch == DEFAULT_TRUNK:
         return f"`{branch}` is the trunk"
-    out = git("for-each-ref", "--contains", "HEAD", "--format=%(refname)", "refs/remotes/",
-              cwd=root, check=False)
-    if any(r and not r.startswith("refs/remotes/origin/") for r in out.splitlines()):
-        return f"`{branch}` carries nothing but upstream's commits, so the file is upstream's"
+    if branch == DEFAULT_MIRROR or branch in upstream_branch_names(root):
+        return f"`{branch}` is the mirror of the original project"
     return ""
 
 
@@ -437,7 +457,7 @@ class Ctx:
     upstream_url: str = ""
     upstream_branch: str = "main"
     trunk: str = DEFAULT_TRUNK
-    mirror: str = "main"
+    mirror: str = DEFAULT_MIRROR
     platform: str = "unknown"
     dry_run: bool = False
     sync_prefix: str = DEFAULT_SYNC_PREFIX
@@ -13183,6 +13203,62 @@ def run_tests() -> None:
             sh("git", "add", self.VARIANT, cwd=fork)
             sh("git", "commit", "-q", "-m", "fork: config, spelled differently", cwd=fork)
             no_remedy(self.refusal(fork))
+
+        def test_the_trunk_and_the_mirror_are_the_only_branches_that_refuse_a_commit(self):
+            """`no_commit_here` encodes rules 2 and 6 and nothing besides. The mirror is
+            known by its name, the config that would name it being the file that cannot be
+            read: the default, and any name the original project's remote has a branch of
+            (`main` beside `upstream/main`, which is what `setup` bootstraps). A branch of
+            the fork's own refuses nothing, however little of its own it carries - it used
+            to refuse whenever it held only upstream's commits, which on a fresh fork is
+            every branch there is."""
+            fork = make_fork(self.tmp)
+            sh("git", "push", "-q", "origin", "main:refs/heads/release",
+               cwd=os.path.join(self.tmp, "seed"))              # another upstream branch
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            sh("git", "branch", "release", "develop", cwd=fork)
+            sh("git", "branch", "feat/x", "develop", cwd=fork)
+            for branch, why in (("develop", "origin's default branch"),
+                                ("main", "is the mirror"), ("release", "is the mirror"),
+                                ("feat/x", "")):
+                sh("git", "checkout", "-q", branch, cwd=fork)
+                answer = no_commit_here(fork, "develop")
+                if why:
+                    self.assertIn(why, answer, branch)
+                else:
+                    self.assertEqual(answer, "", branch)
+            sh("git", "checkout", "-q", "--detach", cwd=fork)
+            self.assertEqual(no_commit_here(fork, "develop"), "HEAD is detached")
+
+        @needs_tomllib
+        def test_a_fresh_fork_of_a_project_that_tracks_a_variant_is_not_a_dead_end(self):
+            """The project itself tracks `.ForkFlow.toml`, and the fork is new: `develop`,
+            `main` and every branch off `origin/develop` are all still at upstream's tip.
+            Each of them answered "carries nothing but upstream's commits" and named no
+            command, so `forkflow setup` - the first command a new fork runs - and the very
+            branch its advice sends you to were both dead ends, with only an unrelated
+            commit leading out. The trunk and the mirror still name no command; the branch
+            they send you to names the rename, which run as printed leaves the config
+            readable."""
+            fork = make_fork(self.tmp)
+            commit_upstream(self.tmp, self.VARIANT, 'gate = ["true"]\n', "theirs: variant")
+            push_upstream_into_origin(self.tmp, "develop")
+            push_upstream_into_origin(self.tmp, "main")
+            sh("git", "fetch", "-q", "--prune", "origin", cwd=fork)
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            sh("git", "merge", "-q", "--ff-only", "origin/develop", cwd=fork)
+            self.assertIn(self.VARIANT, os.listdir(fork))
+            code, out, err = run("-C", fork, "setup")
+            self.assertEqual(code, 2, err + out)
+            no_remedy(err)                                   # rule 2: nothing to run here
+            self.assertIn("branch off `origin/develop`", err)
+            sh("git", "checkout", "-q", "main", cwd=fork)
+            sh("git", "merge", "-q", "--ff-only", "origin/main", cwd=fork)
+            no_remedy(self.refusal(fork))                    # rule 6: nor here
+            sh("git", "checkout", "-q", "-b", "fix/config", "origin/develop", cwd=fork)
+            self.run_remedy(fork, 'gate = ["true"]\n')
+            sh("git", "commit", "-q", "-m", "the config under its exact name", cwd=fork)
+            self.assertEqual(load_config(fork), {"gate": ["true"]})
 
         def test_on_the_mirror_nothing_is_run(self):
             """Upstream tracks a variant and the mirror is checked out: the file is upstream's,

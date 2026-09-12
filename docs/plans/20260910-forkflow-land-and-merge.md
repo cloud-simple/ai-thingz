@@ -231,6 +231,24 @@ working: a fresh fork's untracked `.forkflow.toml` says "self"; the one ship tha
 resumed runs alike; exit 6 when it no longer says "self") both call it, and
 `TestSourceInvariants.test_every_merge_decision_goes_through_fork_merge_mode` holds that.
 
+⚠️ deviation (review phase 1, iteration 5): whose `.forkflow.toml` it is is decided by its CONTENT,
+not by the path's history and not by index membership. `written_by_upstream`'s
+`git log -1 <rev> -- <path>` was wrong in both directions - a re-add under another name (which is
+what the printed `git mv` remedy for a case variant does to upstream's file) made upstream's config
+look fork-written, and history simplification on a sync merge that kept upstream's side made a
+fork-written one look upstream's - and `own_untracked_config`'s "in none of the index, HEAD or
+MERGE_HEAD" was as blind: upstream's file, brought in by an ordinary sync and untracked by hand, is
+byte for byte the state `setup` leaves this fork's own template in, and it opened the gate with
+nothing merged by anyone. `upstream_config_texts` now fingerprints every `.forkflow.toml` upstream
+has - tips only: `<upstream>/<branch>`, the mirror on origin and here, the merge base of upstream
+and `origin/<trunk>`, and `MERGE_HEAD` during a sync merge; no history walked, the scope stated at
+the helper - and `config_is_upstreams` is the one question both readers and the message builders
+ask, pinned by `TestSourceInvariants.test_whose_config_it_is_is_decided_by_its_bytes_in_one_place`.
+Any edit the fork makes to the file makes the bytes the fork's, which is the way back every refusal
+prints: the refusal now says whose file it is (`fork_merge_refusal`) instead of "no `merge = "self"`
+in this fork's own config" about a file that plainly reads `merge = "self"`, and it names the ship
+that gets a config of the fork's own onto the trunk.
+
 ### Flags and dispatch
 
 - `sync` and `ship` gain `--merge` ("open the merge request and merge it; needs merge = \"self\" in
@@ -280,6 +298,16 @@ nothing but upstream's commits (the mirror) or a detached HEAD it prints an expl
 command; a merge in progress whose copy left the index gets no command either. `finish_sync`'s
 outer message no longer invites an edit for a variant, and `setup`'s "commit it" says on a
 branch off `origin/<trunk>`, shipped.
+
+⚠️ iteration 5: "on a branch of nothing but upstream's commits" is gone from `no_commit_here`. On a
+fresh fork every branch is still at upstream's tip, so `forkflow setup` - the first command a new
+fork runs - and the very branch that refusal sends the user to both hit the clause, with no command
+named anywhere: a dead end out of which only an unrelated commit led. It refuses on the trunk
+(`origin/HEAD`'s branch or `develop`), on the mirror - by name now: the default, or any name the
+original project's remote has a branch of (`upstream_branch_names`) - and on a detached HEAD; rules
+2 and 6, and nothing besides. Whose a FILE is, which that clause was also standing in for, is
+`config_is_upstreams`'s question, and its bytes answer it. The rename remedy also carries the
+`, and --merge is refused` clause again, which fc20258 had dropped.
 
 ⚠️ iteration 4: condition 1 is `fork_merge_mode(ctx) != "self"` (see the deviation under *Config*);
 `merge_mode_arrived_in_merge` is gone - the working tree is no longer a source, so there is nothing
