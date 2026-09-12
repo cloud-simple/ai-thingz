@@ -495,6 +495,19 @@ origin/<trunk>`, `git branch -d <branch>`. Nothing commits, nothing is forced, a
 exits 0: the push and the merge request happened. `resume_unrecorded` says the same about a resume
 record, and `land` says when a landed record could not be cleared.
 
+⚠️ review fix (phase 3, external, iteration 2): taking a stale lock was `os.stat` the path,
+judge, `os.unlink` the path - two statements about two different files the moment the holder
+lets go between them, so what it deleted could be the FRESH lock a third run had just taken, and
+two writers then ran unserialised (reproduced side by side with the fixed body in scratchpad
+`f8/repro3.py`: the old one takes the lock, this one refuses). `steal_stale_lock` takes the
+lock's identity from the DESCRIPTOR - open it once, `fstat` that descriptor, and unlink only
+while the path still names the very inode that was judged - which is also what makes two runs
+stealing at the same moment safe. `STATE_LOCK_STALE` went from 60s to 600s: what the lock guards
+is one read-modify-write of a small JSON file, milliseconds, so ten minutes is a crash and never
+a run that was merely slow or stopped. The bounded wait still ends in a refusal and never in a
+write (`change_state` returns the failure), and the refusal now names the lock file, how old it
+is, and that deleting that one file is the way out when no run is going.
+
 ### `land`
 
 `cmd_land(args)` -> `resolve_ctx(need_upstream=True, need_trunk=True, strict_mirror=False)`, header,
