@@ -1595,8 +1595,15 @@ def header(ctx: Ctx, sub: str, server: Optional[str] = None) -> None:
 
 
 def fetch_preview(ctx: Ctx, remotes: Sequence[str],
-                  refs: Sequence[str]) -> Tuple[int, str, str, str]:
+                  refs: Sequence[str]) -> Tuple[int, str, str, str, list]:
     """What a fetch would have found, for a `--dry-run` that must write nothing.
+
+    The fifth field is the refs the server has MOVED PAST - the ones this run would have
+    fetched and did not. A caller that then CONCLUDES something from a ref on that list is
+    concluding it from bytes it already knows are out of date, which is what the "already
+    in sync" answer did (`cmd_sync`). The refs NOT on it are the same here as on the
+    server, so what is read off one of those is as true as a fetch would have made it -
+    which is why this is a list of refs and not one flag for the whole preview.
 
     `git ls-remote` asks the same server over the same transport in one round trip and
     writes nothing at all - no `FETCH_HEAD`, no remote-tracking ref, no object - so each
@@ -1607,7 +1614,7 @@ def fetch_preview(ctx: Ctx, remotes: Sequence[str],
 
     A failure to reach the remote is the caller's to handle exactly as a failed fetch is:
     the dry run of a command that could not have run is not a dry run that passed."""
-    shown, moved, stale = [], [], False
+    shown, moved, stale = [], [], []
     for ref in refs:
         remote, _, branch = ref.partition("/")     # the callers name `<remote>/<branch>`
         if not branch or remote not in remotes:
@@ -1616,24 +1623,30 @@ def fetch_preview(ctx: Ctx, remotes: Sequence[str],
         shown.append(cmd)
         rc, out, err = git_rc("ls-remote", remote, "refs/heads/" + branch, cwd=ctx.root)
         if rc != 0:
-            return (rc, cmd, "", err)
+            return (rc, cmd, "", err, [])
         here, there = rev(ctx.root, ref), (out.split("\t")[0] if out.strip() else "")
         moved.append(f"{ref} {short(here) or '-'} here"
                      + ("" if here == there else
                         f", {short(there) or 'gone'} on {remote}"))
-        stale = stale or here != there
+        if here != there:
+            stale.append(ref)
     if not shown:
         args = ["fetch"] + (["--multiple"] if len(remotes) > 1 else []) + list(remotes)
         return (0, "git " + " ".join(sh_arg(a) for a in args),
-                "not run (dry run): the refs on disk are as the last fetch left them", "")
+                "not run (dry run): the refs on disk are as the last fetch left them",
+                "", [])
     tail = (" - NOT fetched (dry run): everything below is judged from the refs on disk"
             if stale else " (nothing to fetch)")
-    return (0, " && ".join(shown), ", ".join(moved) + tail, "")
+    return (0, " && ".join(shown), ", ".join(moved) + tail, "", stale)
 
 
 def fetch(ctx: Ctx, remotes: Sequence[str],
-          refs: Sequence[str] = ()) -> Tuple[int, str, str, str]:
-    """Refresh `remotes` and say what moved: (returncode, command, result, stderr).
+          refs: Sequence[str] = ()) -> Tuple[int, str, str, str, list]:
+    """Refresh `remotes` and say what moved: (returncode, command, result, stderr, stale).
+
+    `stale` is the refs nothing may be concluded from. After a real fetch it is always
+    empty - the fetch has just made every named ref the server's - and in a dry run it is
+    what `fetch_preview` found the server had moved past.
 
     `result` is the `step()` line a successful fetch deserves - one `<ref> <old>..<new>` (or
     `<ref> unchanged`) per named ref, or "remote-tracking refs refreshed" when the caller
@@ -1650,13 +1663,14 @@ def fetch(ctx: Ctx, remotes: Sequence[str],
     before = dict((r, rev(ctx.root, r)) for r in refs)
     rc, _, err = git_rc(*args, cwd=ctx.root)
     if rc != 0:
-        return (rc, cmd, "", err)
+        return (rc, cmd, "", err, [])
     moved = []
     for r in refs:
         now = rev(ctx.root, r)
         moved.append(f"{r} unchanged" if now == before[r]
                      else f"{r} {short(before[r])}..{short(now)}")
-    return (0, cmd, ", ".join(moved) if moved else "remote-tracking refs refreshed", err)
+    return (0, cmd, ", ".join(moved) if moved else "remote-tracking refs refreshed",
+            err, [])
 
 
 def upstream_server_tip(ctx: Ctx) -> Tuple[Optional[str], str]:
@@ -2183,7 +2197,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     server = None
     server_step = None
     if getattr(args, "fetch", False):
-        rc, cmd, result, err = fetch(ctx, (ctx.origin, ctx.upstream))
+        rc, cmd, result, err, _ = fetch(ctx, (ctx.origin, ctx.upstream))
         tail = err.strip().splitlines()[-1] if err.strip() else "see git output"
         fetch_step = (cmd, result if rc == 0
                       else f"FAILED, reporting the refs on disk: {tail}")
@@ -2432,15 +2446,19 @@ def sync_branch(ctx: Ctx) -> str:
     return f"{ctx.sync_prefix}{ctx.upstream}-{utc_stamp()}"
 
 
-def fetch_both(ctx: Ctx) -> None:
-    """Refresh both remotes and report what moved; every later step reads these refs."""
-    rc, cmd, result, err = fetch(ctx, (ctx.origin, ctx.upstream),
-                                 [ctx.up(), f"{ctx.origin}/{ctx.trunk}",
-                                  f"{ctx.origin}/{ctx.mirror}"])
+def fetch_both(ctx: Ctx) -> list:
+    """Refresh both remotes and report what moved; every later step reads these refs.
+
+    Answers with the refs a dry run did NOT fetch and the server has moved past, for the
+    one caller that goes on to draw a CONCLUSION rather than a preview out of them."""
+    rc, cmd, result, err, stale = fetch(ctx, (ctx.origin, ctx.upstream),
+                                        [ctx.up(), f"{ctx.origin}/{ctx.trunk}",
+                                         f"{ctx.origin}/{ctx.mirror}"])
     if rc != 0:
         step("fetch", cmd, "FAILED")
         raise Fail(f"fetch failed: {err.strip()}")
     step("fetch", cmd, result)
+    return stale
 
 
 def blob(ctx: Ctx, ref: str, path: str) -> Optional[str]:
@@ -3928,7 +3946,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     print(f"  leaving `{branch}`, switching to `{name}` (you stay on it when this "
           f"finishes{tail})")
 
-    fetch_both(ctx)
+    stale = fetch_both(ctx)
     target = rev(ctx.root, ctx.up())
     if not target:
         raise Fail(f"`{ctx.up()}` does not resolve after the fetch: is `{ctx.upstream}` right?")
@@ -3943,6 +3961,21 @@ def cmd_sync(args: argparse.Namespace) -> int:
     trunk_ref = f"refs/remotes/{ctx.origin}/{ctx.trunk}"
     rc, _, _ = git_rc("merge-base", "--is-ancestor", target, trunk_ref, cwd=ctx.root)
     if rc == 0:
+        if ctx.dry_run and ctx.up() in stale:
+            # `target` is `<upstream>/<branch>` as the LAST FETCH left it and this run did
+            # not fetch, so "already in sync" is being said about a commit the server has
+            # already moved past. It is a CONCLUSION and not a preview: it returns 0, and
+            # everything the dry run exists to run - the merge simulation, the
+            # untracked-in-the-way and case-collision preflights - is below it and does
+            # not run. `advance_mirror` and `judge_landings` say this where they would
+            # otherwise conclude from a ref the fetch line has just called stale
+            raise Fail(f"this dry run did not fetch, so it cannot tell whether this fork "
+                       f"is in sync: from the refs on disk {ctx.origin}/{ctx.trunk} "
+                       f"already contains {short(target)}, which is `{ctx.up()}` as the "
+                       f"last fetch left it - the `fetch` line above says what "
+                       f"`{ctx.upstream}` has now, and none of the checks below this ran. "
+                       f"Run `git fetch {sh_arg(ctx.upstream)}` and try again, or run the "
+                       f"same command without `--dry-run`, which fetches first")
         print(f"  already in sync: {ctx.origin}/{ctx.trunk} already contains {short(target)} "
               f"(the mirror was advanced and pushed above if it was behind)")
         return 0
@@ -4321,7 +4354,7 @@ def cmd_ship(args: argparse.Namespace) -> int:
         step("continue", cmd, "the rebase completed - resuming at the squash")
         return finish_ship(ctx, args, branch, state["backup"], state.get("lease", ""))
 
-    rc, cmd, result, err = fetch(ctx, (ctx.origin,), [trunk_name])
+    rc, cmd, result, err, _ = fetch(ctx, (ctx.origin,), [trunk_name])
     if rc != 0:
         step("fetch", cmd, "FAILED")
         raise Fail(f"fetch failed: {err.strip()}")
@@ -4710,6 +4743,17 @@ def judge_landings(ctx: Ctx, chosen: Sequence[dict], force: bool, after_merge: b
     if not landings:                       # only with several: one alone has raised above
         lines = "".join(f"\n  `{e['branch']}` (MR {e.get('mr') or '-'}): {why}"
                         for e, why in waiting)
+        if ctx.dry_run:
+            # the sentence the single-record path above raises, for the same reason: a dry
+            # run does not fetch, so every "no" printed above was read off the refs on
+            # disk. Sending a user to merge requests that are already merged - and that
+            # the very next non-dry `land` lands without complaint - is the guess this
+            # caveat exists to stop, and it was written for one record only
+            raise Fail(f"this dry run did not fetch, so it cannot tell whether anything "
+                       f"pending has landed: from the refs on disk none of these is on "
+                       f"{trunk_name}, and the `fetch` line above says what {ctx.origin} "
+                       f"has now. Run `{land_cmd()}` without `--dry-run` to fetch and "
+                       f"decide:{lines}")
         raise Fail(f"nothing pending is on {trunk_name} yet - merge, then run `{land_cmd()}` "
                    f"again:{lines}")
 
@@ -4778,7 +4822,7 @@ def land_pending(ctx: Ctx, force: bool = False, after_merge: bool = False,
         land_preflight(ctx, resume)
 
     trunk_name = f"{ctx.origin}/{ctx.trunk}"
-    rc, cmd, result, err = fetch(ctx, (ctx.origin,), [trunk_name])
+    rc, cmd, result, err, _ = fetch(ctx, (ctx.origin,), [trunk_name])
     if rc != 0:
         step("fetch", cmd, "FAILED")
         raise Fail(f"fetch failed: {err.strip()}")
@@ -5017,7 +5061,7 @@ def setup_upstream_remote(ctx: Ctx, args: argparse.Namespace) -> Optional[str]:
 
 def setup_fetch(ctx: Ctx, upstream: str) -> None:
     """Both remotes, then their HEADs. A failure here has changed nothing yet."""
-    rc, cmd, result, err = fetch(ctx, (ctx.origin, upstream))
+    rc, cmd, result, err, _ = fetch(ctx, (ctx.origin, upstream))
     if rc != 0:
         step("fetch", cmd, "FAILED")
         raise Fail(f"fetch failed - nothing has been changed yet:\n{err.strip()}")
@@ -8704,6 +8748,68 @@ def run_tests() -> None:
             self.assertIn("up to date", out)
             self.assertEqual(sh("git", "for-each-ref", cwd=fork), before)
 
+        def test_a_dry_run_does_not_call_a_stale_fork_already_in_sync(self):
+            """"Already in sync" is a CONCLUSION - it returns 0 and skips every preflight
+            below it - and a dry run does not fetch, so on refs the server has moved past it
+            is a conclusion about a commit that is no longer upstream's tip. Said there, it
+            hid the merge simulation and the untracked-in-the-way and case-collision checks
+            the dry run exists to run, two lines under a `fetch` line reporting the newer
+            commit. `advance_mirror` and `judge_landings` already said so where they would
+            conclude from a stale ref; this is the third.
+
+            The refusal is about STALENESS and not about `--dry-run`: with `upstream/<branch>`
+            the same here as on the server, the same dry run still answers "already in sync"
+            and exits 0, both with nothing at all to take and with the trunk already carrying
+            what upstream has."""
+            fork = make_fork(self.tmp)
+            code, out, err = run("-C", fork, "sync", "--dry-run")   # nothing new anywhere
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("already in sync", out)
+
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            before = sh("git", "for-each-ref", cwd=fork)
+            code, out, err = run("-C", fork, "sync", "--dry-run")   # not fetched here
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("did not fetch", err)
+            self.assertNotIn("already in sync", out)
+            self.assertIn("NOT fetched (dry run)", out)
+            self.assertEqual(sh("git", "for-each-ref", cwd=fork), before)   # and wrote nothing
+
+            # a teammate synced it and this clone fetched: the trunk carries what upstream
+            # has and every ref is the server's, so the same dry run concludes again
+            push_upstream_into_origin(self.tmp, "develop")
+            push_upstream_into_origin(self.tmp, "main")
+            sh("git", "fetch", "-q", "--multiple", "origin", "upstream", cwd=fork)
+            code, out, err = run("-C", fork, "sync", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("already in sync", out)
+
+            # and the ref that decides is `upstream/<branch>` alone. Somebody pushed to the
+            # trunk on origin and this clone has not fetched that either - it changes
+            # nothing about whether the trunk already carries what upstream has, so
+            # refusing on it would be a refusal of an answerable question
+            second_clone_commit(self.tmp)
+            code, out, err = run("-C", fork, "sync", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("already in sync", out)
+            self.assertIn("NOT fetched (dry run)", out)      # origin/develop IS stale here
+
+        def test_a_stale_dry_run_still_runs_the_collision_preflight_after_a_fetch(self):
+            """What the refusal is protecting: the untracked-in-the-way preflight. Upstream
+            starts tracking a `.forkflow.toml` while this fork keeps its own untracked, which is
+            exit 2 with the remedy - and from the refs on disk it was exit 0 "already in
+            sync" with nothing checked at all."""
+            fork = make_fork(self.tmp)
+            write(fork, CONFIG_FILE, 'merge = "self"\n')       # untracked, as `setup` leaves it
+            commit_upstream(self.tmp, CONFIG_FILE, 'merge = "manual"\n', "theirs: config")
+            code, out, err = run("-C", fork, "sync", "--dry-run")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("did not fetch", err)
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
+            code, out, err = run("-C", fork, "sync", "--dry-run")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("overwrite an untracked file", err)
+
         def test_dry_run_previews_the_pending_merge_and_moves_nothing(self):
             fork = make_fork(self.tmp)
             commit_fork(fork, "shared.tf",
@@ -12278,6 +12384,10 @@ def run_tests() -> None:
             self.assertEqual(code, 0, err + out)
             self.assertFalse(os.path.exists(git_path(fork, STATE_FILE)))
             commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
+            # the dry run does not fetch, and against an `upstream/*` the server has moved
+            # past it says so instead of concluding anything
+            # (`test_a_dry_run_does_not_call_a_stale_fork_already_in_sync`)
+            sh("git", "fetch", "-q", "upstream", cwd=fork)
             code, out, err = run("-C", fork, "sync", "--dry-run")
             self.assertEqual(code, 0, err + out)
             self.assertFalse(os.path.exists(git_path(fork, STATE_FILE)))
@@ -13726,6 +13836,39 @@ def run_tests() -> None:
             self.assertEqual(sorted(entries), ["feat/b"])                # W2's, kept
             self.assertEqual(entries["feat/b"]["commit"], origin_sha(fork, "feat/b"))
             self.assertEqual(entries["feat/b"]["commit"], rev(fork, "refs/heads/feat/b"))
+
+        def test_a_dry_run_with_several_pending_says_it_could_not_tell(self):
+            """A dry run does not fetch, so with several records the "no" beside each was
+            read off the refs on disk - and the sentence under them sent the user to merge
+            two merge requests that the very next non-dry `land` lands without complaint.
+            The caveat was written for the one-record path only; both paths say it now."""
+            fork = make_fork(self.tmp)
+            w1, w2, a, b = self.two_shipped(fork)
+            base = rev(fork, "refs/heads/develop")
+            self.human(("merge", "--no-ff", "-m", "m", a["commit"]),
+                       ("merge", "--no-ff", "-m", "m2", b["commit"]))       # both merged on origin
+            code, out, err = run("-C", fork, "land", "--dry-run")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("did not fetch", err)
+            self.assertIn("without `--dry-run`", err)
+            self.assertNotIn("merge, then run", err)             # what it used to say
+            self.assertIn("`feat/a`", err)                       # each record is still named
+            self.assertIn("`feat/b`", err)
+            self.assertEqual(self.entries(fork), {"feat/a": a, "feat/b": b})
+            self.assertEqual(rev(fork, "refs/heads/develop"), base)
+            code, out, err = run("-C", fork, "land")              # and it lands them
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(self.entries(fork), {})
+
+        def test_several_pending_and_none_merged_still_says_merge_them(self):
+            """The refusal the dry run must not borrow: a real `land` has fetched, so
+            "nothing pending is on the trunk yet - merge, then run it again" is true there."""
+            fork = make_fork(self.tmp)
+            w1, w2, a, b = self.two_shipped(fork)
+            code, out, err = run("-C", fork, "land")
+            self.assertEqual(code, 2, err + out)
+            self.assertIn("nothing pending is on origin/develop yet", err)
+            self.assertNotIn("did not fetch", err)
 
         def test_force_needs_the_record_named_when_several_are_pending(self):
             """`--force` judges nothing, so it must not pick among several on its own: off
@@ -15241,7 +15384,8 @@ def run_tests() -> None:
             and reaches the merge-request step)."""
             fork = make_fork(self.tmp, config='merge = "self"\n')
             commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
-            with on_platform("gitlab"):
+            sh("git", "fetch", "-q", "upstream", cwd=fork)   # the dry run does not fetch, and
+            with on_platform("gitlab"):                   # will not conclude from a stale ref
                 code, out, err = run("-C", fork, "sync", "--merge", "--dry-run")
             self.assertEqual(code, 0, err + out)
             self.assertNotIn(self.REFUSED, err)
