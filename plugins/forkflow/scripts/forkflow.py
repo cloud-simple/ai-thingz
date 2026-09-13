@@ -590,15 +590,17 @@ def git_config_settings(root: str) -> dict:
 
 
 def load_settings(root: str) -> dict:
-    """Every setting but `merge`: git config first, then `.forkflow.toml` over it, so THE
-    FILE WINS key by key while both are read.
+    """Every setting but `merge`, and `git config` is the whole of where they come from.
 
-    The one place the precedence is decided. `resolve_ctx` builds the Ctx from it and
-    `finish_sync` rebuilds `cfg` from it after the merge it just made, and a second spelling
-    in either is how one of them came to read half the settings."""
-    cfg = git_config_settings(root)
-    cfg.update(load_config(root))
-    return cfg
+    `.forkflow.toml` is no longer read for configuration by anything: it is tracked, and a
+    sync merges the original project's changes by design, so the file a fork read could be
+    the project's - `gate` is shell run with `sh -c`, and deciding whose copy was in the
+    working tree took an apparatus the whole of this change exists to delete. `.git/config`
+    is not tracked and no merge reaches it, so the question is not there to ask.
+
+    The one place the settings are read. `resolve_ctx` builds the Ctx from it and
+    `finish_sync` rebuilds `cfg` from it after the merge it just made."""
+    return git_config_settings(root)
 
 
 def git_config_merge(root: str) -> str:
@@ -902,10 +904,6 @@ def resolve_ctx(cwd: str, args: Optional[argparse.Namespace] = None, need_upstre
     if not git_ok("rev-parse", "--is-inside-work-tree", cwd=cwd):
         raise Fail(f"{cwd} is not inside a git repository")
     root = git("rev-parse", "--show-toplevel", cwd=cwd)
-    # git config is where the settings are going; `.forkflow.toml` is where they are today.
-    # Both are read and the FILE WINS key by key, so a fork that has not moved yet behaves
-    # exactly as it did and one that has is already read from `.git/config`, which is not
-    # tracked and which no merge can reach
     cfg = load_settings(root)
     remotes = git("remote", cwd=root).split()
     if "origin" not in remotes:
@@ -5650,6 +5648,26 @@ def config_with_keys(text: str, pairs: Sequence[Tuple[str, str]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def write_git_config_keys(ctx: Ctx, pairs: Sequence[Tuple[str, str]]) -> None:
+    """--trunk/--mirror/--upstream persisted WHERE FORKFLOW READS THEM, which is git config.
+
+    The names have to outlive the flags that set them: a clone with more than one non-origin
+    remote can infer nothing, so without the `upstream` key every later subcommand would ask
+    for the flag again. `write_config_keys` still writes them into `.forkflow.toml` beside
+    this, for a fork whose teammates are on an older forkflow; nothing reads them there."""
+    names = dict(GIT_CONFIG_SINGLES)
+    for key, value in pairs:
+        cmd = f"git config {sh_arg(names[key])} {sh_arg(value)}"
+        if git("config", "--get", names[key], cwd=ctx.root, check=False) == value:
+            step("config", cmd, f"already {key} = {value}")
+            continue
+        if ctx.dry_run:
+            step("config", cmd, f"would set {key} = {value}", dry=True)
+            continue
+        git("config", names[key], value, cwd=ctx.root)
+        step("config", cmd, f"{key} = {value}")
+
+
 def write_config_keys(ctx: Ctx, pairs: Sequence[Tuple[str, str]]) -> None:
     """--trunk/--mirror persisted: the branch names must outlive the flags that set them."""
     path = os.path.join(ctx.root, CONFIG_FILE)
@@ -6581,6 +6599,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         # later subcommand would exit 2 asking for the flag again
         pairs.append(("upstream", ctx.upstream))
     if pairs:
+        write_git_config_keys(ctx, pairs)
         write_config_keys(ctx, pairs)
 
     target = rev(ctx.root, ctx.up())
@@ -7179,7 +7198,6 @@ def run_tests() -> None:
                            need_trunk=need_trunk, strict_mirror=strict_mirror)
 
     has_tomllib = sys.version_info >= (3, 11)
-    needs_tomllib = unittest.skipUnless(has_tomllib, "reading .forkflow.toml needs Python 3.11+")
     needs_merge_tree = unittest.skipUnless(git_version() >= MERGE_TREE_GIT,
                                            "the merge simulation needs git 2.38+")
 
@@ -7268,153 +7286,6 @@ def run_tests() -> None:
             major, minor = git_version()
             self.assertGreaterEqual(major, 2)
             self.assertIsInstance(minor, int)
-
-    class TestLoadConfig(Base):
-        def test_absent(self):
-            self.assertEqual(load_config(self.tmp), {})
-
-        @needs_tomllib
-        def test_valid(self):
-            write(self.tmp, CONFIG_FILE, 'trunk = "trunk"\ngate = ["true"]\n')
-            cfg = load_config(self.tmp)
-            self.assertEqual(cfg["trunk"], "trunk")
-            self.assertEqual(cfg["gate"], ["true"])
-
-        @needs_tomllib
-        def test_invalid_is_fatal(self):
-            write(self.tmp, CONFIG_FILE, "trunk = \n")
-            with self.assertRaises(Fail) as cm:
-                load_config(self.tmp)
-            self.assertEqual(cm.exception.code, 2)
-
-        def test_a_comment_only_file_is_no_config_at_all_without_tomllib(self):
-            """`setup` used to leave a commented template behind on any Python; a file that
-            configures nothing must not brick every subcommand on 3.9/3.10."""
-            write(self.tmp, CONFIG_FILE, "# trunk = \"develop\"\n\n#  gate = []\n")
-            with mock.patch.dict(sys.modules, {"tomllib": None}):
-                self.assertEqual(load_config(self.tmp), {})
-
-        def test_a_file_that_does_configure_something_is_still_fatal_without_tomllib(self):
-            write(self.tmp, CONFIG_FILE, '# the trunk\ntrunk = "trunk"\n')
-            with mock.patch.dict(sys.modules, {"tomllib": None}):
-                with self.assertRaises(Fail) as cm:
-                    load_config(self.tmp)
-            self.assertEqual(cm.exception.code, 2)
-            self.assertIn("3.11", str(cm.exception))
-            # the way out it names keeps the file and its settings: every line a comment
-            self.assertIn("into a `#` comment", str(cm.exception))
-            path = os.path.join(self.tmp, CONFIG_FILE)
-            with open(path) as fh:
-                lines = fh.read().splitlines()
-            write(self.tmp, CONFIG_FILE, "".join("# %s\n" % ln for ln in lines))
-            with mock.patch.dict(sys.modules, {"tomllib": None}):
-                self.assertEqual(load_config(self.tmp), {})
-            with open(path) as fh:
-                self.assertIn('trunk = "trunk"', fh.read())
-
-        @needs_tomllib
-        def test_a_value_of_the_wrong_type_is_fatal(self):
-            """Every value ends up on a git command line: a wrong type would be a traceback."""
-            for text in ('trunk = 123\n', 'mirror = ["a"]\n', 'sync_prefix = true\n',
-                         'upstream = 1.5\n', 'backup_prefix = 7\n', 'upstream_branch = []\n'):
-                write(self.tmp, CONFIG_FILE, text)
-                with self.assertRaises(Fail) as cm:
-                    load_config(self.tmp)
-                self.assertEqual(cm.exception.code, 2, text)
-                self.assertIn("must be a string", str(cm.exception))
-
-        @needs_tomllib
-        def test_a_file_that_cannot_be_read_is_fatal(self):
-            path = write(self.tmp, CONFIG_FILE, 'trunk = "trunk"\n')
-            os.chmod(path, 0)
-            self.addCleanup(os.chmod, path, 0o644)
-            if os.access(path, os.R_OK):                 # running as root: nothing to prove
-                self.skipTest("the file is readable anyway")
-            with self.assertRaises(Fail) as cm:
-                load_config(self.tmp)
-            self.assertEqual(cm.exception.code, 2)
-            self.assertIn("cannot be read", str(cm.exception))
-
-        def test_without_tomllib_is_fatal(self):
-            write(self.tmp, CONFIG_FILE, 'trunk = "trunk"\n')
-            with mock.patch.dict(sys.modules, {"tomllib": None}):
-                with self.assertRaises(Fail) as cm:
-                    load_config(self.tmp)
-            self.assertEqual(cm.exception.code, 2)
-            self.assertIn("3.11", str(cm.exception))
-
-        @needs_tomllib
-        def test_merge_is_manual_or_self_and_nothing_else(self):
-            """`merge` decides whether `--merge` may merge at all: a spelling nobody defined
-            is refused outright rather than read as one of the two."""
-            for text, expected in (('merge = "self"\n', "self"), ('merge = "manual"\n', "manual")):
-                write(self.tmp, CONFIG_FILE, text)
-                self.assertEqual(load_config(self.tmp)["merge"], expected, text)
-            write(self.tmp, CONFIG_FILE, 'trunk = "develop"\n')
-            self.assertNotIn("merge", load_config(self.tmp))              # absent: the default
-            for text in ('merge = "auto"\n', 'merge = "Self"\n', 'merge = ""\n'):
-                write(self.tmp, CONFIG_FILE, text)
-                with self.assertRaises(Fail) as cm:
-                    load_config(self.tmp)
-                self.assertEqual(cm.exception.code, 2, text)
-                self.assertIn('`merge` must be "manual" or "self"', str(cm.exception))
-            write(self.tmp, CONFIG_FILE, "merge = true\n")
-            with self.assertRaises(Fail) as cm:
-                load_config(self.tmp)
-            self.assertEqual(cm.exception.code, 2)
-            self.assertIn("`merge` must be a string", str(cm.exception))
-
-        def test_a_name_that_differs_only_in_case_is_refused(self):
-            """The directory lists `.ForkFlow.toml` and no `.forkflow.toml` - true on every
-            filesystem once that one file is written. A case-insensitive one would open it
-            as the config while git's case-exact paths call it absent; a case-sensitive one
-            would silently ignore the file every other tool there reads. Refused either way,
-            naming the file that was found."""
-            for variant in (".ForkFlow.toml", ".FORKFLOW.TOML", ".forkflow.TOML"):
-                path = write(self.tmp, variant, 'gate = ["true"]\n')
-                self.assertIn(variant, os.listdir(self.tmp))
-                self.assertNotIn(CONFIG_FILE, os.listdir(self.tmp))
-                with self.assertRaises(Fail) as cm:
-                    load_config(self.tmp)
-                self.assertEqual(cm.exception.code, 2, variant)
-                self.assertIn("`%s`" % variant, str(cm.exception))
-                os.unlink(path)
-            self.assertEqual(load_config(self.tmp), {})
-
-        @needs_tomllib
-        def test_an_untracked_variant_is_renamed_by_the_command_printed(self):
-            """Nothing tracked: the printed remedy copies the file into the git directory,
-            then renames it to the exact name - run as printed, the file keeps its content
-            and is read, and the copy is where the message said. No `.forkflow.toml` is
-            listed beside it, so on either kind of filesystem the rename replaces nothing.
-            The same line run twice stops before it could copy over the saved file."""
-            sh("git", "init", "-q", self.tmp)
-            write(self.tmp, ".ForkFlow.toml", 'trunk = "mine"\n')
-            with self.assertRaises(Fail) as cm:
-                load_config(self.tmp)
-            cmd, kept = remedy_of(str(cm.exception))
-            sh("sh", "-c", cmd, cwd=self.tmp)
-            self.assertIn(CONFIG_FILE, os.listdir(self.tmp))
-            self.assertNotIn(".ForkFlow.toml", os.listdir(self.tmp))
-            self.assertEqual(load_config(self.tmp), {"trunk": "mine"})
-            self.assertEqual(os.path.dirname(kept), os.path.join(self.tmp, ".git"))
-            with open(kept) as fh:
-                self.assertEqual(fh.read(), 'trunk = "mine"\n')
-            write(self.tmp, CONFIG_FILE, 'trunk = "edited since"\n')
-            self.assertNotEqual(subprocess.run(["sh", "-c", cmd], cwd=self.tmp,
-                                               capture_output=True).returncode, 0)
-            with open(kept) as fh:
-                self.assertEqual(fh.read(), 'trunk = "mine"\n')             # not copied over
-            self.assertEqual(load_config(self.tmp), {"trunk": "edited since"})
-
-        @needs_tomllib
-        def test_the_exact_name_is_read_when_a_variant_sits_beside_it(self):
-            """Only a case-sensitive filesystem can hold both; there git and the open() agree
-            on which file is `.forkflow.toml`, so it is read and the variant is not the
-            config."""
-            write(self.tmp, CONFIG_FILE, 'trunk = "trunk"\n')
-            with mock.patch.object(os, "listdir", return_value=[".ForkFlow.toml", CONFIG_FILE]):
-                self.assertEqual(load_config(self.tmp), {"trunk": "trunk"})
 
     class TestGitConfigSettings(Base):
         """The settings as `git config` holds them - `.git/config`, which is not tracked and
@@ -7553,19 +7424,21 @@ def run_tests() -> None:
             sh("git", "config", "--global", "forkflow.trunk", "trunk", cwd=root)
             self.assertEqual(git_config_settings(root)["trunk"], "trunk")
 
-        @needs_tomllib
-        def test_the_file_still_wins_key_by_key_where_both_are_there(self):
-            """`resolve_ctx` reads both and the FILE WINS, key by key: a fork that has not
-            moved its settings behaves exactly as it did, and one that has is already read
-            from `.git/config`. Nothing in charge has changed yet."""
+        def test_git_config_is_read_and_the_file_is_not(self):
+            """The file is no longer read for configuration by anything: a `.forkflow.toml`
+            sitting in the tree - and what a sync brings in is the original project's copy
+            of it - names no branch, sets no prefix and adds no `gate`."""
             fork = make_fork(self.tmp, trunk="trunk", mirror="upstream-main",
-                             config='trunk = "trunk"\nmirror = "upstream-main"\n')
-            sh("git", "config", "forkflow.trunk", "from-git-config", cwd=fork)
+                             config='trunk = "trunk"\nmirror = "upstream-main"\n'
+                                    'backup_prefix = "from-the-file/"\n'
+                                    'gate = ["exit 2"]\n')
+            sh("git", "config", "forkflow.trunk", "trunk", cwd=fork)
+            sh("git", "config", "forkflow.mirror", "upstream-main", cwd=fork)
             sh("git", "config", "forkflow.backupPrefix", "safety/", cwd=fork)
             ctx = ctx_for(fork)
-            self.assertEqual(ctx.trunk, "trunk")              # the file's, over git config's
-            self.assertEqual(git_config_settings(fork)["trunk"], "from-git-config")
-            self.assertEqual(ctx.backup_prefix, "safety/")    # a key only git config has
+            self.assertEqual((ctx.trunk, ctx.mirror), ("trunk", "upstream-main"))
+            self.assertEqual(ctx.backup_prefix, "safety/")    # git config's, not the file's
+            self.assertEqual(gate_commands(ctx), [])          # the file's `gate` is not run
 
     # ------------------------------------------------------------------- #
     # resolve_ctx
@@ -7581,7 +7454,6 @@ def run_tests() -> None:
             self.assertEqual(ctx.platform, "unknown")
             self.assertFalse(mirror_divergence(ctx)[0])
 
-        @needs_tomllib
         def test_names_from_config(self):
             fork = make_fork(self.tmp, trunk="trunk", mirror="upstream-main",
                              settings={"trunk": "trunk", "mirror": "upstream-main"})
@@ -7771,7 +7643,6 @@ def run_tests() -> None:
             self.assertIn("narrowed fetch refspec", str(cm.exception))
             self.assertFalse(mirror_divergence(ctx_for(fork, strict_mirror=False))[0])
 
-        @needs_tomllib
         def test_the_prefix_and_upstream_keys_come_from_the_config(self):
             fork = make_fork(self.tmp, settings={"sync_prefix": "merge-up/",
                                                  "backup_prefix": "safety/",
@@ -7786,7 +7657,6 @@ def run_tests() -> None:
             self.assertTrue(sync_branch(ctx).startswith("merge-up/up-"))
             self.assertTrue(backup_name(ctx, "pre-ship").startswith("safety/"))
 
-        @needs_tomllib
         def test_upstream_branch_from_the_config_names_the_mirror(self):
             fork = make_fork(self.tmp, settings={"upstream_branch": "legacy"})
             sha = rev(fork, "refs/remotes/upstream/main")
@@ -7796,7 +7666,6 @@ def run_tests() -> None:
             self.assertEqual(ctx.up(), "upstream/legacy")
             self.assertEqual(ctx.mirror, "legacy")   # the mirror defaults to upstream's branch
 
-        @needs_tomllib
         def test_a_name_git_would_refuse_is_exit_2(self):
             fork = make_fork(self.tmp, settings={"trunk": "bad..name"})
             with self.assertRaises(Fail) as cm:
@@ -7815,7 +7684,6 @@ def run_tests() -> None:
             self.assertTrue(valid_branch_name("head"))       # only the names git resolves first
             self.assertTrue(valid_branch_name("HEAD/x"))     # no ambiguity below a directory
 
-        @needs_tomllib
         def test_head_as_the_trunk_is_exit_2(self):
             fork = make_fork(self.tmp, settings={"trunk": "HEAD"})
             with self.assertRaises(Fail) as cm:
@@ -7952,7 +7820,6 @@ def run_tests() -> None:
                                          "unquoted %r in: %s" % (name, cmd))
             return seen
 
-        @needs_tomllib
         def test_no_command_any_run_prints_carries_a_bare_name(self):
             fork = make_fork(self.tmp, trunk=self.TRUNK,
                              settings={"trunk": self.TRUNK,
@@ -7977,7 +7844,6 @@ def run_tests() -> None:
             # and both names really did reach one, so the check above had something to judge
             self.assertEqual(seen, set(names))
 
-        @needs_tomllib
         def test_a_verified_landing_prints_every_command_quoted(self):
             """The landing that moves the trunk and deletes a branch prints the most: the
             checkout, the fast-forward, the branch deletion and, on GitHub, the remote
@@ -8960,7 +8826,6 @@ def run_tests() -> None:
             self.assertEqual(rev(fork, "refs/heads/" + name), other)   # left exactly as it was
             self.assertEqual(origin_sha(fork, name), "")
 
-        @needs_tomllib
         def test_custom_backup_prefix(self):
             fork = make_fork(self.tmp, settings={"backup_prefix": "safety/"})
             ctx = ctx_for(fork)
@@ -9365,7 +9230,6 @@ def run_tests() -> None:
             self.assertIn("none configured (.forkflow.toml gate = [...])", out)
             self.assertIn("check    ok", out)
 
-        @needs_tomllib
         def test_passing_gate_runs_in_the_repo_root(self):
             fork = make_fork(self.tmp,
                              settings={"gate": ["test -f README.md", "true"]})
@@ -9376,7 +9240,6 @@ def run_tests() -> None:
             self.assertIn("sh -c 'test -f README.md'  -> passed", out)
             self.assertIn("sh -c 'true'  -> passed", out)
 
-        @needs_tomllib
         def test_failing_gate_is_exit_3_with_its_output_tail(self):
             fork = make_fork(
                 self.tmp,
@@ -9392,7 +9255,6 @@ def run_tests() -> None:
             # the first failure is the one to fix: later gate commands do not run
             self.assertFalse(os.path.exists(os.path.join(fork, "second-ran")))
 
-        @needs_tomllib
         def test_dry_run_never_executes_a_gate(self):
             fork = make_fork(self.tmp,
                              settings={"gate": ["touch gate-ran; exit 2"]})
@@ -9403,15 +9265,6 @@ def run_tests() -> None:
             self.assertIn("not run (dry run)", out)
             self.assertFalse(os.path.exists(os.path.join(fork, "gate-ran")))
 
-        @needs_tomllib
-        def test_gate_of_a_wrong_type_is_exit_2(self):
-            for value in ("3", '"make test"', '["ok", 3]'):     # a bare string included
-                fork = make_fork(tempfile.mkdtemp(dir=self.tmp), config="gate = %s\n" % value)
-                code, out, err = run("-C", fork, "check")
-                self.assertEqual(code, 2, value)
-                self.assertIn("list of shell commands", err)
-
-        @needs_tomllib
         def test_only_the_last_lines_of_a_failing_gate_are_shown(self):
             self.assertEqual(TAIL_LINES, 12)         # pinned: what a failing gate is judged by
             fork = make_fork(self.tmp, settings={"gate": ["seq 1 40; exit 2"]})
@@ -9485,7 +9338,6 @@ def run_tests() -> None:
             self.assertNotIn("ours/new.txt", out)
             self.assertIn("check    ok", out)
 
-        @needs_tomllib
         def test_custom_trunk_name_from_config(self):
             fork = make_fork(self.tmp, trunk="trunk", mirror="upstream-main",
                              settings={"trunk": "trunk", "mirror": "upstream-main"})
@@ -9860,7 +9712,6 @@ def run_tests() -> None:
             self.assertNotIn("backup/", local_branches(fork))
             self.assertNotIn(self.sync_name(), local_branches(fork))
 
-        @needs_tomllib
         def test_custom_names_from_config(self):
             fork = make_fork(self.tmp, trunk="trunk", mirror="upstream-main",
                              settings={"trunk": "trunk", "mirror": "upstream-main"})
@@ -9923,7 +9774,6 @@ def run_tests() -> None:
             self.assertEqual(origin_sha(fork, "develop"), before_trunk)
             self.assertEqual(rev(fork, self.sync_name() + "^2"), rev(fork, "upstream/main"))
 
-        @needs_tomllib
         def test_an_untracked_file_upstream_tracks_is_refused_before_the_backup(self):
             """`setup` writes `.forkflow.toml` untracked, and an upstream that uses forkflow
             too tracks it - the case the gate guard exists for. git refuses a merge that
@@ -9970,7 +9820,6 @@ def run_tests() -> None:
                                           cwd=fork))
             self.assertEqual(sh("git", "show", "HEAD:" + CONFIG_FILE, cwd=fork), ours.strip())
 
-        @needs_tomllib
         def test_the_untracked_merge_fallback_names_a_rerun_that_is_not_a_closed_loop(self):
             """`cmd_sync`'s preflight answers this before the backup; the fallback in
             `merge_upstream` is what is left when the tree changes under the run, and by then
@@ -10006,7 +9855,6 @@ def run_tests() -> None:
             with open(kept) as fh:
                 self.assertEqual(fh.read(), "ours, untracked\n")
 
-        @needs_tomllib
         def test_the_untracked_merge_fallback_for_the_config_keeps_it(self):
             """The fallback meeting the untracked config gives the config's own answer -
             ship it, then `--force` - and followed to the letter it loses nothing: the next
@@ -10075,7 +9923,6 @@ def run_tests() -> None:
             with open(kept) as fh:
                 self.assertEqual(fh.read(), "# ours, untracked\n")
 
-        @needs_tomllib
         def test_failing_gate_is_exit_3_with_the_continue_hint(self):
             fork = make_fork(self.tmp, settings={"gate": ["exit 2"]})
             self.ahead_upstream(fork)
@@ -10085,137 +9932,6 @@ def run_tests() -> None:
             self.assertIn("forkflow sync --continue", out)
             self.assertEqual(origin_sha(fork, self.sync_name()), "")   # nothing was pushed
             self.assertEqual(origin_sha(fork, "develop"), before_trunk)
-
-    @needs_tomllib
-    class TestSyncGateOnACleanMerge(Base):
-        """The `gate` guard on the path where the merge does not conflict.
-
-        `resolve_ctx` reads `.forkflow.toml` before that merge, so everything here is about
-        the config the merge *produced* rather than the one the run started with."""
-
-        def trunk_from_upstream(self, fork: str) -> None:
-            """Publish upstream's tip as the trunk, as a merged sync MR would: the fork then
-            carries upstream's `.forkflow.toml` and the next change to it merges clean."""
-            push_upstream_into_origin(self.tmp, "develop")
-            sh("git", "fetch", "origin", cwd=fork)
-            sh("git", "checkout", "develop", cwd=fork)
-            sh("git", "reset", "--hard", "origin/develop", cwd=fork)
-
-        def test_the_gate_shown_is_the_one_the_merge_brought(self):
-            """The guard exists so nobody runs upstream's unread shell. Showing the fork's
-            own pre-merge command and then naming `forkflow check` - which runs the one that
-            arrived - is that failure, not a display wart."""
-            fork = make_fork(self.tmp)
-            ours = os.path.join(self.tmp, "OLD-ran")
-            theirs = os.path.join(self.tmp, "NEW-ran")
-            commit_upstream(self.tmp, CONFIG_FILE, 'gate = ["touch %s"]\n' % ours,
-                            "theirs: a gate")
-            self.trunk_from_upstream(fork)
-            commit_upstream(self.tmp, CONFIG_FILE, 'gate = ["touch %s"]\n' % theirs,
-                            "theirs: a different gate")
-
-            code, out, err = run("-C", fork, "sync")
-            self.assertEqual(code, 0, err + out)
-            self.assertIn("NOT RUN", out)
-            self.assertIn("would have run: sh -c 'touch %s'" % theirs, out)
-            self.assertNotIn(ours, out)                    # never the pre-merge command
-            self.assertFalse(os.path.exists(ours))
-            self.assertFalse(os.path.exists(theirs))
-
-            # `forkflow check` is the command the guard names: it runs what it showed
-            code, out, err = run("-C", fork, "check")
-            self.assertEqual(code, 0, err + out)
-            self.assertTrue(os.path.exists(theirs))
-            self.assertFalse(os.path.exists(ours))
-
-        def test_a_gate_the_fork_did_not_have_is_shown_and_not_run(self):
-            """The fork has no `gate` at all and upstream's merge adds one: there is nothing
-            to suppress, and the NOT-RUN block is the whole point of the run."""
-            fork = make_fork(self.tmp)
-            flag = os.path.join(self.tmp, "theirs-gate-ran")
-            commit_upstream(self.tmp, CONFIG_FILE, 'gate = ["touch %s"]\n' % flag,
-                            "theirs: a gate")
-
-            code, out, err = run("-C", fork, "sync")
-            self.assertEqual(code, 0, err + out)
-            self.assertIn("NOT RUN", out)
-            self.assertIn("would have run: sh -c 'touch %s'" % flag, out)
-            self.assertNotIn("none configured", out)
-            self.assertFalse(os.path.exists(flag))
-
-        def test_an_unchanged_gate_runs_even_when_upstream_edits_the_file(self):
-            """The inverse mistake: this fork's own preflight silently skipped because
-            upstream touched an unrelated line. The MR would be opened with `check ok`
-            printed and nothing checked."""
-            fork = make_fork(self.tmp)
-            flag = os.path.join(self.tmp, "ours-gate-ran")
-            gate = 'gate = ["touch %s"]\n' % flag
-            commit_upstream(self.tmp, CONFIG_FILE, gate, "theirs: a gate")
-            self.trunk_from_upstream(fork)
-            commit_upstream(self.tmp, CONFIG_FILE, "# upstream added a comment\n" + gate,
-                            "theirs: a comment, and nothing else")
-
-            code, out, err = run("-C", fork, "sync")
-            self.assertEqual(code, 0, err + out)
-            self.assertNotIn("NOT RUN", out)
-            self.assertIn("sh -c 'touch %s'" % flag, out)
-            self.assertTrue(os.path.exists(flag))
-            # the file did change, so the reviewer is still told to read the diff
-            self.assertIn("this sync changes `%s`" % CONFIG_FILE, out)
-
-        def test_the_untracked_gate_setup_leaves_behind_still_runs(self):
-            """The default post-setup state, and the one `setup/SKILL.md` sends the user to:
-            `.forkflow.toml` is untracked and holds this fork's own `gate`. Nothing in the
-            merge touches it, so the preflight must run and the reviewer must not be sent to
-            a diff that prints nothing. Reading the working tree on one side of the guard and
-            a commit on the other made an untracked file read as "the merge changed it": the
-            gate was skipped and the CHECK advisory fired on every sync, forever."""
-            fork = make_fork(self.tmp)
-            self.assertEqual(run("-C", fork, "setup")[0], 0)
-            flag = os.path.join(self.tmp, "ours-gate-ran")
-            with open(os.path.join(fork, CONFIG_FILE), "a") as fh:
-                fh.write('gate = ["touch %s"]\n' % flag)
-            self.assertIn("?? " + CONFIG_FILE,
-                          sh("git", "status", "--porcelain", cwd=fork))     # still untracked
-            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: a doc")
-
-            code, out, err = run("-C", fork, "sync")
-            self.assertEqual(code, 0, err + out)
-            self.assertNotIn("NOT RUN", out)
-            self.assertNotIn("this sync changes `%s`" % CONFIG_FILE, out)
-            self.assertIn("sh -c 'touch %s'  -> passed" % flag, out)
-            self.assertTrue(os.path.exists(flag))
-
-            # `check` in the same clone runs the same gate: `sync` and `check` must not
-            # disagree about whose shell the file holds
-            os.unlink(flag)
-            code, out, err = run("-C", fork, "check")
-            self.assertEqual(code, 0, err + out)
-            self.assertTrue(os.path.exists(flag))
-
-        def test_a_merged_config_that_cannot_be_read_names_the_state_and_the_way_out(self):
-            """`finish_sync` reloads the config from the merged tree, so an ordinary typo
-            arriving in `.forkflow.toml` aborts the run *after* the mirror push, the backup,
-            the merge commit and the branch. A bare parse error there said nothing about what
-            had been done or how to get out, and every later command died on the same line."""
-            fork = make_fork(self.tmp)
-            commit_upstream(self.tmp, CONFIG_FILE, "gate = []\n", "theirs: forkflow too")
-            self.trunk_from_upstream(fork)
-            commit_upstream(self.tmp, CONFIG_FILE, "gate = [\n", "theirs: a typo")
-
-            code, out, err = run("-C", fork, "sync")
-            self.assertEqual(code, 2, out + err)
-            self.assertIn("cannot be read", err)
-            self.assertIn("the merge commit and `sync/upstream-", err)     # what was done
-            self.assertIn("forkflow sync --continue", err)                 # the way out
-            self.assertEqual(origin_sha(fork, sync_branch_name()), "")     # nothing published
-
-            # the route it names, followed literally
-            write(fork, CONFIG_FILE, "gate = []\n")
-            sh("git", "commit", "-am", "ours: fix the config the merge broke", cwd=fork)
-            code, out, err = run("-C", fork, "sync", "--continue")
-            self.assertEqual(code, 0, err + out)
-            self.assertEqual(origin_sha(fork, sync_branch_name()), rev(fork, "HEAD"))
 
     class TestSyncConflicts(Base):
         """The conflict path, `sync --continue`, and the both-sides table."""
@@ -10283,83 +9999,6 @@ def run_tests() -> None:
             # the mirror step ran before the merge and is complete on its own
             self.assertEqual(rev(fork, "refs/heads/main"), rev(fork, "upstream/main"))
             self.assertEqual(origin_sha(fork, "main"), rev(fork, "upstream/main"))
-
-        @needs_tomllib
-        def test_a_gate_that_arrived_in_the_merge_is_shown_and_not_run(self):
-            """`gate` is the one config key that is *run* (`sh -c`), and `.forkflow.toml` is a
-            tracked file a sync is designed to bring in from the original project. The run
-            whose own merge wrote it prints the commands instead of obeying them."""
-            fork = self.conflicting_fork()
-            flag = os.path.join(self.tmp, "gate-ran")
-            commit_upstream(self.tmp, CONFIG_FILE, 'gate = ["touch %s"]\n' % flag,
-                            "theirs: a gate")
-            self.assertEqual(run("-C", fork, "sync")[0], 4)          # shared.tf conflicts
-            self.resolve(fork, self.BASE_TF.replace("count = 1", "count = 4"))
-
-            code, out, err = run("-C", fork, "sync", "--continue")
-            self.assertEqual(code, 0, err + out)
-            self.assertIn("this sync changes `%s`" % CONFIG_FILE, out)
-            self.assertIn("NOT RUN", out)
-            self.assertIn("would have run: sh -c 'touch %s'" % flag, out)
-            self.assertFalse(os.path.exists(flag))
-
-            # and it is only that run: a gate the fork now carries runs like any other, with
-            # the provenance of the file it comes from said out loud
-            code, out, err = run("-C", fork, "check")
-            self.assertEqual(code, 0, err + out)
-            self.assertTrue(os.path.exists(flag))
-            self.assertIn("is tracked by `upstream/main` too", out)
-
-        @needs_tomllib
-        def test_a_gate_that_arrived_stays_shown_after_a_commit_on_the_merge(self):
-            """`--continue` supports a commit made on top of the merge - that is how a
-            refused `check` is fixed. The merge is then no longer `HEAD`, and the gate it
-            brought must still be shown rather than run."""
-            fork = self.conflicting_fork()
-            flag = os.path.join(self.tmp, "gate-ran")
-            commit_upstream(self.tmp, CONFIG_FILE, 'gate = ["touch %s"]\n' % flag,
-                            "theirs: a gate")
-            self.assertEqual(run("-C", fork, "sync")[0], 4)
-            self.resolve(fork, self.BASE_TF.replace("count = 1", "count = 4"))
-            self.assertEqual(run("-C", fork, "sync", "--continue")[0], 0)
-            self.assertFalse(os.path.exists(flag))
-
-            commit_fork(fork, "ours/fix.txt", "fixed\n", "ours: fix what check refused")
-            code, out, err = run("-C", fork, "sync", "--continue")
-            self.assertEqual(code, 0, err + out)
-            self.assertIn("NOT RUN", out)
-            self.assertIn("would have run: sh -c 'touch %s'" % flag, out)
-            self.assertIn("this sync changes `%s`" % CONFIG_FILE, out)
-            self.assertFalse(os.path.exists(flag))
-
-        @needs_tomllib
-        def test_a_gate_that_arrived_stays_shown_after_a_merge_on_the_merge(self):
-            """The same fix, with a `git merge` on top instead of a commit: that is a merge
-            commit too, and the *newest* merge on the branch is then not the sync merge.
-            Resuming from it made `--continue` compare the gate against the merge's own first
-            parent - the sync merge, which already carries upstream's `gate` - so the guard
-            said nothing had changed and `sh -c` ran shell nobody had read."""
-            fork = self.conflicting_fork()
-            flag = os.path.join(self.tmp, "gate-ran")
-            commit_upstream(self.tmp, CONFIG_FILE, 'gate = ["touch %s"]\n' % flag,
-                            "theirs: a gate")
-            self.assertEqual(run("-C", fork, "sync")[0], 4)
-            self.resolve(fork, self.BASE_TF.replace("count = 1", "count = 4"))
-            self.assertEqual(run("-C", fork, "sync", "--continue")[0], 0)
-            self.assertFalse(os.path.exists(flag))
-
-            name = checked_out(fork)
-            sh("git", "switch", "-c", "fix/x", cwd=fork)
-            commit_fork(fork, "ours/fix.txt", "fixed\n", "ours: fix what check refused")
-            sh("git", "switch", name, cwd=fork)
-            sh("git", "merge", "--no-ff", "--no-edit", "fix/x", cwd=fork)
-
-            code, out, err = run("-C", fork, "sync", "--continue")
-            self.assertEqual(code, 0, err + out)
-            self.assertIn("NOT RUN", out)
-            self.assertIn("would have run: sh -c 'touch %s'" % flag, out)
-            self.assertIn("this sync changes `%s`" % CONFIG_FILE, out)
-            self.assertFalse(os.path.exists(flag))
 
         def test_continue_after_a_resolution_that_keeps_both_sides(self):
             fork = self.appending_fork()
@@ -10836,7 +10475,6 @@ def run_tests() -> None:
             self.assertIn("    src/app.py", out)
             self.assertNotIn("ours/new.txt", out)
 
-        @needs_tomllib
         def test_custom_trunk_name_is_the_rebase_target(self):
             fork = make_fork(self.tmp, trunk="trunk", settings={"trunk": "trunk"})
             sh("git", "checkout", "-b", "feat/x", "trunk", cwd=fork)
@@ -11108,7 +10746,6 @@ def run_tests() -> None:
             self.assertEqual(origin_sha(fork, "develop"), before_trunk)
             self.assertIn("rollback: git reset --hard origin/" + DEFAULT_BACKUP_PREFIX, out)
 
-        @needs_tomllib
         def test_gate_failure_after_the_squash_is_exit_3_with_the_rollback_line(self):
             fork = make_fork(self.tmp,
                              settings={"gate": ["echo gate-said-no; exit 2"]})
@@ -11126,7 +10763,6 @@ def run_tests() -> None:
             self.assertEqual(sh("git", "rev-list", "--count",
                                 "origin/develop..HEAD", cwd=fork), "1")
 
-        @needs_tomllib
         def test_a_gate_failure_on_a_published_branch_is_resumable(self):
             """exit 3 leaves the branch squashed, so `origin/<branch>` is no longer in it. The
             hint has to name `--continue`, and neither that nor a fresh `ship` may refuse the
@@ -11149,7 +10785,6 @@ def run_tests() -> None:
             self.assertEqual(sh("git", "rev-list", "--count",
                                 "origin/develop..HEAD", cwd=fork), "1")
 
-        @needs_tomllib
         def test_ship_run_again_after_a_gate_failure_is_not_refused(self):
             """The same state, resumed the other way: a plain rerun of `ship`. Its own squash
             is what put `origin/<branch>` outside the branch, so refusing it would make exit 3
@@ -11168,7 +10803,6 @@ def run_tests() -> None:
             self.assertEqual(origin_sha(fork, name), rev(fork, "HEAD"))
             self.assertNotEqual(origin_sha(fork, name), published)
 
-        @needs_tomllib
         def test_the_recorded_lease_resumes_a_rerun_when_the_reflog_is_gone(self):
             """Reflogs expire and can be switched off, so the run's own record has to stand
             on its own: the lease the interrupted `ship` fetched is the tip it may replace."""
@@ -11378,7 +11012,6 @@ def run_tests() -> None:
             self.assertEqual(self.push_url(fork, "original"), "DISABLED")
             self.assertIn("upstream=original/main", out)
 
-        @needs_tomllib
         def test_the_upstream_flag_is_used_and_written_to_the_config(self):
             """With more than one non-origin remote nothing can be inferred: the name the
             flag gave has to outlive the run that gave it."""
@@ -11404,7 +11037,6 @@ def run_tests() -> None:
             self.assertIn("--upstream-url is ignored", out)
             self.assertEqual(sh("git", "remote", "get-url", "upstream", cwd=fork), before)
 
-        @needs_tomllib
         def test_trunk_and_mirror_flags_are_written_and_other_keys_survive(self):
             fork = make_fork(self.tmp, trunk="trunk", mirror="upstream-main",
                              config='gate = ["true"]\n')
@@ -13232,7 +12864,6 @@ def run_tests() -> None:
             self.assertEqual(code, 0, err + out)
             self.assertFalse(os.path.exists(git_path(fork, STATE_FILE)))
 
-    @needs_tomllib
     class MergeBase(ShipBase):
         """A `merge = "self"` fork on a named platform, with `merging_tool` as the platform:
         what the `--merge` tests and the `land`-after-`--merge` tests share. The fixture's
@@ -15065,7 +14696,6 @@ def run_tests() -> None:
             self.assertEqual(code, 0, err2 + out)
             self.merged_and_landed(fork, name)
 
-    @needs_tomllib
     class TestForkMergeMode(ShipBase):
         """`fork_merge_mode` reads `merge` only where the original project cannot write it:
         the config committed on `origin/<trunk>` by this fork, or - while none is committed
@@ -15841,7 +15471,7 @@ def run_tests() -> None:
             scope is for. What must not happen is the refusal outliving the config that
             caused it: the fork edits the file, and the gate opens again."""
             config = 'merge = "self"\nmirror = "ours"\n'
-            fork = make_fork(self.tmp, config=config)
+            fork = make_fork(self.tmp, config=config, settings={"mirror": "ours"})
             sh("git", "push", "-q", "origin", "develop:refs/heads/ours", cwd=fork)
             sh("git", "fetch", "-q", "origin", cwd=fork)
             ctx = ctx_for(fork)
@@ -15865,7 +15495,7 @@ def run_tests() -> None:
             What a remote is a remote OF is `repo_id`, off `origin`'s own URL - local git
             config, which upstream cannot write - so this is not a narrowing a
             `.forkflow.toml` can reach."""
-            fork = make_fork(self.tmp)
+            fork = make_fork(self.tmp, settings={"upstream": "upstream"})
             mine = 'upstream = "upstream"\nmerge = "self"\ngate = ["make test"]\n'
             write(fork, CONFIG_FILE, mine)                  # where `setup` leaves it
             self.assertEqual(self.mode(fork), "self")
@@ -15893,7 +15523,7 @@ def run_tests() -> None:
             So the record carries the repository each digest came from, the refusal NAMES the
             remote whose history matched, and the way back it prints is run here exactly as
             printed. Nothing is dropped: re-adding the remote refuses again."""
-            fork = make_fork(self.tmp)
+            fork = make_fork(self.tmp, settings={"upstream": "upstream"})
             team = 'upstream = "upstream"\nmerge = "self"\ngate = ["make test"]\n'
             write(fork, CONFIG_FILE, team)
             self.assertEqual(self.mode(fork), "self")
@@ -16025,7 +15655,8 @@ def run_tests() -> None:
             `upstream_scope_refs` takes the scope from every remote-tracking ref that is not
             `origin`'s instead - remotes are local git config, which upstream cannot write -
             so `upstream/main` is walked however the config is spelled."""
-            fork = make_fork(self.tmp)
+            fork = make_fork(self.tmp, settings={"upstream_branch": "blank",
+                                                 "trunk": "main", "mirror": "develop"})
             self.blank_upstream_branch()
             theirs = ('merge = "self"\ngate = ["touch theirs"]\n'
                       'upstream_branch = "blank"\ntrunk = "main"\nmirror = "develop"\n')
@@ -16048,7 +15679,7 @@ def run_tests() -> None:
             `upstream` at a remote with nothing fetched under it must not make them this
             fork's. `upstream/main` is deleted here and the mirror with it, so only the
             other remote's refs can answer - and they do."""
-            fork = make_fork(self.tmp)
+            fork = make_fork(self.tmp, settings={"upstream": "upstream"})
             theirs = ('merge = "self"\nupstream = "upstream"\n'
                       '# theirs, fetched under another remote\n')
             commit_upstream(self.tmp, CONFIG_FILE, theirs, "theirs: forkflow")
@@ -16240,11 +15871,9 @@ def run_tests() -> None:
             self.assertEqual(origin_sha(fork, "feat/x"), "")
             self.assertFalse(self.work_state(fork))
 
-        @needs_tomllib
         def test_refused_on_a_manual_fork_with_the_config_committed(self):
             self.both_refused(make_fork(self.tmp, config='merge = "manual"\n'))
 
-        @needs_tomllib
         def test_refused_on_a_manual_fork_with_the_config_untracked(self):
             """`setup` leaves `.forkflow.toml` untracked, and `load_config` reads the
             working tree: the gate reads it there too - it stays untracked throughout (the
@@ -16266,7 +15895,6 @@ def run_tests() -> None:
             self.feature(fork)            # `ship` refuses the trunk before the gate is read
             return fork
 
-        @needs_tomllib
         def test_refused_on_a_shallow_clone(self):
             """Fail CLOSED: a version the walk cannot see is not a version upstream never
             had. A shallow clone simply does not hold the commits before its cut, so
@@ -16282,7 +15910,6 @@ def run_tests() -> None:
             self.assertIn("git fetch --unshallow upstream", err)
             self.assertIn("merged by hand", err)
 
-        @needs_tomllib
         def test_refused_when_history_is_rewritten_by_a_replace_ref(self):
             """`refs/replace/*` makes git answer with a history that is not the one the
             original project published - which is the one the set has to be taken from."""
@@ -16293,7 +15920,6 @@ def run_tests() -> None:
             self.assertIn("refs/replace/", err)
             self.assertIn("git replace -l", err)
 
-        @needs_tomllib
         def test_refused_on_a_partial_clone(self):
             """A promisor remote means the blobs are fetched on demand: a `.forkflow.toml`
             upstream had can be absent here, and absence is what reads as "never had it"."""
@@ -16329,7 +15955,6 @@ def run_tests() -> None:
             self.assertTrue(os.path.exists(loose), loose)
             os.remove(loose)
 
-        @needs_tomllib
         def test_refused_when_a_config_at_a_tip_cannot_be_read(self):
             """The object is gone from this clone, and a ref names the tree that holds it:
             reading that as "upstream never had these bytes" is the open gate."""
@@ -16341,7 +15966,6 @@ def run_tests() -> None:
             self.assertIn("cannot be read", err)
             self.assertIn("merged by hand", err)
 
-        @needs_tomllib
         @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
                          "root reads a mode-000 file anyway")
         def test_refused_when_a_config_the_history_lists_cannot_be_read(self):
@@ -16362,7 +15986,6 @@ def run_tests() -> None:
             self.assertIn(short(blob), err)
             self.assertIn("cannot be read", err)
 
-        @needs_tomllib
         def test_refused_when_the_history_cannot_be_walked_at_all(self):
             """A commit missing from the middle: the tips still read, and `rev-list` fails.
             An empty answer from a walk that failed is not "no config was ever here"."""
@@ -16374,7 +15997,6 @@ def run_tests() -> None:
             self.assertIn("cannot be walked", err)
             self.assertIn("merged by hand", err)
 
-        @needs_tomllib
         def test_refused_when_this_clone_holds_nothing_of_upstreams(self):
             """Nothing outside `origin` is fetched here, so there is no history of the
             original project's to compare a config against - and an empty set says every
@@ -16418,7 +16040,6 @@ def run_tests() -> None:
             self.refused(fork, "ship", "--continue", "--merge")
             self.assertEqual(origin_sha(fork, name), "")                   # nothing pushed
 
-        @needs_tomllib
         def test_refused_when_merge_self_arrived_with_the_sync(self):
             """The fork has no config ("manual"); upstream's `.forkflow.toml` says `merge =
             "self"` and comes in with a conflicted sync. On `--continue` the working tree is
@@ -16450,7 +16071,6 @@ def run_tests() -> None:
             # still `--mr`: the request the reviewer merges by hand is opened
             self.assertEqual(tool_argv(self.tmp, "glab", "create")[:2], ["mr", "create"])
 
-        @needs_tomllib
         def test_refused_on_a_sync_branch_left_carrying_upstreams_merge_self(self):
             """The fork has no config ("manual"); upstream's `.forkflow.toml` says `merge =
             "self"`. `sync --mr` leaves the user on the sync branch, whose tree holds
@@ -16475,7 +16095,6 @@ def run_tests() -> None:
             self.assertEqual(origin_sha(fork, name + "-2"), "")
             self.assertEqual(origin_sha(fork, "develop"), trunk)
 
-        @needs_tomllib
         def test_refused_when_upstreams_config_sits_untracked_in_the_working_tree(self):
             """This fork chose no `merge`. A sync brought upstream's `.forkflow.toml` in and
             the user untracked it by hand, leaving upstream's bytes on disk in the state
@@ -16500,7 +16119,6 @@ def run_tests() -> None:
             self.assertEqual(code, 0, err + out)
             self.assertEqual(tool_argv(self.tmp, "glab", "merge")[:3], ["mr", "merge", name])
 
-        @needs_tomllib
         def test_the_refusal_over_upstreams_config_says_whose_it_is_and_names_the_way_back(self):
             """A sync whose `.forkflow.toml` conflict a person resolved by taking upstream's
             text leaves upstream's bytes on the trunk. `--merge` is refused - they are not
@@ -16532,14 +16150,12 @@ def run_tests() -> None:
             sh("git", "fetch", "-q", "origin", cwd=fork)
             self.assertEqual(fork_merge_mode(ctx_for(fork)), "self")
 
-        @needs_tomllib
         def test_refused_when_the_origin_names_no_project(self):
             """Knowable at gate time, so not a push followed by a failed merge: the fixture's
             local-path origin is on no platform and cannot be given to `--repo`."""
             self.both_refused(make_fork(self.tmp, config='merge = "self"\n'), why=self.UNNAMED,
                               named=False)
 
-        @needs_tomllib
         def test_refused_for_a_branch_that_reads_as_a_request_number(self):
             """The merge is addressed by branch name, and `glab mr merge 123` reads `123`
             as merge request !123 - refused before anything is pushed."""
@@ -16548,7 +16164,6 @@ def run_tests() -> None:
             self.refused(fork, "ship", "--merge", why="reads as a merge request number")
             self.assertEqual(origin_sha(fork, "123"), "")
 
-        @needs_tomllib
         def test_the_ship_that_first_commits_the_config_is_told_which_flag_to_use(self):
             """`setup` leaves `.forkflow.toml` untracked and `--merge` reads it there. The
             one ship that first COMMITS it is refused - on a branch the file is neither
@@ -16570,7 +16185,6 @@ def run_tests() -> None:
             self.assertEqual(tool_argv(self.tmp, "glab", "create")[:2], ["mr", "create"])
             self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])   # merged by hand
 
-        @needs_tomllib
         def test_passes_on_a_self_fork_whose_origin_is_named(self):
             """Both conditions met: the run goes on (a dry run here, which pushes nothing
             and reaches the merge-request step)."""
@@ -16588,7 +16202,6 @@ def run_tests() -> None:
             self.assertNotIn(self.REFUSED, err)
             self.assertIn("not run (dry run)", out)              # `--merge` implied `--mr`
 
-        @needs_tomllib
         def test_passes_with_merge_self_untracked_as_setup_leaves_it(self):
             """The ordinary solo fork after `setup`: `merge = "self"` in an UNTRACKED
             `.forkflow.toml`. The gate passes on the file as it is - not only on a committed
@@ -16644,16 +16257,6 @@ def run_tests() -> None:
                             'merge = "self"\ngate = ["touch %s"]\n' % flag,
                             "theirs: forkflow, spelled differently")
 
-        def test_check_refuses_a_variant_in_the_tree_and_runs_no_gate(self):
-            fork = make_fork(self.tmp)
-            flag = os.path.join(self.tmp, "variant-gate-ran")
-            write(fork, self.VARIANT, 'gate = ["touch %s"]\n' % flag)
-            self.assertNotIn(CONFIG_FILE, os.listdir(fork))
-            code, out, err = run("-C", fork, "check")
-            self.assertEqual(code, 2, err + out)
-            self.assertIn("`%s`" % self.VARIANT, err)
-            self.assertFalse(os.path.exists(flag))
-
         def test_a_committed_variant_counts_as_the_config(self):
             """What "is the config tracked" and "what did this revision carry" answer for a
             variant - built with plumbing, so no working-tree file is involved and it holds on
@@ -16679,83 +16282,6 @@ def run_tests() -> None:
                       "-m", "both", cwd=fork)
             self.assertEqual(config_text(ctx, both), "ours\n")
             self.assertIsNone(config_text(ctx, "HEAD"))                   # still none there
-
-        @needs_tomllib
-        def test_a_clean_sync_bringing_a_variant_runs_no_gate(self):
-            """A plain `sync` on a fork with no config of its own: the merge is clean, and
-            before the fix `check` ran upstream's gate from the variant."""
-            fork = make_fork(self.tmp)
-            if not case_insensitive(fork):
-                self.skipTest("the filesystem is case-sensitive")
-            flag = os.path.join(self.tmp, "upstream-gate-ran")
-            self.upstream_variant(flag)
-            code, out, err = run("-C", fork, "sync")
-            self.assertEqual(code, 2, err + out)
-            self.assertIn("`%s`" % self.VARIANT, err)
-            self.assertFalse(os.path.exists(flag))
-            name = sync_branch_name()
-            self.assertEqual(checked_out(fork), name)                    # the merge is made
-            self.assertEqual(origin_sha(fork, name), "")                   # nothing pushed
-            # the route the refusal names, run as printed: the fork has no config of its own,
-            # so the variant takes the exact name, content kept (and a copy kept first),
-            # committed on the sync branch
-            with open(os.path.join(fork, self.VARIANT)) as fh:
-                theirs = fh.read()
-            cmd, kept = remedy_of(err)
-            sh("sh", "-c", cmd, cwd=fork)
-            self.assertIn(CONFIG_FILE, os.listdir(fork))
-            with open(os.path.join(fork, CONFIG_FILE)) as fh:
-                self.assertEqual(fh.read(), theirs)
-            with open(kept) as fh:
-                self.assertEqual(fh.read(), theirs)
-            sh("git", "commit", "-q", "-m", "upstream's config under the name forkflow reads",
-               cwd=fork)
-            code, out, err2 = run_printed(err, "forkflow sync --continue", fork)
-            self.assertEqual(code, 0, err2 + out)
-            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
-            self.assertFalse(os.path.exists(flag))       # still upstream's gate: shown, not run
-
-        @needs_tomllib
-        def test_a_conflicted_sync_bringing_a_variant_is_not_merged_on_continue(self):
-            fork = make_fork(self.tmp)
-            if not case_insensitive(fork):
-                self.skipTest("the filesystem is case-sensitive")
-            flag = os.path.join(self.tmp, "upstream-gate-ran")
-            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
-                        "ours: shared", push=True)
-            self.upstream_variant(flag)
-            commit_upstream(self.tmp, "shared.tf", self.BASE_TF.replace("count = 1", "count = 3"),
-                            "theirs: shared")
-            merging_tool(self.tmp, "glab")
-            trunk = origin_sha(fork, "develop")
-            with on_platform("gitlab"):
-                self.assertEqual(run("-C", fork, "sync")[0], 4)
-            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
-            sh("git", "add", "shared.tf", cwd=fork)
-            name = sync_branch_name()
-            with on_platform("gitlab"):
-                code, out, err = run("-C", fork, "sync", "--continue", "--merge")
-            self.assertEqual(code, 2, err + out)
-            self.assertIn("`%s`" % self.VARIANT, err)
-            self.assertFalse(os.path.exists(flag))
-            self.assertEqual(origin_sha(fork, name), "")
-            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
-            self.assertEqual(origin_sha(fork, "develop"), trunk)
-            # renamed to the exact name, it is upstream's config arriving with the merge:
-            # `--merge` is refused (the fork's own config says nothing), and the gate is
-            # shown rather than run
-            sh("git", "mv", self.VARIANT, CONFIG_FILE, cwd=fork)
-            with on_platform("gitlab"):
-                code, out, err = run("-C", fork, "sync", "--continue", "--merge")
-            self.assertEqual(code, 2, err + out)
-            self.assertIn("--merge needs", err)
-            with on_platform("gitlab"):
-                code, out, err = run_printed(err, "forkflow sync --continue", fork)
-            self.assertEqual(code, 0, err + out)
-            self.assertIn("NOT RUN", out)
-            self.assertFalse(os.path.exists(flag))
-            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
-            self.assertEqual(origin_sha(fork, "develop"), trunk)
 
         # -- the remedies: on a case-insensitive filesystem the variant and `.forkflow.toml`
         # -- are ONE file, so a remedy that deletes or renames "the variant" takes the fork's
@@ -16810,13 +16336,11 @@ def run_tests() -> None:
             with open(kept) as fh:
                 self.assertEqual(fh.read(), was)
 
-        @needs_tomllib
         def test_the_index_only_remedy_brings_the_forks_config_back(self):
             fork = self.variant_beside_ours('gate = ["touch theirs"]\n')
             self.run_remedy(fork, 'gate = ["touch theirs"]\n')
             self.assert_ours_back(fork)
 
-        @needs_tomllib
         def test_the_index_only_remedy_holds_when_the_two_hold_the_same_bytes(self):
             """`git rm --cached <variant> && git checkout -- .forkflow.toml` leaves the file
             under the variant's name when the bytes match and the index is fresh: checkout
@@ -16826,7 +16350,6 @@ def run_tests() -> None:
             self.run_remedy(fork, self.OURS)
             self.assert_ours_back(fork)
 
-        @needs_tomllib
         def test_an_edit_made_before_the_remedy_is_in_the_copy(self):
             """The refusal used to invite an edit of the file, and the checkout from HEAD
             then overwrote it with no copy anywhere: the copy is made first."""
@@ -16834,7 +16357,6 @@ def run_tests() -> None:
             self.run_remedy(fork, self.OURS + "# mine\n")
             self.assert_ours_back(fork)
 
-        @needs_tomllib
         def test_the_remedy_goes_through_where_git_rm_cached_refuses(self):
             """The staged variant differs from both the file and HEAD - the middle of a merge
             with the file edited since: `git rm --cached` refuses and suggests `-f`, which
@@ -16862,7 +16384,6 @@ def run_tests() -> None:
             self.assertIn("`gate` is shown rather than run", err)
             self.assertIn("`--merge` is refused", err)
 
-        @needs_tomllib
         def test_a_tracked_variant_alone_is_renamed_with_its_content(self):
             """No `.forkflow.toml` is tracked: the variant is the only config there is, and
             `git mv` gives it the exact name - nothing deleted."""
@@ -16877,7 +16398,6 @@ def run_tests() -> None:
             self.assertEqual(load_config(fork), {"trunk": "develop"})
             self.assertEqual(sh("git", "ls-files", CONFIG_FILE, cwd=fork), CONFIG_FILE)
 
-        @needs_tomllib
         def test_on_the_trunk_nothing_is_run_and_the_fix_goes_on_a_branch(self):
             """The fork's config committed on its trunk under a variant name - which worked
             before variants were refused. On `develop`, and on a detached HEAD, the refusal
@@ -16902,7 +16422,6 @@ def run_tests() -> None:
             self.assertEqual(origin_sha(fork, "develop"), trunk)
             self.assertEqual(sh("git", "ls-files", "--", CONFIG_FILE, cwd=fork), CONFIG_FILE)
 
-        @needs_tomllib
         def test_the_index_state_on_the_trunk_names_nothing_to_run(self):
             fork = self.variant_beside_ours('gate = ["touch theirs"]\n', branch=None)
             no_remedy(self.refusal(fork))
@@ -16942,36 +16461,6 @@ def run_tests() -> None:
                     self.assertEqual(answer, "", branch)
             sh("git", "checkout", "-q", "--detach", cwd=fork)
             self.assertEqual(no_commit_here(fork, "develop"), "HEAD is detached")
-
-        @needs_tomllib
-        def test_a_fresh_fork_of_a_project_that_tracks_a_variant_is_not_a_dead_end(self):
-            """The project itself tracks `.ForkFlow.toml`, and the fork is new: `develop`,
-            `main` and every branch off `origin/develop` are all still at upstream's tip.
-            Each of them answered "carries nothing but upstream's commits" and named no
-            command, so `forkflow setup` - the first command a new fork runs - and the very
-            branch its advice sends you to were both dead ends, with only an unrelated
-            commit leading out. The trunk and the mirror still name no command; the branch
-            they send you to names the rename, which run as printed leaves the config
-            readable."""
-            fork = make_fork(self.tmp)
-            commit_upstream(self.tmp, self.VARIANT, 'gate = ["true"]\n', "theirs: variant")
-            push_upstream_into_origin(self.tmp, "develop")
-            push_upstream_into_origin(self.tmp, "main")
-            sh("git", "fetch", "-q", "--prune", "origin", cwd=fork)
-            sh("git", "fetch", "-q", "upstream", cwd=fork)
-            sh("git", "merge", "-q", "--ff-only", "origin/develop", cwd=fork)
-            self.assertIn(self.VARIANT, os.listdir(fork))
-            code, out, err = run("-C", fork, "setup")
-            self.assertEqual(code, 2, err + out)
-            no_remedy(err)                                   # rule 2: nothing to run here
-            self.assertIn("branch off `origin/develop`", err)
-            sh("git", "checkout", "-q", "main", cwd=fork)
-            sh("git", "merge", "-q", "--ff-only", "origin/main", cwd=fork)
-            no_remedy(self.refusal(fork))                    # rule 6: nor here
-            sh("git", "checkout", "-q", "-b", "fix/config", "origin/develop", cwd=fork)
-            self.run_remedy(fork, 'gate = ["true"]\n')
-            sh("git", "commit", "-q", "-m", "the config under its exact name", cwd=fork)
-            self.assertEqual(load_config(fork), {"gate": ["true"]})
 
         def test_on_the_mirror_nothing_is_run(self):
             """Upstream tracks a variant and the mirror is checked out: the file is upstream's,
@@ -17025,7 +16514,6 @@ def run_tests() -> None:
             with mock.patch.object(os.path, "samefile", side_effect=one_file):
                 self.assertEqual(untracked_in_the_way(ctx, target), [CONFIG_FILE])
 
-        @needs_tomllib
         def test_the_in_the_way_advice_says_when_the_untracked_config_is_upstreams(self):
             """`setup`'s untracked template and upstream's own file, left untracked after a
             sync, are the same shape on disk. The advice called both "this fork's own
@@ -17051,7 +16539,6 @@ def run_tests() -> None:
             self.assertIn("is this fork's own config, untracked", err)
             self.assertNotIn("the original project's own file", err)
 
-        @needs_tomllib
         def test_an_ignored_untracked_config_is_in_the_way_before_the_backup(self):
             """setup's `.forkflow.toml`, kept out of `git status` with `info/exclude`, and
             upstream starts tracking one: git writes over an ignored file without a word, and
@@ -17077,177 +16564,6 @@ def run_tests() -> None:
             self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
             with open(path) as fh:
                 self.assertEqual(fh.read(), ours)
-
-        @needs_tomllib
-        def test_a_config_gone_from_the_tree_mid_sync_is_put_back_before_it_goes_on(self):
-            """A conflict on upstream's `.ForkFlow.toml` resolved with `git rm` deletes the one
-            file a case-insensitive filesystem holds for both names: the fork's
-            `.forkflow.toml` is still in the index and gone from the tree, and `sync
-            --continue` went on with no config - "gate none configured". Built on any
-            filesystem by removing the file; the command printed, run as printed, puts it back
-            and the resumed sync runs the fork's gate."""
-            flag = os.path.join(self.tmp, "fork-gate-ran")
-            config = 'gate = ["touch %s"]\n' % flag
-            fork = make_fork(self.tmp, config=config)
-            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
-                        "ours: shared", push=True)
-            commit_upstream(self.tmp, "shared.tf", self.BASE_TF.replace("count = 1", "count = 3"),
-                            "theirs: shared")
-            self.assertEqual(run("-C", fork, "sync")[0], 4)
-            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
-            sh("git", "add", "shared.tf", cwd=fork)
-            os.unlink(os.path.join(fork, CONFIG_FILE))
-            code, out, err = run("-C", fork, "sync", "--continue")
-            self.assertEqual(code, 2, err + out)
-            name = sync_branch_name()
-            self.assertEqual(origin_sha(fork, name), "")
-            self.assertFalse(os.path.exists(flag))
-            sh("sh", "-c", printed_cmd(err, "git checkout"), cwd=fork)
-            with open(os.path.join(fork, CONFIG_FILE)) as fh:
-                self.assertEqual(fh.read(), config)
-            code, out, err = run_printed(err, "forkflow sync --continue", fork)
-            self.assertEqual(code, 0, err + out)
-            self.assertTrue(os.path.exists(flag))
-            self.assertEqual(origin_sha(fork, name), rev(fork, "refs/heads/" + name))
-
-        @needs_tomllib
-        def test_an_untracked_config_meets_upstreams_variant_before_the_backup(self):
-            """setup's untracked `.forkflow.toml` and upstream's `.ForkFlow.toml`: one file
-            here. The case-exact check let `sync --merge` push a backup and create the sync
-            branch before git refused the merge, and its "remove them" deleted this fork's
-            config for good. Now it is refused before the backup - and every command printed
-            on the way, run as printed, ends with the sync merged, landed, and this fork's
-            config and gate the ones in force."""
-            fork = make_fork(self.tmp)
-            if not case_insensitive(fork):
-                self.skipTest("the filesystem is case-sensitive")
-            ours_flag = os.path.join(self.tmp, "fork-gate-ran")
-            theirs_flag = os.path.join(self.tmp, "upstream-gate-ran")
-            ours = 'merge = "self"\ngate = ["touch %s"]\n' % ours_flag
-            path = write(fork, CONFIG_FILE, ours)
-            self.upstream_variant(theirs_flag)
-            merging_tool(self.tmp, "glab")
-            trunk = origin_sha(fork, "develop")
-
-            with on_platform("gitlab"):
-                code, out, err = run("-C", fork, "sync", "--merge")
-            self.assertEqual(code, 2, err + out)
-            self.assertEqual(sh("git", "ls-remote", "origin", "refs/heads/backup/*", cwd=fork),
-                             "")
-            self.assertNotIn("backup/", local_branches(fork))
-            self.assertNotIn(sync_branch_name(), local_branches(fork))
-            self.assertEqual(origin_sha(fork, sync_branch_name()), "")
-            self.assertEqual(checked_out(fork), "develop")
-            self.assertEqual(origin_sha(fork, "develop"), trunk)
-            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
-            self.assertIn(CONFIG_FILE, os.listdir(fork))
-            with open(path) as fh:
-                self.assertEqual(fh.read(), ours)
-
-            # commit it on a branch off the trunk and ship it - as printed, `--mr`: committed
-            # on a branch it is neither untracked nor on origin/develop, so nothing says
-            # "self" until a person has merged it - then land it
-            sh("git", "checkout", "-q", "-b", "cfg", "origin/develop", cwd=fork)
-            sh("git", "add", CONFIG_FILE, cwd=fork)
-            sh("git", "commit", "-q", "-m", "ours: forkflow config", cwd=fork)
-            with on_platform("gitlab"):
-                code, out, err2 = run_printed(err, "forkflow ship", fork)
-            self.assertEqual(code, 0, err2 + out)
-            self.assertEqual(tool_argv(self.tmp, "glab", "create")[:2], ["mr", "create"])
-            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
-            self.move_trunk(origin_sha(fork, "cfg"))                     # merged by a person
-            code, out, err2 = run("-C", fork, "land")
-            self.assertEqual(code, 0, err2 + out)
-            self.assertEqual(sh("git", "show", "origin/develop:" + CONFIG_FILE, cwd=fork),
-                             ours.strip())
-            # then the sync again: now the merge is made, and the variant beside the fork's
-            # own config is refused - with the index-only way back
-            os.unlink(ours_flag)
-            next_utc_second()
-            with on_platform("gitlab"):
-                code, out, err = run_printed(err, "forkflow sync", fork)
-            self.assertEqual(code, 2, err + out)
-            self.assertFalse(os.path.exists(theirs_flag))
-            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])    # nothing merged yet
-            with open(path) as fh:
-                theirs = fh.read()                                 # what the merge put there
-            cmd, kept = remedy_of(err)
-            sh("sh", "-c", cmd, cwd=fork)
-            with open(kept) as fh:
-                self.assertEqual(fh.read(), theirs)
-            with open(path) as fh:
-                self.assertEqual(fh.read(), ours)
-            self.assertIn(CONFIG_FILE, os.listdir(fork))
-            sh("git", "commit", "-q", "-m", "keep this fork's config", cwd=fork)
-            with on_platform("gitlab"):
-                code, out, err2 = run_printed(err, "forkflow sync --continue", fork)
-            self.assertEqual(code, 0, err2 + out)
-            self.assertTrue(os.path.exists(ours_flag))                   # the fork's gate ran
-            self.assertFalse(os.path.exists(theirs_flag))
-            self.assertEqual(tool_argv(self.tmp, "glab", "merge")[:3],
-                             ["mr", "merge", sync_branch_name()])
-            self.assertEqual(checked_out(fork), "develop")
-            self.assertEqual(origin_sha(fork, "develop"), rev(fork, "refs/heads/develop"))
-            tree = sh("git", "ls-tree", "--name-only", "origin/develop", cwd=fork).splitlines()
-            self.assertIn(CONFIG_FILE, tree)
-            self.assertNotIn(self.VARIANT, tree)
-            with open(path) as fh:
-                self.assertEqual(fh.read(), ours)
-            self.assertEqual(self.pending_of(fork), {})
-
-        @needs_tomllib
-        def test_a_conflicted_sync_beside_the_forks_tracked_config_resumes_intact(self):
-            """The fork tracks `.forkflow.toml`; the sync conflicts elsewhere and brings
-            upstream's variant, and the user edits the file in the middle of it. `sync
-            --continue --merge` is refused with the index-only way back; run as printed -
-            where `git rm --cached` refused and suggested `-f` - committed, and resumed, this
-            fork's gate runs and its config is what lands, the edit in the copy named.
-            `git rm .ForkFlow.toml` - the old advice - took the fork's working
-            `.forkflow.toml` with it."""
-            flag = os.path.join(self.tmp, "fork-gate-ran")
-            ours = 'merge = "self"\ngate = ["touch %s"]\n' % flag
-            fork = make_fork(self.tmp, config=ours)
-            if not case_insensitive(fork):
-                self.skipTest("the filesystem is case-sensitive")
-            theirs_flag = os.path.join(self.tmp, "upstream-gate-ran")
-            commit_fork(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 2"),
-                        "ours: shared", push=True)
-            self.upstream_variant(theirs_flag)
-            commit_upstream(self.tmp, "shared.tf", self.BASE_TF.replace("count = 1", "count = 3"),
-                            "theirs: shared")
-            merging_tool(self.tmp, "glab")
-            with on_platform("gitlab"):
-                self.assertEqual(run("-C", fork, "sync", "--merge")[0], 4)
-            write(fork, "shared.tf", self.BASE_TF.replace("count = 1", "count = 4"))
-            sh("git", "add", "shared.tf", cwd=fork)
-            with open(os.path.join(fork, CONFIG_FILE), "a") as fh:
-                fh.write("# my edit\n")                                    # the one file on disk
-            with on_platform("gitlab"):
-                code, out, err = run("-C", fork, "sync", "--continue", "--merge")
-            self.assertEqual(code, 2, err + out)
-            self.assertEqual(origin_sha(fork, sync_branch_name()), "")
-            with open(os.path.join(fork, CONFIG_FILE)) as fh:
-                edited = fh.read()
-            self.assertIn("# my edit", edited)
-            cmd, kept = remedy_of(err)
-            sh("sh", "-c", cmd, cwd=fork)
-            with open(kept) as fh:
-                self.assertEqual(fh.read(), edited)
-            path = os.path.join(fork, CONFIG_FILE)
-            self.assertIn(CONFIG_FILE, os.listdir(fork))
-            with open(path) as fh:
-                self.assertEqual(fh.read(), ours)
-            sh("git", "commit", "-q", "--no-edit", cwd=fork)
-            with on_platform("gitlab"):
-                code, out, err = run("-C", fork, "sync", "--continue", "--merge")
-            self.assertEqual(code, 0, err + out)
-            self.assertTrue(os.path.exists(flag))
-            self.assertFalse(os.path.exists(theirs_flag))
-            self.assertEqual(checked_out(fork), "develop")
-            self.assertEqual(sh("git", "show", "origin/develop:" + CONFIG_FILE, cwd=fork),
-                             ours.strip())
-            self.assertNotIn(self.VARIANT, sh("git", "ls-tree", "--name-only", "origin/develop",
-                                              cwd=fork).splitlines())
 
     class TestParseArgs(unittest.TestCase):
         def test_common_flags_before_or_after_the_subcommand(self):

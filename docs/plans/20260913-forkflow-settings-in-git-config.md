@@ -157,9 +157,38 @@ them came to read half the settings.
 writes. Task 7 replaces the template; the helper goes with it.
 
 ### Task 3: git config wins, the file is ignored
-- [ ] `resolve_ctx` stops calling `load_config`; drop the `needs_tomllib` decorators
-- [ ] delete `TestLoadConfig`
-- [ ] run the suite - must pass before task 4
+- [x] `resolve_ctx` stops calling `load_config`; drop the `needs_tomllib` decorators
+- [x] delete `TestLoadConfig`
+- [x] run the suite - must pass before task 4
+
+**⚠️ Deviation, task 3: the suite drops 28 tests, not 12, and `setup` gained a git config
+write.** The file stopping being read for configuration takes every test whose subject was
+that reading with it, and four of them could not wait for the task that deletes their
+production code:
+
+- `TestLoadConfig` (12) and `TestCheck.test_gate_of_a_wrong_type_is_exit_2` (1): the file's
+  parsing and its type checking. A git config value is always a string.
+- `TestSyncGateOnACleanMerge` (5, the whole class) and three `TestSyncConflicts` gate tests:
+  **task 4's tests, deleted here.** The guards ask whether the merge this run just made
+  changed the `gate` in `.forkflow.toml`; the `gate` now comes from `.git/config`, which a
+  merge cannot reach, so there is no longer a state in which they can fire. The production
+  code (`config_changed_in_merge`, `gate_arrived_in_merge`, `gate_at`) is untouched and is
+  still task 4's to delete - **task 4 loses its test-deletion bullet.**
+- seven `TestConfigNameCase` tests: **task 6's.** Their subject is a case variant of the name
+  making every subcommand refuse, which was `load_config`'s refusal reached through
+  `resolve_ctx`. The variant machinery still guards `merge` (`fork_merge_mode` reads the
+  untracked file through `load_config`) and still answers "what is in the way of this merge",
+  and the tests for both still pass - **task 6 loses its test-deletion bullet** for the seven.
+
+**⚠️ `setup` now writes `--trunk`/`--mirror`/`--upstream` into git config**
+(`write_git_config_keys`), beside the `.forkflow.toml` it still writes. Without it, task 3
+leaves `forkflow setup --upstream <name>` persisting the name nowhere anything reads, and a
+clone with two non-origin remotes is exit 2 on every later command - a real regression across
+four commits. Task 7 deletes the file half; the git config half is already there.
+
+Five `TestForkMergeMode` fixtures had their LAYOUT keys moved into git config (their `merge`
+stays in the file, which is their subject): they configure a trunk, mirror or upstream name
+in order to aim the provenance walk, and that has to reach the Ctx to aim anything.
 
 ### Task 4: delete the sync gate guards
 - [ ] `config_changed_in_merge`, `gate_arrived_in_merge`, `gate_at` and their plumbing in
