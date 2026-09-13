@@ -112,10 +112,23 @@ would this merge overwrite" for any file. `upstream_tracked` and its `ls-tree`. 
 ## Implementation Steps
 
 ### Task 1: git config reader beside the file
-- [ ] add the reader for the eight keys, one `--get-regexp` call plus a scoped read for `merge`
-- [ ] `resolve_ctx` prefers the file where both exist, so nothing changes yet
-- [ ] tests for multi-valued `gate`, missing keys, illegal branch names, and `merge` scope
-- [ ] run the suite - must pass before task 2
+- [x] add the reader for the eight keys, one `--get-regexp` call plus a scoped read for `merge`
+- [x] `resolve_ctx` prefers the file where both exist, so nothing changes yet
+- [x] tests for multi-valued `gate`, missing keys, illegal branch names, and `merge` scope
+- [x] run the suite - must pass before task 2
+
+**⚠️ Deviation, task 1: `fork_merge_mode` consults `git_config_merge` first, here and not in
+task 5.** As written, the plan had nothing read `merge` from git config until task 5, while
+task 2 converts `MergeBase.self_fork()` - the fixture that declares `merge = "self"` - to
+`git config`. Every `--merge` test would have gone red at task 2 and stayed red through
+tasks 3 and 4, so tasks 2-4 could not be committed green. The wiring is two lines at the
+top of `fork_merge_mode`: a value found in `.git/config` answers, and the file is still read
+where git config is silent. It is safe to bring forward and worse to defer - it is read from
+`--local` only, so nothing a merge can write reaches it, and leaving `merge` on the tracked
+file through tasks 3 and 4 would have left the most dangerous key on the file after the
+layout keys had left it. It changes nothing for a clone that sets no `forkflow.merge`, which
+is every clone before task 7. The provenance apparatus still answers wherever git config is
+silent, so its own tests keep exercising it until task 5 deletes it.
 
 ### Task 2: convert the test fixtures
 - [ ] `make_fork(config=...)` and `MergeBase.self_fork()` set git config instead of writing the file

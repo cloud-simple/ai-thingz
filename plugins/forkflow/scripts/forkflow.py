@@ -518,6 +518,102 @@ def load_config(root: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# settings in git config
+#
+# `.forkflow.toml` is tracked, and a sync exists to merge the original project's changes
+# into this fork - so the file a fork reads is a file the project can write. `.git/config`
+# is not tracked and no merge reaches it, so that is where forkflow's settings live.
+# --------------------------------------------------------------------------- #
+
+# Each setting's `.forkflow.toml` key and the `git config` variable it became. A git config
+# variable is alphanumeric plus `-` and must start with a letter, so `upstream_branch`
+# cannot keep its name. Git lower-cases a variable name on lookup, so `--get-regexp`
+# answers with `forkflow.upstreambranch` whatever case it was written in: the camelCase
+# spelling here is what the docs and `setup` write, and the lookup is by its lower-cased
+# form.
+GIT_CONFIG_SINGLES = (("upstream", "forkflow.upstream"),
+                      ("upstream_branch", "forkflow.upstreamBranch"),
+                      ("mirror", "forkflow.mirror"),
+                      ("trunk", "forkflow.trunk"),
+                      ("sync_prefix", "forkflow.syncPrefix"),
+                      ("backup_prefix", "forkflow.backupPrefix"))
+GIT_CONFIG_GATE = "forkflow.gate"     # multi-valued: added with `--add`, read in file order
+GIT_CONFIG_MERGE = "forkflow.merge"   # `--local` alone - see `git_config_merge`
+# The keys whose value becomes a branch name, and what is appended to make a branch of a
+# prefix. `valid_branch_name` and the `merge` enum are all that survives of the file
+# parser's checking: a git config value is always a string, so "wrong type" cannot happen.
+GIT_CONFIG_BRANCHY = (("upstream_branch", ""), ("mirror", ""), ("trunk", ""),
+                      ("sync_prefix", "x"), ("backup_prefix", "x"))
+
+
+def git_config_settings(root: str) -> dict:
+    """forkflow's settings as `git config` holds them, in the shape `load_config` returns.
+
+    Every key but `merge` comes back from ONE `git config --get-regexp` call. This runs on
+    every subcommand, so a separate call per key would be eight where one does. `-z` makes
+    each record `<name>\\n<value>` with a NUL after it, so a value holding a newline - a
+    `gate` command may - is still one record.
+
+    `gate` is multi-valued and ITS ORDER IS THE ORDER IT WAS ADDED IN, which `gate_commands`
+    depends on because a gate stops at the first command that fails. `--get-regexp` answers
+    in file order, so the values are appended as they are read and never sorted or keyed.
+
+    An empty value is dropped rather than refused: it falls through to the default, exactly
+    as an absent key does. `merge` is ignored here whatever scope it was found in -
+    `git_config_merge` is the only reader of it."""
+    rc, out, _ = git_rc("config", "-z", "--get-regexp", "^forkflow\\.", cwd=root)
+    if rc != 0:                     # 1 is "nothing matched": this clone configures nothing
+        return {}
+    by_name = {name.lower(): key for key, name in GIT_CONFIG_SINGLES}
+    names = dict(GIT_CONFIG_SINGLES)
+    cfg = {}
+    gate = []
+    for record in out.split("\0"):
+        if not record:
+            continue
+        name, _, value = record.partition("\n")
+        name = name.lower()
+        if not value:               # unset, or a variable with no value at all
+            continue
+        if name == GIT_CONFIG_GATE:
+            gate.append(value)
+        elif name in by_name:
+            cfg[by_name[name]] = value
+    if gate:
+        cfg["gate"] = gate
+    for key, suffix in GIT_CONFIG_BRANCHY:
+        if key in cfg and not valid_branch_name(cfg[key] + suffix):
+            name = cfg[key] + suffix
+            raise Fail(f"`{names[key]}` would make the branch name `{name}`, which git "
+                       f"refuses (`git check-ref-format {sh_arg('refs/heads/' + name)}`)")
+    return cfg
+
+
+def git_config_merge(root: str) -> str:
+    """This fork's `merge`, read from `--local` AND FROM NOWHERE ELSE; "" when unset.
+
+    Every other setting may come from whatever scope a plain read reaches - a `--global`
+    `forkflow.trunk` is a user's own convenience and costs nothing. `merge` may not.
+    `merge = "self"` is what disables human review of this fork's merge requests, and one
+    `git config --global forkflow.merge self` would arm it in every fork on the machine at
+    once, silently, from outside the repository it is a statement about. So it is read on
+    its own, explicitly scoped, and never through the `--get-regexp` sweep beside it.
+
+    A value that is neither mode is a failure rather than a fallback. Written twice in the
+    one file, the last wins - `--get`'s answer, and how git resolves every single-valued
+    variable it has; both are the fork's own word, so there is nothing to choose between."""
+    rc, out, _ = git_rc("config", "--local", "--get", GIT_CONFIG_MERGE, cwd=root)
+    if rc != 0:                     # 1: not set in this clone's own `.git/config`
+        return ""
+    value = out.strip()
+    if value and value not in MERGE_MODES:
+        raise Fail(f"`{GIT_CONFIG_MERGE}` must be "
+                   + " or ".join(f'"{mode}"' for mode in MERGE_MODES)
+                   + f', not "{value}"')
+    return value
+
+
+# --------------------------------------------------------------------------- #
 # context
 # --------------------------------------------------------------------------- #
 
@@ -794,7 +890,12 @@ def resolve_ctx(cwd: str, args: Optional[argparse.Namespace] = None, need_upstre
     if not git_ok("rev-parse", "--is-inside-work-tree", cwd=cwd):
         raise Fail(f"{cwd} is not inside a git repository")
     root = git("rev-parse", "--show-toplevel", cwd=cwd)
-    cfg = load_config(root)
+    # git config is where the settings are going; `.forkflow.toml` is where they are today.
+    # Both are read and the FILE WINS key by key, so a fork that has not moved yet behaves
+    # exactly as it did and one that has is already read from `.git/config`, which is not
+    # tracked and which no merge can reach
+    cfg = git_config_settings(root)
+    cfg.update(load_config(root))
     remotes = git("remote", cwd=root).split()
     if "origin" not in remotes:
         raise Fail("no `origin` remote: forkflow expects the fork to be `origin`")
@@ -4261,7 +4362,16 @@ def fork_merge_mode(ctx: Ctx) -> str:
     on `--continue`, under a case variant of the name, and from a sync branch left checked
     out. Every other state - no file, a file that cannot be read, one only the branch or
     only upstream carries, and a clone that cannot be asked whose a file is at all
-    (`unprovable`) - is "manual"."""
+    (`unprovable`) - is "manual".
+
+    `.git/config` comes first and answers on its own where it speaks: it is not tracked, no
+    merge reaches it, and `git_config_merge` reads it from `--local` alone - so the question
+    the whole apparatus below exists to answer, whose copy of a tracked file this is, does
+    not arise for a value found there. The file is still read where git config is silent,
+    which is every fork that has not moved its settings yet."""
+    declared = git_config_merge(ctx.root)
+    if declared:
+        return declared
     state, text, _ = fork_config_state(ctx)
     if state == "trunk_own":
         where = f"{ctx.origin}/{ctx.trunk}:{CONFIG_FILE}"
@@ -6670,12 +6780,35 @@ def run_tests() -> None:
         sh("git", "remote", "set-head", "upstream", "-a", cwd=fork)
         return fork
 
+    def set_config(root: str, settings: dict) -> None:
+        """The fork's settings in `git config`, where `.git/config` holds them and no merge
+        can reach them - what every fixture that used to write a `.forkflow.toml` does now.
+
+        Keyed by the name the file used, so a fixture reads the way it always did; the
+        `git config` variable each became is `GIT_CONFIG_SINGLES`. `gate` takes a list and
+        is `--add`ed in order, because a gate stops at the first failure and the order is
+        the whole of what it means."""
+        names = dict(GIT_CONFIG_SINGLES)
+        for key, value in settings.items():
+            if key == "gate":
+                for command in ([value] if isinstance(value, str) else value):
+                    sh("git", "config", "--add", GIT_CONFIG_GATE, command, cwd=root)
+            elif key == "merge":
+                sh("git", "config", GIT_CONFIG_MERGE, value, cwd=root)
+            else:
+                sh("git", "config", names[key], value, cwd=root)
+
     def make_fork(tmp: str, trunk: str = "develop", mirror: str = "main",
-                  config: Optional[str] = None) -> str:
+                  settings: Optional[dict] = None, config: Optional[str] = None) -> str:
+        """`settings` is the fork's own configuration, in `git config`. `config` is the
+        tracked `.forkflow.toml`, and belongs only to the tests whose subject IS that file -
+        its parsing, whose copy of it a clone is reading, and what a sync merge does to it."""
         fork = scaffold(tmp)
         origin_git = os.path.join(tmp, "origin.git")
         sh("git", "branch", "--no-track", trunk, "main", cwd=fork)
         sh("git", "switch", trunk, cwd=fork)
+        if settings is not None:
+            set_config(fork, settings)
         if config is not None:
             write(fork, CONFIG_FILE, config)
             sh("git", "add", CONFIG_FILE, cwd=fork)
@@ -7271,6 +7404,157 @@ def run_tests() -> None:
             write(self.tmp, CONFIG_FILE, 'trunk = "trunk"\n')
             with mock.patch.object(os, "listdir", return_value=[".ForkFlow.toml", CONFIG_FILE]):
                 self.assertEqual(load_config(self.tmp), {"trunk": "trunk"})
+
+    class TestGitConfigSettings(Base):
+        """The settings as `git config` holds them - `.git/config`, which is not tracked and
+        which no merge can reach, so the question `.forkflow.toml` needs a thousand lines to
+        answer (whose copy of this file am I reading?) cannot be asked of it."""
+
+        def repo(self, name: str = "clone") -> str:
+            path = os.path.join(self.tmp, name)
+            sh("git", "init", "-q", "-b", "main", path)
+            return path
+
+        def set(self, root: str, *pairs: str) -> None:
+            for i in range(0, len(pairs), 2):
+                sh("git", "config", pairs[i], pairs[i + 1], cwd=root)
+
+        def test_nothing_configured_is_no_settings_at_all(self):
+            self.assertEqual(git_config_settings(self.repo()), {})
+
+        def test_every_key_comes_back_from_one_call_in_the_shape_the_file_had(self):
+            """`resolve_ctx` runs on every subcommand, so the sweep is ONE subprocess for
+            the seven keys it reads - not one per key. The camelCase spelling is what is
+            written; git lower-cases a variable name on lookup, and the reader matches on
+            the lower-cased form it gets back."""
+            root = self.repo()
+            self.set(root,
+                     "forkflow.upstream", "up",
+                     "forkflow.upstreamBranch", "legacy",
+                     "forkflow.mirror", "upstream-main",
+                     "forkflow.trunk", "trunk",
+                     "forkflow.syncPrefix", "merge-up/",
+                     "forkflow.backupPrefix", "safety/")
+            sh("git", "config", "--add", "forkflow.gate", "true", cwd=root)
+            calls = []
+            real = git_rc
+
+            def counting(*args, **kwargs):
+                calls.append(args)
+                return real(*args, **kwargs)
+
+            with mock.patch.object(sys.modules[__name__], "git_rc", counting):
+                cfg = git_config_settings(root)
+            self.assertEqual(cfg, {"upstream": "up", "upstream_branch": "legacy",
+                                   "mirror": "upstream-main", "trunk": "trunk",
+                                   "sync_prefix": "merge-up/", "backup_prefix": "safety/",
+                                   "gate": ["true"]})
+            self.assertEqual(len(calls), 1, calls)
+            self.assertIn("--get-regexp", calls[0])
+
+        def test_gate_is_multi_valued_and_keeps_the_order_it_was_added_in(self):
+            """A gate stops at the first command that fails, so the order is the whole of
+            what it means. `--add` appends; a plain `git config` would replace."""
+            root = self.repo()
+            for cmd in ("make lint", "make test", "echo done"):
+                sh("git", "config", "--add", "forkflow.gate", cmd, cwd=root)
+            self.assertEqual(git_config_settings(root)["gate"],
+                             ["make lint", "make test", "echo done"])
+            # and a value holding a newline is still one command, not two
+            sh("git", "config", "--add", "forkflow.gate", "echo one\necho two", cwd=root)
+            self.assertEqual(git_config_settings(root)["gate"][-1], "echo one\necho two")
+
+        def test_a_missing_key_is_absent_and_an_empty_one_falls_through(self):
+            """An empty value is the default, as an absent key is - it is not a branch
+            called "" for `valid_branch_name` to refuse."""
+            root = self.repo()
+            self.set(root, "forkflow.trunk", "trunk", "forkflow.mirror", "")
+            cfg = git_config_settings(root)
+            self.assertEqual(cfg, {"trunk": "trunk"})
+            self.assertNotIn("mirror", cfg)
+            self.assertNotIn("gate", cfg)
+            self.assertEqual(cfg.get("sync_prefix") or DEFAULT_SYNC_PREFIX,
+                             DEFAULT_SYNC_PREFIX)
+
+        def test_a_name_git_would_refuse_is_fatal(self):
+            """Type checking collapses - a git config value is always a string - and what
+            survives is the check that the names reaching refs and shell are real ones."""
+            for key, value in (("forkflow.trunk", "bad..name"), ("forkflow.mirror", "HEAD"),
+                               ("forkflow.upstreamBranch", "-x"),
+                               ("forkflow.syncPrefix", "..bad/"),
+                               ("forkflow.backupPrefix", "+force/")):
+                root = self.repo(key + value.replace("/", "-"))
+                sh("git", "config", key, value, cwd=root)
+                with self.assertRaises(Fail) as cm:
+                    git_config_settings(root)
+                self.assertEqual(cm.exception.code, 2, key)
+                self.assertIn("check-ref-format", str(cm.exception))
+                self.assertIn(key, str(cm.exception))
+
+        def test_merge_is_manual_or_self_and_nothing_else(self):
+            root = self.repo()
+            self.assertEqual(git_config_merge(root), "")
+            for value in (MERGE_SELF, MERGE_MANUAL):
+                sh("git", "config", GIT_CONFIG_MERGE, value, cwd=root)
+                self.assertEqual(git_config_merge(root), value)
+            for value in ("auto", "Self", "yes"):
+                sh("git", "config", GIT_CONFIG_MERGE, value, cwd=root)
+                with self.assertRaises(Fail) as cm:
+                    git_config_merge(root)
+                self.assertEqual(cm.exception.code, 2, value)
+                self.assertIn('must be "manual" or "self"', str(cm.exception))
+            # written twice in the one file, the last wins - git's own answer for every
+            # single-valued variable, and both lines are the fork's own word
+            sh("git", "config", "--unset-all", GIT_CONFIG_MERGE, cwd=root)
+            for value in (MERGE_SELF, MERGE_MANUAL):
+                sh("git", "config", "--add", GIT_CONFIG_MERGE, value, cwd=root)
+            self.assertEqual(git_config_merge(root), MERGE_MANUAL)
+
+        def test_merge_is_read_from_the_local_scope_and_the_sweep_never_carries_it(self):
+            """THE PROPERTY THE WHOLE CHANGE EXISTS FOR. One
+            `git config --global forkflow.merge self` would otherwise arm unreviewed merging
+            in every fork on the machine at once - from outside every repository it is a
+            statement about. The global file here is a real one (`GIT_CONFIG_GLOBAL` under
+            a temporary `HOME`), and git plainly reads it: an unscoped `--get` in the clone
+            answers `self`. The scoped read does not, and neither does `fork_merge_mode`,
+            which is the reader every `--merge` decision goes through."""
+            fork = make_fork(self.tmp)
+            globalfile = os.environ["GIT_CONFIG_GLOBAL"]
+            sh("git", "config", "--global", GIT_CONFIG_MERGE, MERGE_SELF, cwd=fork)
+            with open(globalfile) as fh:
+                self.assertIn(MERGE_SELF, fh.read())        # it really is in the global file
+            self.assertEqual(sh("git", "config", "--get", GIT_CONFIG_MERGE, cwd=fork),
+                             MERGE_SELF)                    # and git really does read it
+            self.assertEqual(sh("git", "config", "--local", "--get", GIT_CONFIG_MERGE,
+                                cwd=fork, check=False), "")
+            self.assertEqual(git_config_merge(fork), "")
+            self.assertNotIn("merge", git_config_settings(fork))
+            self.assertEqual(fork_merge_mode(ctx_for(fork)), MERGE_MANUAL)
+            # the fork's own declaration, in its own `.git/config`, is the one that counts
+            sh("git", "config", GIT_CONFIG_MERGE, MERGE_SELF, cwd=fork)
+            self.assertEqual(git_config_merge(fork), MERGE_SELF)
+            self.assertEqual(fork_merge_mode(ctx_for(fork)), MERGE_SELF)
+
+        def test_a_global_setting_of_any_other_key_is_read(self):
+            """Only `merge` is scoped: a `--global forkflow.trunk` is a user's own
+            convenience and costs nothing, so the sweep is left unscoped."""
+            root = self.repo()
+            sh("git", "config", "--global", "forkflow.trunk", "trunk", cwd=root)
+            self.assertEqual(git_config_settings(root)["trunk"], "trunk")
+
+        @needs_tomllib
+        def test_the_file_still_wins_key_by_key_where_both_are_there(self):
+            """`resolve_ctx` reads both and the FILE WINS, key by key: a fork that has not
+            moved its settings behaves exactly as it did, and one that has is already read
+            from `.git/config`. Nothing in charge has changed yet."""
+            fork = make_fork(self.tmp, trunk="trunk", mirror="upstream-main",
+                             config='trunk = "trunk"\nmirror = "upstream-main"\n')
+            sh("git", "config", "forkflow.trunk", "from-git-config", cwd=fork)
+            sh("git", "config", "forkflow.backupPrefix", "safety/", cwd=fork)
+            ctx = ctx_for(fork)
+            self.assertEqual(ctx.trunk, "trunk")              # the file's, over git config's
+            self.assertEqual(git_config_settings(fork)["trunk"], "from-git-config")
+            self.assertEqual(ctx.backup_prefix, "safety/")    # a key only git config has
 
     # ------------------------------------------------------------------- #
     # resolve_ctx
@@ -17194,6 +17478,15 @@ def run_tests() -> None:
             self.assertEqual(self.owners('get("merge")'),
                              {"parse_config", "merge_mode_in", "fork_merge_mode"})
             self.assertEqual(self.owners('["merge"]'), set())
+            # and the git config half of the same question: `forkflow.merge` is named in one
+            # reader, that reader is `fork_merge_mode`'s alone, and the scope it is read at
+            # is spelled there and nowhere else. An unscoped read would let one
+            # `git config --global forkflow.merge self` arm every fork on the machine
+            self.assertEqual(self.owners("GIT_CONFIG_MERGE"),
+                             {"<module>", "git_config_merge"})
+            self.assertEqual(self.owners("git_config_merge("),
+                             {"git_config_merge", "fork_merge_mode"})
+            self.assertEqual(self.owners('"--local"'), {"git_config_merge"})
             self.assertTrue(refuses_on("merge_gate", "fork_merge_mode"))
             self.assertTrue(refuses_on("merge_mr", "fork_merge_mode"))
             self.assertEqual(self.owners("merge_command("), {"merge_command", "merge_mr"})
