@@ -258,88 +258,15 @@ def short(sha: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# config
+# the merge modes
 # --------------------------------------------------------------------------- #
 
-CONFIG_STRINGS = ("upstream", "upstream_branch", "mirror", "trunk",
-                  "sync_prefix", "backup_prefix", "merge")
 # `merge`: who merges this fork's merge requests. "manual" (the default) means a person does,
 # through the platform; "self" means whoever opened them - the solo fork - and is what lets
 # `sync --merge` / `ship --merge` merge the request they have just opened.
 MERGE_MANUAL = "manual"              # the default: a person merges, through the platform
 MERGE_SELF = "self"                  # whoever opened the request merges it - what --merge needs
 MERGE_MODES = (MERGE_MANUAL, MERGE_SELF)
-
-
-def have_tomllib() -> bool:
-    """Whether `.forkflow.toml` can be read at all - Python 3.11+ (or a backport on the path)."""
-    try:
-        import tomllib  # noqa: F401   Python 3.11+
-    except ImportError:
-        return False
-    return True
-
-
-def configures_nothing(text: str) -> bool:
-    """True when the file holds nothing but blank lines and `#` comments."""
-    return all(not line.strip() or line.strip().startswith("#") for line in text.splitlines())
-
-
-def parse_config(text: str, where: str) -> dict:
-    """The parsed `.forkflow.toml`, wherever the bytes came from - the working tree, or a
-    `git show <rev>:.forkflow.toml` of what a branch carried before a merge. A value of the
-    wrong type is a hard failure: it names the branches every safety check depends on."""
-    if not have_tomllib():
-        # a file of nothing but comments configures nothing: reading it as `{}` is exactly what
-        # tomllib would have said, and refusing it would brick every subcommand over the
-        # commented template `setup` used to leave behind
-        if configures_nothing(text):
-            return {}
-        raise Fail(f"{where} needs Python 3.11+ (tomllib) to be read; "
-                   f"this is Python {sys.version_info[0]}.{sys.version_info[1]}. "
-                   f"Run forkflow with Python 3.11 or newer, or turn every line of the file "
-                   f"into a `#` comment (a file of comments configures nothing, and its "
-                   f"settings stay there to uncomment later).")
-    import tomllib  # Python 3.11+, guarded by have_tomllib() above
-    try:
-        cfg = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
-        raise Fail(f"{where}: {exc}")
-    # every value ends up in a git command line: a wrong type is a traceback, not a workflow
-    for key in CONFIG_STRINGS:
-        if key in cfg and not isinstance(cfg[key], str):
-            raise Fail(f"{where}: `{key}` must be a string, "
-                       f"not {type(cfg[key]).__name__}")
-    gate = cfg.get("gate")
-    if gate is not None and (not isinstance(gate, list)
-                             or any(not isinstance(c, str) for c in gate)):
-        raise Fail(f"{where}: `gate` must be a list of shell commands")
-    merge = cfg.get("merge")
-    if merge is not None and merge not in MERGE_MODES:
-        raise Fail(f"{where}: `merge` must be "
-                   + " or ".join(f'"{mode}"' for mode in MERGE_MODES)
-                   + f', not "{merge}"')
-    return cfg
-
-
-def load_config(root: str) -> dict:
-    """{} when absent. A config that is there but cannot be read is a hard failure.
-
-    Read from a file named exactly `.forkflow.toml`, and nothing is configured from it: it
-    is read to be reported on and for no other purpose. A name that differs from it only in
-    case used to be refused rather than read, because on a case-insensitive filesystem
-    (the macOS and Windows default) the two names open one file while git tells them apart,
-    so upstream's copy could be read as this fork's settings. No setting rides on this file
-    now, so there is nothing for the two spellings to decide between."""
-    path = os.path.join(root, CONFIG_FILE)
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            text = fh.read()
-    except (OSError, UnicodeDecodeError) as exc:
-        raise Fail(f"{CONFIG_FILE} cannot be read: {exc}")
-    return parse_config(text, CONFIG_FILE)
 
 
 # --------------------------------------------------------------------------- #
@@ -449,6 +376,224 @@ def git_config_merge(root: str) -> str:
                    + " or ".join(f'"{mode}"' for mode in MERGE_MODES)
                    + f', not "{value}"')
     return value
+
+
+# --------------------------------------------------------------------------- #
+# the migration notice
+#
+# `.forkflow.toml` shipped in 0.1.x for the layout keys, so real forks - this one included -
+# have a copy of it on disk today. Nothing is configured from it any more, so the single
+# thing left to do with it is to say, once, what replaced it, and then carry on.
+#
+# Two rules run through everything below. What is read reaches `print` and NOTHING ELSE:
+# these are the bytes of a tracked file, which a sync merges from the original project by
+# design, and a value out of it deciding anything again is the whole of what this change
+# removed (`test_the_migration_parser_configures_nothing`). And nothing here may end a run:
+# on Python 3.9 and 3.10 there is no `tomllib` to read the file with at all, and the old
+# behaviour - refusing every subcommand when the file could not be read - is exactly what
+# must not survive. An upgrade meant to simplify a tool does not get to brick a fork.
+#
+# KEEP THIS FOR THE 0.3.x LINE. DELETE IT, AND `CONFIG_FILE` WITH IT, AT 0.4.0.
+# --------------------------------------------------------------------------- #
+
+CONFIG_STRINGS = ("upstream", "upstream_branch", "mirror", "trunk",
+                  "sync_prefix", "backup_prefix", "merge")
+MIGRATION_MAX = 64 * 1024     # bytes of a leftover file this notice is willing to read
+MIGRATION_SAID = set()        # the repository roots this run has already told: `setup`
+                              # resolves its Ctx twice, and the notice is said once
+
+# What the notice prints and the order it prints it in: each key of the file, and the
+# `git config` variable that replaced it. `merge` is in the table with NO variable beside
+# it, which is deliberate and is not an omission - see `migration_report`.
+MIGRATION_KEYS = GIT_CONFIG_SINGLES + (("gate", GIT_CONFIG_GATE), ("merge", ""))
+
+
+def have_tomllib() -> bool:
+    """Whether TOML can be parsed on this Python at all - 3.11+, or a backport on the path.
+
+    The script itself needs no TOML: `git config` holds every setting. This answers for the
+    migration notice alone, which has a leftover `.forkflow.toml` to read out to the user
+    and says plainly when it has nothing to read it with."""
+    try:
+        import tomllib  # noqa: F401   Python 3.11+
+    except ImportError:
+        return False
+    return True
+
+
+def configures_nothing(text: str) -> bool:
+    """True when the file holds nothing but blank lines and `#` comments.
+
+    `setup` used to leave a fully commented template behind, so this is the shape a great
+    many leftover files have: it names nothing, and a Python with no parser can still say
+    so rather than report a file it could not read."""
+    return all(not line.strip() or line.strip().startswith("#") for line in text.splitlines())
+
+
+def parse_config(text: str) -> dict:
+    """The parsed `.forkflow.toml`, for the migration notice and for nothing else.
+
+    A value of the wrong type is a failure rather than a shrug: the notice renders what it
+    finds into a command line for a human to paste, and a list or a number rendered into one
+    is not a command. Every refusal here is a phrase and not a sentence - the one caller
+    names the file itself and reads this out as the reason - and the run carries on."""
+    if not have_tomllib():
+        if configures_nothing(text):
+            return {}
+        raise Fail(f"it is TOML and this Python has no `tomllib` to read it with - that is "
+                   f"3.11+, and this is Python "
+                   f"{sys.version_info[0]}.{sys.version_info[1]}")
+    import tomllib  # Python 3.11+, guarded by have_tomllib() above
+    try:
+        cfg = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise Fail(f"it is not valid TOML ({exc})")
+    for key in CONFIG_STRINGS:
+        if key in cfg and not isinstance(cfg[key], str):
+            raise Fail(f"`{key}` must be a string, not {type(cfg[key]).__name__}")
+    gate = cfg.get("gate")
+    if gate is not None and (not isinstance(gate, list)
+                             or any(not isinstance(c, str) for c in gate)):
+        raise Fail("`gate` must be a list of shell commands")
+    mode = cfg.get("merge")
+    if mode is not None and mode not in MERGE_MODES:
+        raise Fail("`merge` must be "
+                   + " or ".join(f'"{m}"' for m in MERGE_MODES)
+                   + f', not "{mode}"')
+    return cfg
+
+
+def migration_report(root: str) -> list:
+    """The migration notice as the lines to print - `[]` when there is no leftover file.
+
+    THE ONE READER OF `.forkflow.toml` LEFT IN THIS SCRIPT, and it reads for display. What
+    comes back is text: nothing parsed out of that file is returned, stored or handed on,
+    and the caller does nothing with these lines but print them.
+
+    The care taken over a file this script does not trust:
+
+    - the name comes from the directory listing, never from `os.path.exists`, because a
+      case-insensitive filesystem opens `.ForkFlow.toml` under the exact name while git
+      keeps the two apart. A variant is a file to NAME and not to read, and no rename
+      remedy is printed: the machinery that made the spelling matter is gone, because no
+      setting rides on either spelling any more;
+    - `os.path.islink` is asked before anything opens the path, and a link is reported with
+      its target rather than followed;
+    - it must be a regular file, and the read is capped;
+    - only the eight known keys are taken; tables and unknown keys are ignored whole;
+    - every value that reaches a printed command goes through `sh_arg`, so a gate command
+      holding a quote or a newline comes out as one safe argument;
+    - and no failure raises. Each one is a sentence, and the run goes on."""
+    try:
+        here = os.listdir(root)
+    except OSError:
+        return []
+    named = sorted(n for n in here if n.lower() == CONFIG_FILE.lower())
+    if not named:
+        return []
+    name = CONFIG_FILE if CONFIG_FILE in named else named[0]
+    path = os.path.join(root, name)
+    tail = ["  Removing it is a change to a tracked file like any other: commit the deletion "
+            "on a branch off the trunk and take it through a merge request, rather than "
+            "deleting it on the trunk itself."]
+    hint = ["    Open it yourself and set the `forkflow.*` keys it names. Every key has a "
+            "counterpart: upstream, upstreamBranch, mirror, trunk, syncPrefix, backupPrefix, "
+            "gate (added one command at a time, in the order they run) and merge - which a "
+            "fork decides for itself, deliberately, and which `forkflow setup` spells out."]
+    lines = [f"  `{name}` is in this working tree and forkflow no longer reads it. The "
+             f"settings live in `git config` now - in `.git/config`, this clone's own file, "
+             f"which is in no tree and which no merge can write."]
+    for other in named:
+        if other != name:
+            lines.append(f"  `{other}` is here too, under a name that differs only in case. "
+                         f"It is named and not read.")
+    if name != CONFIG_FILE:
+        lines.append(f"  Its name differs from `{CONFIG_FILE}` only in case, so it is named "
+                     f"here and not read: on a case-insensitive filesystem the two names "
+                     f"open one file while git tells them apart. There is nothing to rename "
+                     f"it for - no setting rides on either spelling any more.")
+        return lines + hint + tail
+    if os.path.islink(path):
+        try:
+            target = os.readlink(path)
+        except OSError as exc:
+            target = f"<the link cannot be read: {exc}>"
+        return (lines + [f"  It is a symbolic link to `{target}`, so it is named here and "
+                         f"not opened: nothing follows a link to read it."] + hint + tail)
+    if not os.path.isfile(path):
+        return lines + ["  It is not a regular file, so it is not read."] + hint + tail
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        size = 0
+        lines.append(f"  Its size could not be read: {exc}.")
+    if size > MIGRATION_MAX:
+        return (lines + [f"  It is {size} bytes, larger than the {MIGRATION_MAX} this notice "
+                         f"reads, so it is not read."] + hint + tail)
+    try:
+        # one catch for the read and the parse together: an OS error, bytes that are not
+        # UTF-8, TOML that does not parse, and a Python with no parser at all are one answer
+        # to the user - and a leftover file may not end a run, whatever it turns out to hold
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read(MIGRATION_MAX + 1)
+        cfg = parse_config(text)
+    except Exception as exc:
+        return lines + [f"  It cannot be read here: {exc}."] + hint + tail
+    body, gated, mode = [], False, ""
+    for key, var in MIGRATION_KEYS:
+        value = cfg.get(key)
+        if not value:
+            continue
+        if not var:
+            # `merge`, and the table gives it no command BY DESIGN. These are a tracked
+            # file's bytes; a sync merges the original project's copy of them; and `self`
+            # is what turns off human review of this fork's merge requests. A line to paste
+            # would put that whole route back, through the user's own hands. So the value is
+            # reported below and no command for it is built anywhere here.
+            mode = value
+        elif key == "gate":
+            for command in value:
+                if command:
+                    body.append(f"      git config --add {var} {sh_arg(command)}")
+                    gated = True
+        else:
+            body.append(f"      git config {var} {sh_arg(value)}")
+    if not body and not mode:
+        return lines + ["  It names no setting forkflow knows, so there is nothing in it to "
+                        "move."] + tail
+    if body:
+        lines.append("  What it names, and the command that sets each of them in this "
+                     "clone:")
+        lines += body
+    if gated:
+        lines.append("    `--add` appends one more command; plain `git config "
+                     "forkflow.gate ...` REPLACES every command there is. They run in the "
+                     "order they were added and stop at the first one that fails.")
+    if mode:
+        lines.append(f'    It also says merge = "{mode}", and that one is reported and no '
+                     f'more - there is deliberately no line here to paste for it. This file '
+                     f'is tracked, a sync merges the original project\'s copy of it by '
+                     f'design, and "self" is what turns off human review of this fork\'s '
+                     f'merge requests: the fork has to decide it deliberately, for itself. '
+                     f'`forkflow setup` says what the choice costs.')
+    return lines + tail
+
+
+def migration_notice(root: str) -> None:
+    """Say what replaced `.forkflow.toml`, once per run and per repository, and carry on.
+
+    `resolve_ctx` is where `load_config` used to be called: the one place every subcommand
+    passes through exactly once, needing nothing but the repository root. `setup` resolves
+    its Ctx twice - before and after it adds the upstream remote - so what has already been
+    said is remembered here rather than counted on. It is printed under `--dry-run` too:
+    it writes nothing.
+
+    This prints, and does nothing else at all."""
+    if root in MIGRATION_SAID:
+        return
+    MIGRATION_SAID.add(root)
+    for line in migration_report(root):
+        print(line)
 
 
 # --------------------------------------------------------------------------- #
@@ -728,7 +873,8 @@ def resolve_ctx(cwd: str, args: Optional[argparse.Namespace] = None, need_upstre
     if not git_ok("rev-parse", "--is-inside-work-tree", cwd=cwd):
         raise Fail(f"{cwd} is not inside a git repository")
     root = git("rev-parse", "--show-toplevel", cwd=cwd)
-    cfg = load_settings(root)
+    migration_notice(root)          # a leftover `.forkflow.toml`, said once - and read for
+    cfg = load_settings(root)       # nothing but that. The settings come from `git config`
     remotes = git("remote", cwd=root).split()
     if "origin" not in remotes:
         raise Fail("no `origin` remote: forkflow expects the fork to be `origin`")
@@ -4927,6 +5073,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    # the migration notice is said once per RUN, and a run is this call: the embedded tests
+    # call `main` many times in one process, and each of those is a run like any other
+    MIGRATION_SAID.clear()
     try:
         if argv[:1] == ["--test"]:       # only as the first word: `ship --title --test` is a title
             run_tests()                  # exits through SystemExit, which this does not catch
@@ -5630,6 +5779,224 @@ def run_tests() -> None:
             self.assertEqual((ctx.trunk, ctx.mirror), ("trunk", "upstream-main"))
             self.assertEqual(ctx.backup_prefix, "safety/")    # git config's, not the file's
             self.assertEqual(gate_commands(ctx), [])          # the file's `gate` is not run
+
+    # ------------------------------------------------------------------- #
+    # the migration notice
+    # ------------------------------------------------------------------- #
+
+    class TestMigrationNotice(Base):
+        """`.forkflow.toml` shipped in 0.1.x, so real forks have one on disk. The notice is
+        the whole of what is left to do with it: say what replaced it, once per run, print
+        nothing that could arm `merge`, and never stop a run over it."""
+
+        FULL = ('upstream = "upstream"\n'
+                'upstream_branch = "main"\n'
+                'mirror = "main"\n'
+                'trunk = "develop"\n'
+                'sync_prefix = "sync/"\n'
+                'backup_prefix = "backup/"\n'
+                'merge = "self"\n'
+                'gate = ["make test", "make lint"]\n'
+                '\n'
+                '[project]\n'                    # a table, and a key inside it: both ignored
+                'trunk = "not-a-setting"\n'
+                'unknown_key = "ignored"\n')
+
+        def place(self, text, name: str = CONFIG_FILE) -> str:
+            """A directory holding one leftover file. The notice reads the filesystem and
+            asks git nothing, so a repository is not needed for what it says."""
+            root = tempfile.mkdtemp(dir=self.tmp)
+            if text is not None:
+                write(root, name, text)
+            return root
+
+        def notice(self, root: str) -> str:
+            MIGRATION_SAID.clear()
+            return "\n".join(migration_report(root))
+
+        def commands(self, root: str) -> list:
+            return [line.strip() for line in migration_report(root)
+                    if line.startswith("      git config ")]
+
+        def test_no_file_is_no_notice(self):
+            self.assertEqual(migration_report(self.place(None)), [])
+
+        def test_every_key_becomes_the_command_that_sets_it_in_git_config(self):
+            """The mapping, in the file's own order - and `gate` one `--add` per command, in
+            the order they were written, because a gate stops at the first failure and the
+            order is the whole of what it means."""
+            root = self.place(self.FULL)
+            self.assertEqual(self.commands(root), [
+                "git config forkflow.upstream upstream",
+                "git config forkflow.upstreamBranch main",
+                "git config forkflow.mirror main",
+                "git config forkflow.trunk develop",
+                "git config forkflow.syncPrefix sync/",
+                "git config forkflow.backupPrefix backup/",
+                "git config --add forkflow.gate 'make test'",
+                "git config --add forkflow.gate 'make lint'"])
+            out = self.notice(root)
+            self.assertIn("no longer reads it", out)
+            self.assertNotIn("not-a-setting", out)          # the table is ignored whole
+            self.assertNotIn("unknown_key", out)
+            # removing it is a tracked-file change, shipped and not deleted on the trunk
+            self.assertIn("branch off the trunk", out)
+            self.assertIn("merge request", out)
+
+        def test_merge_is_reported_and_nothing_printed_would_set_it(self):
+            """THE RULE THIS NOTICE IS MOST CAREFUL ABOUT. These are a tracked file's bytes,
+            which a sync merges from the original project by design, and `merge = "self"` is
+            what turns off human review of this fork's merge requests. A
+            `git config forkflow.merge self` on screen would put that whole route back
+            through the user's own hands, so the value is reported as information and NO
+            runnable line for it is printed - not here, and not for a file that could not be
+            read either."""
+            out = self.notice(self.place(self.FULL))
+            self.assertIn('merge = "self"', out)                  # reported
+            self.assertIn("decide it deliberately", out)
+            self.assertNotIn(GIT_CONFIG_MERGE, out)               # never as a variable to set
+            # and no line anybody could paste so much as mentions it
+            for line in out.splitlines():
+                if line.strip().startswith("git "):
+                    self.assertNotIn("merge", line)
+            self.assertEqual(dict(MIGRATION_KEYS)["merge"], "")   # the table gives it none
+            self.assertNotIn(MERGE_SELF, " ".join(self.commands(self.place(self.FULL))))
+            # and the same for `merge = "manual"`, which is just as much the project's word
+            other = self.notice(self.place('merge = "manual"\n'))
+            self.assertIn('merge = "manual"', other)
+            self.assertNotIn(GIT_CONFIG_MERGE, other)
+            self.assertEqual(self.commands(self.place('merge = "manual"\n')), [])
+
+        def test_a_gate_command_with_a_quote_or_a_newline_is_one_safe_argument(self):
+            """`sh_arg` stands between the file and every printed command. A gate entry is
+            shell, and one holding a quote or a newline has to come out as ONE argument -
+            pasted, it must set exactly what the file said and start nothing else."""
+            gate = ["echo it's fine", "printf 'a\\nb\\n'", "x; rm -rf /", "a\nb"]
+            root = self.place('gate = %s\n' % json.dumps(gate))
+            printed = [line.strip() for line in migration_report(root)
+                       if line.startswith("      git config --add")]
+            self.assertEqual(len(printed), len(gate))
+            for line, command in zip(printed, gate):
+                argv = shlex.split(line)
+                self.assertEqual(argv[:4], ["git", "config", "--add", GIT_CONFIG_GATE])
+                self.assertEqual(argv[4:], [command])      # one argument, and it is the value
+
+        def test_a_symlink_is_named_and_never_followed(self):
+            root = self.place(None)
+            write(root, "elsewhere.toml", 'merge = "self"\ntrunk = "MARKER"\n')
+            os.symlink(os.path.join(root, "elsewhere.toml"),
+                       os.path.join(root, CONFIG_FILE))
+            out = self.notice(root)
+            self.assertIn("symbolic link", out)
+            self.assertIn("elsewhere.toml", out)               # the link's target, named
+            self.assertNotIn("MARKER", out)                    # and not one byte of it read
+            self.assertEqual(self.commands(root), [])
+            self.assertIn("Open it yourself", out)
+
+        def test_a_case_variant_is_named_and_not_read_and_no_rename_is_printed(self):
+            """A name differing only in case opens the same file on a case-insensitive
+            filesystem while git tells the two apart. It is a file to NAME, and there is no
+            remedy to print: the machinery that made the spelling matter is gone, because
+            nothing is configured from either spelling any more."""
+            root = self.place('trunk = "MARKER"\n', name=".ForkFlow.toml")
+            out = self.notice(root)
+            self.assertIn(".ForkFlow.toml", out)
+            self.assertIn("only in case", out)
+            self.assertNotIn("MARKER", out)                    # named, not read
+            self.assertEqual(self.commands(root), [])
+            self.assertIn("nothing to rename it for", out)
+            for line in out.splitlines():           # and not one line to paste, of any kind
+                self.assertFalse(line.strip().startswith(("mv ", "cp ", "rm ", "git ")), line)
+
+        def test_a_file_larger_than_the_cap_is_refused_and_said_plainly(self):
+            root = self.place('trunk = "MARKER"\n' + "# pad\n" * MIGRATION_MAX)
+            out = self.notice(root)
+            self.assertIn("larger than the %d" % MIGRATION_MAX, out)
+            self.assertNotIn("MARKER", out)
+            self.assertEqual(self.commands(root), [])
+
+        def test_something_that_is_not_a_regular_file_is_not_read(self):
+            root = self.place(None)
+            os.makedirs(os.path.join(root, CONFIG_FILE))
+            out = self.notice(root)
+            self.assertIn("not a regular file", out)
+            self.assertEqual(self.commands(root), [])
+
+        def test_a_file_that_says_nothing_says_so(self):
+            out = self.notice(self.place("# every line a comment\n\n"))
+            self.assertIn("names no setting", out)
+            self.assertIn("branch off the trunk", out)
+
+        def test_a_file_that_cannot_be_read_still_lets_every_command_run(self):
+            """Never exit non-zero over a leftover. The old behaviour refused every
+            subcommand when the file could not be read, and an upgrade meant to simplify a
+            fork does not get to brick one."""
+            fork = make_fork(self.tmp)
+            for text, reason in ((b"\xff\xfe not utf-8", "It cannot be read here"),
+                                 ("trunk = [\n", "not valid TOML"),
+                                 ('gate = 3\n', "list of shell commands"),
+                                 ('merge = "yes"\n', '`merge` must be')):
+                write(fork, CONFIG_FILE, text)
+                code, out, err = run("-C", fork, "status")
+                self.assertEqual(code, 0, err + out)
+                self.assertIn(reason, out)
+                self.assertIn("Open it yourself", out)
+                self.assertNotIn("forkflow.merge", out)
+                code, out, err = run("-C", fork, "check")
+                self.assertEqual(code, 0, err + out)
+
+        def test_a_python_without_tomllib_still_runs_every_subcommand(self):
+            """Python 3.9 and 3.10 have no parser for this file at all. That is a sentence,
+            not a refusal - and a file of nothing but comments, which is what `setup` used to
+            leave behind, still answers `names no setting` without one."""
+            fork = make_fork(self.tmp)
+            write(fork, CONFIG_FILE, self.FULL)
+            with mock.patch.dict(sys.modules, {"tomllib": None}):
+                for argv in (("status",), ("check",)):
+                    code, out, err = run("-C", fork, *argv)
+                    self.assertEqual(code, 0, " ".join(argv) + ": " + err + out)
+                    self.assertIn("no `tomllib`", out)
+                    self.assertIn("Open it yourself", out)
+                    self.assertNotIn("forkflow.merge", out)
+                write(fork, CONFIG_FILE, "# a commented template configures nothing\n")
+                code, out, err = run("-C", fork, "status")
+                self.assertEqual(code, 0, err + out)
+                self.assertIn("names no setting", out)
+
+        def test_the_notice_is_said_once_in_a_run_that_resolves_twice(self):
+            """`setup` builds its Ctx twice - before and after it adds the upstream remote -
+            and the notice is one per run. It is said under `--dry-run` too: it writes
+            nothing."""
+            fork = make_fork(self.tmp)
+            write(fork, CONFIG_FILE, self.FULL)
+            code, out, err = run("-C", fork, "setup")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(out.count("no longer reads it"), 1, out)
+            self.assertEqual(out.count("git config forkflow.trunk develop"), 1, out)
+            code, out, err = run("-C", fork, "setup", "--dry-run")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(out.count("no longer reads it"), 1, out)
+            self.assertTrue(os.path.exists(os.path.join(fork, CONFIG_FILE)))  # nothing removed it
+            # a second run says it again: once per run, not once per clone
+            code, out, err = run("-C", fork, "status")
+            self.assertEqual(code, 0, err + out)
+            self.assertEqual(out.count("no longer reads it"), 1, out)
+
+        def test_the_settings_in_force_after_the_notice_are_git_configs(self):
+            """The notice reports the file and the file configures nothing: what the run
+            obeys is `.git/config`, and the two disagree here on every key that could be
+            seen from the outside."""
+            fork = make_fork(self.tmp, trunk="trunk", mirror="upstream-main",
+                             settings={"trunk": "trunk", "mirror": "upstream-main",
+                                       "backup_prefix": "safety/", "gate": ["true"]})
+            write(fork, CONFIG_FILE, self.FULL)
+            ctx, out, err = capture(ctx_for, fork)
+            self.assertEqual((ctx.trunk, ctx.mirror), ("trunk", "upstream-main"))
+            self.assertEqual(ctx.backup_prefix, "safety/")     # not the file's `backup/`
+            self.assertEqual(gate_commands(ctx), ["true"])     # not the file's `make test`
+            self.assertEqual(fork_merge_mode(ctx), MERGE_MANUAL)   # not the file's `self`
+            self.assertIn("git config forkflow.backupPrefix backup/", out)   # reported only
+            self.assertIn('merge = "self"', out)
 
     # ------------------------------------------------------------------- #
     # resolve_ctx
@@ -13198,6 +13565,74 @@ def run_tests() -> None:
                 where = funcs[name]
                 self.assertIn("MERGE_TREE_GIT",
                               "\n".join(self.lines[where.lineno - 1:where.end_lineno]), name)
+
+        def test_the_migration_parser_configures_nothing(self):
+            """`.forkflow.toml` is read one last time, and only to be reported on.
+
+            THE REPLACEMENT for the invariant that pinned whose copy of that file a clone
+            was reading - a question this change removed by taking the settings out of every
+            tracked file. What is left to pin is the one thing that would bring it back: a
+            value read out of that file reaching a setting. So the file is parsed in ONE
+            function, that function hands back TEXT and nothing it parsed, it has ONE caller,
+            and in that caller its result goes straight into `print` - never named, never
+            stored, never passed on.
+
+            The call list is the rest of it. A reader that calls nothing but a quoter, an
+            opener and the parser cannot configure anything, and a call added to it has to be
+            argued for here first. And no string it prints is a command that sets `merge`:
+            the value is reported as information, because these are bytes a sync brings in
+            from the original project and a `git config ...` line to paste would put that
+            whole route back through the user's own hands."""
+            import ast
+            funcs = {n.name: n for n in ast.walk(self.tree)
+                     if isinstance(n, ast.FunctionDef) and n.lineno < self.limit}
+            # one parser, one reader of the file, one caller of each
+            self.assertEqual(self.owners("import tomllib"), {"have_tomllib", "parse_config"})
+            self.assertEqual(self.owners("parse_config("), {"parse_config", "migration_report"})
+            self.assertEqual(self.owners("migration_report("),
+                             {"migration_report", "migration_notice"})
+            self.assertEqual(self.owners("migration_notice("),
+                             {"migration_notice", "resolve_ctx"})
+            # said once per run, and what remembers that lives in one place
+            self.assertEqual(self.owners("MIGRATION_SAID"),
+                             {"<module>", "migration_notice", "main"})
+
+            # the parsed file reaches `print` and nothing else
+            notice = funcs["migration_notice"]
+            uses = [n for n in ast.walk(notice) if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name) and n.func.id == "migration_report"]
+            self.assertEqual(len(uses), 1)
+            loops = [n for n in ast.walk(notice) if isinstance(n, ast.For) and n.iter is uses[0]]
+            self.assertEqual(len(loops), 1, "its result is not iterated straight into a loop")
+            self.assertEqual(len(loops[0].body), 1)
+            printed = loops[0].body[0]
+            self.assertIsInstance(printed, ast.Expr)
+            self.assertIsInstance(printed.value, ast.Call)
+            self.assertIsInstance(printed.value.func, ast.Name)
+            self.assertEqual(printed.value.func.id, "print")
+            self.assertEqual([a.id for a in printed.value.args if isinstance(a, ast.Name)],
+                             [loops[0].target.id])
+            self.assertEqual(loops[0].orelse, [])
+
+            # and nothing in the reader calls anything that could configure
+            called = {c.func.id for c in ast.walk(funcs["migration_report"])
+                      if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+            self.assertEqual(called, {"open", "sorted", "parse_config", "sh_arg"})
+
+            # no command it prints sets `merge`
+            for n in ast.walk(funcs["migration_report"]):
+                if isinstance(n, ast.JoinedStr):
+                    text = "".join(v.value if isinstance(v, ast.Constant) else "{}"
+                                   for v in n.values)
+                elif isinstance(n, ast.Constant) and isinstance(n.value, str):
+                    text = n.value
+                else:
+                    continue
+                # the variable is not named anywhere in it, so no string it holds can be a
+                # command that sets it - and no line it builds for pasting mentions `merge`
+                self.assertNotIn(GIT_CONFIG_MERGE, text)
+                if text.lstrip().startswith("git "):
+                    self.assertNotIn("merge", text)
 
         def test_the_state_file_is_written_in_one_place_and_under_its_lock(self):
             """Every record in the state file is a read-modify-write, and `pending` lives in

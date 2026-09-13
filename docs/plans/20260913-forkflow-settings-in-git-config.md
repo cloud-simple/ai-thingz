@@ -377,10 +377,60 @@ notice needs a parser. `load_config` no longer refuses a case variant (task 6), 
 notice will have to treat one as a file to name itself, as the Migration section says.
 
 ### Task 8: the migration notice
-- [ ] the notice in `resolve_ctx`, under every rule above
-- [ ] the source invariant that its parsed result configures nothing
-- [ ] tests: unreadable, case variant, symlink, oversized, and `merge` reported without a command
-- [ ] run the suite - must pass before task 9
+- [x] the notice in `resolve_ctx`, under every rule above
+- [x] the source invariant that its parsed result configures nothing
+- [x] tests: unreadable, case variant, symlink, oversized, and `merge` reported without a command
+- [x] run the suite - must pass before task 9
+
+`migration_notice` is called in `resolve_ctx` where `load_config` was, right after the root
+is known. It remembers the roots it has already told (`MIGRATION_SAID`) so `setup`'s two
+`resolve_ctx` calls say it once, and it prints under `--dry-run` because it writes nothing.
+`migration_report` is the one reader of the file left: it takes the name from the directory
+listing, asks `os.path.islink` before anything opens the path, insists on a regular file,
+caps the read at `MIGRATION_MAX` (64 KiB), takes only the eight known keys, and turns every
+failure - an OS error, bytes that are not UTF-8, TOML that does not parse, a Python with no
+`tomllib` - into a sentence with the reason and "open it yourself". Nothing in it raises.
+
+**⚠️ Deviation, task 8: `load_config` is deleted.** The notice needs a reader that is
+careful about a file it does not trust - the link check before the open, the regular-file
+check, the cap - and `load_config` did none of that. Keeping it would have left a second,
+less careful reader of the same file with no caller, which is exactly the shape that took
+nine review rounds to close the first time. `parse_config`, `configures_nothing`,
+`have_tomllib` and `CONFIG_FILE` stay, as the plan says, until 0.4.0.
+
+**⚠️ Deviation, task 8: `parse_config` lost its `where` parameter.** With one caller there
+is one file it can be parsing, and the caller's sentence already names it: the refusals
+became phrases ("it is not valid TOML (...)", "`gate` must be a list of shell commands") so
+they read as the reason inside that sentence. Its no-`tomllib` message was rewritten for the
+same reason - it used to tell the user to turn every line into a comment to unbrick the
+tool, which was true when the file was read for configuration and is now nonsense.
+
+**⚠️ The merge-decision invariant is untouched, and the new one carries the weight for the
+notice.** `owners('get("merge")')` still answers `{"parse_config"}`: the notice reads the
+key through `MIGRATION_KEYS`, the plan's own mapping table, whose `merge` row carries NO
+`git config` variable - deliberately, and not by omission. What pins rule 2 is stronger than
+a spelling: `test_the_migration_parser_configures_nothing` reads every string constant in
+`migration_report` out of the AST and asserts that none of them names `forkflow.merge` and
+that no line built for pasting mentions `merge` at all, and
+`test_merge_is_reported_and_nothing_printed_would_set_it` asserts the same over the rendered
+output of a file that holds every key. A command that sets `merge` has to name the variable,
+so a notice that never names it cannot print one.
+
+**⚠️ `MIGRATION_SAID` is cleared at the top of `main`.** Once per RUN, and a run is one
+`main` call: the embedded tests call `main` many times in one process, and without the clear
+the notice would have been once per process - the second `forkflow status` of a test saying
+nothing. In production it is a no-op.
+
+**⚠️ Task 8 tests: the suite goes from 486 to 500.** `TestMigrationNotice` (13) covers every
+key in order, `merge` reported with nothing to paste, a gate entry holding a quote or a
+newline coming back out of `shlex.split` as one argument equal to what the file said, the
+symlink named and its target's bytes absent, the case variant named and not read with no
+line of any kind to paste, the oversized file, the not-a-regular-file, the file that says
+nothing, four unreadable files that all still leave `status` and `check` at exit 0, a Python
+with no `tomllib` running every subcommand, the notice said exactly once across `setup`'s
+two `resolve_ctx` calls and again in the next run, and - the point of the whole change - the
+settings actually in force after the notice coming from `git config` while the file on disk
+names different ones. `TestSourceInvariants` gains the one invariant (1).
 
 ### Task 9: docs, manifests and the state file's wording
 - [ ] README Configuration section, exit-code table, adoption recipe, changelog row
