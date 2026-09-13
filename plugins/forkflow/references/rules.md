@@ -5,8 +5,11 @@ mechanically; you must not work around them by driving git by hand.
 
 ## Layout
 
-Two remotes, two long-lived branches. The names are configurable (`.forkflow.toml`), the layout
-is not.
+Two remotes, two long-lived branches. The names are configurable (`git config forkflow.mirror`,
+`forkflow.trunk`, `forkflow.upstream`, `forkflow.upstreamBranch`), the layout is not. Those
+settings live in `.git/config`, which is in no tree, so they are per clone: a teammate cloning
+the fork runs `forkflow setup` before anything works, and they do not travel with the
+repository.
 
 ```
 upstream/main ────●───────●───────●          theirs; read-only (push URL disabled)
@@ -87,11 +90,10 @@ against the tool's own default host (github.com, gitlab.com) and not the one the
 the command on exactly as printed. When the origin URL names no project at all, forkflow prints no
 command and says which URL it could not address: open that merge request in the web UI.
 
-`--merge` (on `sync` and `ship`, only on a fork whose `.forkflow.toml` says `merge = "self"`, and
-only while those bytes are not a `.forkflow.toml` the original project has - asked of every
-remote-tracking ref that is not `origin`'s, and refused outright in a clone that cannot answer it:
-shallow, partial, `refs/replace/*` or grafts, nothing of upstream's fetched) merges with the
-method the project is configured for on GitLab - which `setup`'s report insists is `ff` - and
+`--merge` (on `sync` and `ship`, only in a clone whose `git config --local forkflow.merge` says
+`self` - read from local scope and from nowhere else, so a `--global` setting cannot arm it, and
+`.git/config` is in no tree, so no sync can write it) merges with the method the project is
+configured for on GitLab - which `setup`'s report insists is `ff` - and
 with the method rule 5 requires per call on GitHub (`--merge` for a sync, `--rebase` for a ship),
 always with a head-commit guard (`--sha` / `--match-head-commit`) so only the exact commit the
 run pushed can be merged; `land` warns when what landed does not have that shape (a ship's commit
@@ -107,12 +109,14 @@ Never reset or force-push that branch on the user's behalf.
 
 ## The gate is arbitrary shell
 
-`gate = [...]` in `.forkflow.toml` is run with `sh -c` by `check`, `sync` and `ship`. That file is
-tracked and committed, so a sync can bring a `gate` in from upstream: read the diff of
-`.forkflow.toml` in a sync merge request before the next `sync`/`ship` runs it. A dry run never
-executes a gate.
+`forkflow.gate` is run with `sh -c` by `check`, `sync` and `ship`, in the order the commands were
+added, stopping at the first one that fails. It is whatever shell the clone was told to run, run
+unattended, so treat adding one as the code review it is - `setup` prints the line and never runs
+it for you. A dry run prints the gate and never executes it.
 
-A run whose own merge *changed* the `gate` prints the commands that arrived and does not run them
-(`gate - NOT RUN`), then names `forkflow check` as the way to run them once they have been read -
-so what it shows and what that `check` would run are the same commands. A `gate` the merge left
-alone runs as usual, even when upstream edited some other line of the file.
+It is multi-valued: `git config --add forkflow.gate '<command>'` appends one more command, while
+plain `git config forkflow.gate '<command>'` REPLACES every command there is.
+
+The gate lives in `.git/config`, which is in no tree, so a sync cannot bring one in from the
+original project - that is why the settings moved there. It is also why a fork's gate is per
+clone and reaches no teammate: each clone adds its own.

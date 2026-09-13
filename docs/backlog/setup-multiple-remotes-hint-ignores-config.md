@@ -1,16 +1,21 @@
 ---
 worth: yes
-where: plugins/forkflow/scripts/forkflow.py:307
+where: plugins/forkflow/scripts/forkflow.py:655
 added: 2026-09-09
 ---
-# "several non-origin remotes" exit 2 even though .forkflow.toml is present
+# "several non-origin remotes" exit 2 without naming the setting that ends it
 
 With `origin`, `origin-deprecated` and `upstream` configured, every subcommand exits 2 with
 `several non-origin remotes (origin-deprecated, upstream); run forkflow setup --upstream-url <URL>
-(or --upstream <NAME>)` - and did so on 2026-09-08 with a `.forkflow.toml` sitting in the tree.
-The file was the template `setup` writes, whose keys are all commented out, so `upstream` was
-never set and the resolver fell back to "the only other remote". The hint does not mention the
-config key at all, and `--upstream NAME` is only persisted when given to `setup`, so the fix the
-user needs (`upstream = "upstream"` in `.forkflow.toml`, committed) is the one thing the message
-does not say. Name it in the hint, and consider having the template write `upstream` uncommented
-when `setup` resolved it - that key is the one every later run depends on.
+(or --upstream <NAME>)`. The resolver falls back to "the only other remote" and there is more than
+one, so it refuses - correctly - but the hint names only the `setup` flags, never the setting that
+answers the question for good.
+
+Since 0.3.0 that setting is `git config forkflow.upstream <NAME>`, in this clone's own
+`.git/config`; `setup --upstream <NAME>` writes it, but a user who has already run `setup` and then
+added a second remote has no reason to guess that rerunning `setup` is what persists it. Name the
+`git config` line in the hint alongside the flags - it is one line the user can paste, and it is the
+key every later run depends on.
+
+Seen on 2026-09-08, when the tree still held a `.forkflow.toml` whose keys were all commented out,
+so the file answered nothing either. That file no longer configures anything at all.

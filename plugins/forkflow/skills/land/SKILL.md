@@ -131,7 +131,7 @@ Under `--dry-run` the mutating steps and the last line carry `would:` (`would: l
 | 0 | landed (or caught up under `--force`) | nothing; the landed records are cleared, and any still pending are listed and kept |
 | 0 | dry run | nothing moved and the records are kept - run it without `--dry-run` to land |
 | 2 | dry run, and the landing is not in this clone's refs (`did not fetch, so it cannot tell`) | run the same command without `--dry-run`: it fetches and decides |
-| 2 | precondition: nothing pending (or nothing for the named branch), rebase in progress, dirty tree, trunk checked out in another worktree, the fetch failed, the recorded commit is not in this clone (`cannot verify the landing` - `--force` clears it), not on `origin/<trunk>` yet (with several records: none of them), `--force` with several records and none named, the local trunk carries commits origin lacks, `origin/<trunk>` does not resolve, or the usual setup failures (no `upstream` remote, the trunk not on origin, an origin whose push URL is the original project, an unreadable `.forkflow.toml`) | fix what the message names and rerun. A trunk checked out in another worktree means the command the message names, in that worktree - it sees the same pending records. "Not yet" means wait for the merge; "commits origin lacks" means somebody committed on the local trunk by hand - show them `git log origin/<trunk>..<trunk>` and let them decide, the plugin never moves that trunk over its own commits |
+| 2 | precondition: nothing pending (or nothing for the named branch), rebase in progress, dirty tree, trunk checked out in another worktree, the fetch failed, the recorded commit is not in this clone (`cannot verify the landing` - `--force` clears it), not on `origin/<trunk>` yet (with several records: none of them), `--force` with several records and none named, the local trunk carries commits origin lacks, `origin/<trunk>` does not resolve, or the usual setup failures (no `upstream` remote, the trunk not on origin, an origin whose push URL is the original project, a `forkflow.*` setting that is not a legal branch name) | fix what the message names and rerun. A trunk checked out in another worktree means the command the message names, in that worktree - it sees the same pending records. "Not yet" means wait for the merge; "commits origin lacks" means somebody committed on the local trunk by hand - show them `git log origin/<trunk>..<trunk>` and let them decide, the plugin never moves that trunk over its own commits |
 
 ## Notes
 
@@ -139,13 +139,15 @@ Under `--dry-run` the mutating steps and the last line carry `would:` (`would: l
   time - each keep their own, and only a second `ship` of the same branch replaces its record.
   `land` clears a record only while it is still the one it landed. `forkflow status` shows every
   record on a `pending` line, with the same landed / not-landed verdict `land` would give.
-- `ship --merge` and `sync --merge` (a fork with `merge = "self"`) run this same landing in the
-  same process right after the merge; a merged request whose catch-up could not run exits 2 with
+- `ship --merge` and `sync --merge` (a clone whose `git config --local forkflow.merge` says
+  `self`) run this same landing in the same process right after the merge; a merged request whose catch-up could not run exits 2 with
   a message that opens with "the merge request was merged" - then `forkflow land` finishes it
   once the reason is dealt with. A tool that answered "merged" while nothing reached the trunk
   (a merge train, auto-merge) is exit 6 instead, whichever worktree has the trunk: not merged
   yet - once it is, the `forkflow land <branch>` the message names, in the worktree it names.
 - Never `git push origin <trunk>`, never rebase the trunk, never `--force` anything: `land`
   fast-forwards only, and a trunk it cannot fast-forward is a message, not a `reset`.
-- `.forkflow.toml` (`gate`, `merge`, branch names) needs Python 3.11+; a present but unreadable
-  config is exit 2 for every subcommand rather than a guessed branch name.
+- The settings (`forkflow.gate`, `forkflow.merge`, the branch names) come from `git config`, in
+  this clone's own `.git/config` - they are not tracked and do not travel with the repository, so
+  each clone runs `forkflow setup` and adds its own `gate`. A leftover `.forkflow.toml` is
+  reported once per run and never read for configuration.

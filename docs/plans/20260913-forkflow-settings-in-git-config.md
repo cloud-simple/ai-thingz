@@ -433,11 +433,59 @@ settings actually in force after the notice coming from `git config` while the f
 names different ones. `TestSourceInvariants` gains the one invariant (1).
 
 ### Task 9: docs, manifests and the state file's wording
-- [ ] README Configuration section, exit-code table, adoption recipe, changelog row
-- [ ] `references/rules.md`, the five SKILL.md files, the module docstring, the `--merge` help
-- [ ] reword `change_state`'s refusal and `load_state`'s docstring, which name the deleted memory
-- [ ] bump the plugin to 0.3.0
-- [ ] run the suite - must pass before task 10
+- [x] README Configuration section, exit-code table, adoption recipe, changelog row
+- [x] `references/rules.md`, the five SKILL.md files, the module docstring, the `--merge` help
+- [x] reword `change_state`'s refusal and `load_state`'s docstring, which name the deleted memory
+- [x] bump the plugin to 0.3.0
+- [x] run the suite - must pass before task 10
+
+The README's Configuration section is rewritten around a `git config` block. The essay on how
+`merge` is judged to be the fork's own is four lines, because there is nothing left to judge;
+the sync-brings-a-gate, untracked-config and case-variant passages are gone whole; and two facts
+are stated as headings of their own - that the settings do NOT travel with the repository, and
+that `forkflow.merge` is read from `--local` scope alone so one `--global` cannot arm unreviewed
+merging in every fork on the machine. `gate` says `--add` appends, plain `git config` replaces,
+and that the commands run in order and stop at the first failure. A paragraph documents the
+migration notice: reported, never read for configuration, the commands printed for every other
+key, and for `merge` the value reported with deliberately nothing to paste.
+
+**⚠️ Deviation, task 9: the exit-2 row lost the unreadable config and GAINED a replacement.**
+Dropping `unreadable .forkflow.toml` outright would have left the row silent about the
+precondition that took its place: a `forkflow.*` setting that is not a legal branch name is
+exit 2 for every subcommand (`valid_branch_name`, the one check that survived the file parser).
+The row names that instead, and its `--merge` clause now names `git config --local
+forkflow.merge` rather than the file key.
+
+**⚠️ Deviation, task 9: `change_state`'s refusal may not say `forkflow land`.**
+`test_every_printed_sync_and_ship_command_comes_from_rerun_cmd` pins every spelled `forkflow sync|ship|land`
+to `land_cmd`, and the first rewording of the refusal - "what `forkflow land` would have landed" -
+failed it. What the user loses is named without the command: "every branch's pending ship or sync
+and with it every landing they have waiting". The docstrings of `load_state` and `change_state` are
+prose, which the invariant skips, so they name the pending map and `forkflow land` freely.
+
+**⚠️ Task 9: `.claude-plugin/marketplace.json` needed nothing.** It carries no `version` field -
+the version lives in `plugins/forkflow/.claude-plugin/plugin.json` alone, which is bumped to
+`0.3.0` - and its forkflow description names no config file and no Python floor. Left untouched.
+
+**⚠️ Deviation, task 9: `docs/backlog/setup-multiple-remotes-hint-ignores-config.md` was rewritten,
+which is outside the task's list of documents.** Its remedy was "commit `upstream = \"upstream\"`
+in `.forkflow.toml`", which is now impossible, and its premise was the commented-out template that
+no longer exists. The item itself is still real - the "several non-origin remotes" hint names only
+the `setup` flags and never the setting that ends the refusal - so it is kept, re-pointed at
+`git config forkflow.upstream` and at the line number the hint sits on now. Leaving it would have
+left the only backlog item in the repository telling a reader to do something the tool no longer
+supports.
+
+The five SKILL.md files: `status` drops the 3.11 note from its script line; `land`, `ship` and
+`sync` swap their `.forkflow.toml` bullet for one that names the `git config` settings and says
+they do not travel with the repository; `ship` and `sync` collapse the whose-bytes-are-these
+paragraph in their `--merge` step to the scoped read; `sync` loses the config `CHECK` paragraph in
+its conflict step (a merge cannot reach `.git/config`, so no sync brings a gate) and the config
+half of its exit-2 untracked-file row, keeping the generic refusal; `setup` replaces its
+`.forkflow.toml` step with the two settings it prints and will not set, and says the per-clone cost
+out loud. `references/rules.md` reworks the gate section: still arbitrary shell, still never run on
+a dry run, multi-valued with `--add`, run in order to the first failure - and the sync-brings-a-gate
+premise is replaced by why it cannot.
 
 ### Task 10: verify
 - [ ] the full suite and the other plugin's 24 tests

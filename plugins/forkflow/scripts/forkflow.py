@@ -44,8 +44,13 @@ Exit codes:
         merge by hand, then forkflow land
     130 interrupted
 
-`.forkflow.toml` is optional; reading it needs Python 3.11+ (tomllib). A config file that is
-present but cannot be read is exit 2 for every subcommand - it carries the branch names.
+Settings live in `git config`, in this clone's own `.git/config`, which is in no tree and which
+no merge can write: `forkflow.upstream`, `forkflow.upstreamBranch`, `forkflow.mirror`,
+`forkflow.trunk`, `forkflow.syncPrefix`, `forkflow.backupPrefix`, the multi-valued
+`forkflow.gate` (added with `--add`, run in order, stopping at the first failure) and
+`forkflow.merge` (read from `--local` scope alone). None of them travel with the repository:
+every clone, machine and teammate sets them again, and `setup` writes the layout keys. A
+leftover `.forkflow.toml` is reported once per run and never read for configuration.
 """
 
 from __future__ import annotations
@@ -977,15 +982,16 @@ def load_state(ctx: Ctx, shared: bool = False) -> Tuple[dict, str]:
     The one parser, because "this file says nothing" and "this file cannot be read" are two
     different facts and the difference decides things. An unparseable file used to answer
     `{}` here and nowhere else, so a truncated write, a full disk or a hand edit was
-    indistinguishable from a clone that had never recorded anything: `upstream_configs` -
-    which is the only thing standing between a version upstream has withdrawn and the
-    `--merge` gate - was simply forgotten, in silence, and the next write put the file back
-    with one key in it so the record was gone for good (scratchpad `f10/repro15.py`).
+    indistinguishable from a clone that had never recorded anything - and the next write put
+    the file back with one key in it, so every record that was in there was gone for good,
+    with nothing said. What is in there now is the `pending` map: the ship or sync each
+    branch has waiting to land, which is what `forkflow land` works from and what `status`
+    reports, shared by every worktree of the clone.
 
     So the two facts are told apart here and each caller decides what it costs.
-    `read_state` keeps the tolerant answer, because a command that does not depend on the
-    memory has no business failing over it; `change_state` will not write over a file it
-    cannot read, and `config_memory_unprovable` refuses `--merge`."""
+    `read_state` keeps the tolerant answer, because a command that does not depend on a
+    record has no business failing over it; `change_state` will not write over a file it
+    cannot read."""
     path = state_path(ctx, shared)
     if not path:
         return ({}, f"git could not say where `{STATE_FILE}` lives")
@@ -1169,11 +1175,10 @@ def change_state(ctx: Ctx, shared: bool, change) -> str:
 
     A file that cannot be READ is not written over. Read-modify-write on an unparseable
     file is read-as-{}-and-replace: one key goes in and every record that was in there -
-    including what this clone had written down of the original project's configs, which is
-    the whole defence against a withdrawn version - is gone, with nothing said. So this
-    answers with the reason instead, the callers say what was lost the way they already do
-    for a disk that is full, and `config_memory_unprovable` refuses `--merge` until the
-    user deals with the file. Nothing here deletes it: what is in it is the user's."""
+    every branch's pending ship or sync, which is the only thing `forkflow land` has to
+    work from - is gone, with nothing said. So this answers with the reason instead, and
+    the callers say what was lost the way they already do for a disk that is full. Nothing
+    here deletes it: what is in it is the user's."""
     path = state_path(ctx, shared)
     if not path:
         return f"git could not say where `{STATE_FILE}` lives"
@@ -1186,8 +1191,8 @@ def change_state(ctx: Ctx, shared: bool, change) -> str:
         if why:
             return (f"{why}, and writing over it would lose whatever is in there for good; "
                     f"nothing was written. Look at that file - and if you accept losing "
-                    f"every record in it, including which `{CONFIG_FILE}`s the original "
-                    f"project has had, delete it")
+                    f"every record in it, including every branch's pending ship or sync and "
+                    f"with it every landing they have waiting, delete it")
         change(data)
         return save_state(ctx, data, shared)
     finally:
@@ -5034,7 +5039,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     sy.add_argument("--mr", action="store_true", help="run the merge-request command")
     sy.add_argument("--merge", action="store_true",
                     help="open the merge request, merge it, then land it (you end on the "
-                         "trunk); needs merge = \"self\" in " + CONFIG_FILE)
+                         "trunk); needs `git config --local forkflow.merge self`")
     sy.add_argument("--title", help="merge-request title")
 
     sh = sub.add_parser("ship", parents=[common], help="squash a feature branch onto the trunk's tip")
@@ -5043,7 +5048,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     sh.add_argument("--mr", action="store_true", help="run the merge-request command")
     sh.add_argument("--merge", action="store_true",
                     help="open the merge request, merge it, then land it (you end on the "
-                         "trunk); needs merge = \"self\" in " + CONFIG_FILE)
+                         "trunk); needs `git config --local forkflow.merge self`")
     sh.add_argument("--title", help="merge-request title")
     sh.add_argument("--message-file", help="file with the squashed commit message")
 

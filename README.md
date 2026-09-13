@@ -265,85 +265,66 @@ warning and never a refusal.
 
 ### Configuration
 
-`.forkflow.toml` at the repo root, all keys optional - `setup` drops in a commented template:
+`git config`, all keys optional - `setup` writes the layout keys it worked out, and prints the two
+it will not set for you:
 
-```toml
-upstream = "upstream"        # remote name of the original project
-upstream_branch = "main"     # its branch we track (default: upstream's HEAD)
-mirror = "main"              # our fast-forward-only copy of it (default: upstream_branch)
-trunk = "develop"            # protected, MR-only branch carrying our work
-gate = []                    # e.g. ["make test", "terraform fmt -check -recursive"]
-merge = "manual"             # "self": this fork's MRs are merged by whoever opened them - enables --merge
-sync_prefix = "sync/"
-backup_prefix = "backup/"
+```bash
+git config forkflow.upstream       upstream   # remote name of the original project
+git config forkflow.upstreamBranch main       # its branch we track (default: upstream's HEAD)
+git config forkflow.mirror         main       # our fast-forward-only copy of it (default: upstreamBranch)
+git config forkflow.trunk          develop    # protected, MR-only branch carrying our work
+git config forkflow.syncPrefix     'sync/'
+git config forkflow.backupPrefix   'backup/'
+git config --add forkflow.gate     'make test'   # run before every MR; add one command at a time
+git config --local forkflow.merge  self       # "self": this fork's MRs are merged by whoever opened them - enables --merge
 ```
 
+**The settings do not travel with the repository.** `.git/config` is not tracked, so no merge can
+write it - which is the whole point - and by the same token another clone, another machine or a
+teammate has none of these until they are set there too. `forkflow setup` writes the layout keys,
+so the ordinary path is still one command per clone, but a teammate who clones the fork gets a tool
+that refuses until it is configured, and a fork's own `gate` does not reach its teammates at all.
+That is the accepted cost of settings a sync cannot reach.
+
 `merge` is the fork's one-time declaration of who merges its merge requests. `"manual"` (the
-default) means somebody reviews and presses the button, and `--merge` is refused with exit 2 before
-anything is pushed; `"self"` means whoever opened the MR merges it, which lets `ship --merge` and
-`sync --merge` do so. Config *and* flag are needed - either alone does nothing - so a reviewed fork
-can never be merged by accident. `--merge` also needs an origin URL that names a GitLab or GitHub
-project the merge command can address with `--repo`; one that does not is the same exit 2, before
-anything is pushed. Unlike every other key, `merge` is read only where the original project
-cannot write it: the `.forkflow.toml` this fork committed on `origin/<trunk>`, or - while none
-is committed there - an untracked `.forkflow.toml` in the working tree, where `setup` leaves it.
-The checked-out branch's own copy is never read for it: a sync branch carries upstream's file, so
-upstream's `merge = "self"` can never switch the gate off, and a config upstream wrote onto the
-trunk (a trunk bootstrapped from an upstream that tracks the file) counts as no declaration at all.
-Whose file it is is decided by its bytes, against every `.forkflow.toml` the original project has
-ever had - the whole history of every remote-tracking ref that is not `origin`'s, plus the mirror,
-not just their tips, so a version upstream has since retired is still upstream's. Any edit of your
-own makes it yours. The refs walked are deliberately not the ones the config names: a config
-choosing the evidence against itself is no check at all. What those refs carried is also written
-down - as hashes, in `.git/forkflow-state.json`, where the original project cannot write - because
-a version that is gone from every ref (upstream force-pushed, withdrew the branch, or this clone
-pruned) is not a version upstream never had: what was once upstream's stays upstream's, and your
-own edit of the file is new bytes that no such record holds. And the walk fails CLOSED - a clone that
-cannot prove what the original project has had gets exit 2 for `--merge` alone, with the condition
-named: shallow (`git fetch --unshallow <upstream>` ends it), partial (`--filter`), history rewritten
-by `refs/replace/*` or `info/grafts`, nothing of upstream's fetched, or an object that cannot be
-read. The same for a config that is not the same *kind* of thing as the blobs it is compared
-against - a `.forkflow.toml` that is a symlink (git stores the link's target, reading the path
-follows it), or one a `.gitattributes` renders on checkout (`filter`, `ident`, `text`, `eol`,
-`working-tree-encoding`, `diff`): the refusal names the link or the attribute and the way to end
-it. A `.gitattributes` that says nothing about `.forkflow.toml`, or that turns those attributes
-off for it, changes nothing. Everything else still works; the way past it is the ordinary one, `--mr` and a person merging.
-It is asked again right before the merge command runs; a fork that no longer says `"self"` by then
-(a teammate's commit the run's fetch brought in) gets exit 6 with the MR open. So the ship that
-first commits the config is `--mr`, merged by hand: once committed on a branch it is neither
-untracked nor on the trunk yet.
+default, and what an unset key means) means somebody reviews and presses the button, and `--merge`
+is refused with exit 2 before anything is pushed; `"self"` means whoever opened the MR merges it,
+which lets `ship --merge` and `sync --merge` do so. Config *and* flag are needed - either alone
+does nothing - so a reviewed fork can never be merged by accident. `--merge` also needs an origin
+URL that names a GitLab or GitHub project the merge command can address with `--repo`; one that does
+not is the same exit 2, before anything is pushed.
+
+**`forkflow.merge` is read from `--local` scope and from nowhere else**, deliberately. Every other
+key may come from whatever scope a plain `git config` read reaches - a `--global forkflow.trunk` is
+a user's own convenience and costs nothing. `merge` may not: one
+`git config --global forkflow.merge self` would otherwise arm unreviewed merging in every fork on
+the machine at once, from outside the repository it is a statement about. A value that is neither
+mode is exit 2, not a fallback.
 
 `gate` is the one key that is *run* rather than read - `sh -c` in the repo root, on every `check`,
-`sync` and `ship` - and `.forkflow.toml` is a tracked file a sync is designed to bring in from the
-original project. So a sync that changes it says so with a `CHECK` line pointing at
-`git diff <merge>^1 HEAD -- .forkflow.toml`, a run whose own merge changed the `gate` prints the
-commands that arrived instead of obeying them (`gate - NOT RUN`), and a `check` whose gate comes
-from a file upstream also tracks says that out loud. Read the diff before merging such a sync MR.
-A `gate` the merge left alone still runs: the guard is keyed on the commands, not on the file.
+`sync` and `ship`, in the order the commands were added, stopping at the first one that fails.
+`git config --add forkflow.gate '<command>'` appends one more command; plain
+`git config forkflow.gate '<command>'` **replaces** every command there is. It is shell this clone
+runs unattended, which is why `setup` prints the line and never runs it for you. A dry run prints
+the gate and does not run it.
 
-`setup` leaves `.forkflow.toml` untracked, so a sync that brings upstream's copy of it in would
-have to write over it - which git refuses. `sync` says so and names the file before the backup
-and the sync branch, so there is nothing to clean up. Do not delete it - it is this fork's
-config: commit it on a branch and `ship` it, and the next sync meets upstream's copy as a tracked
-file, in the open. A `.forkflow.toml` kept out of `git status` with `info/exclude` is one git
-*would* write over without a word - it counts ignored files as expendable - so `sync` looks for
-it in the working tree itself and refuses that collision the same way. On a case-insensitive
-filesystem (the macOS and Windows default) upstream's `.ForkFlow.toml` is the same file as
-`.forkflow.toml`, and `sync` treats it so. forkflow reads its config only from a file named
-exactly `.forkflow.toml` and refuses a case variant; the way out it prints never deletes or
-renames the variant in the working tree while the fork has a `.forkflow.toml` of its own - on
-such a filesystem that would take the fork's config with it - but puts the fork's copy back from
-`HEAD` through the index. Every command it prints first copies the file as it is into the git
-directory and names the copy, so an edit made before running it is not lost. On the trunk, the
-mirror or a detached HEAD it prints no command that commits - nothing is committed there: run
-forkflow on a branch off `origin/<trunk>`, where the fix it names is committed and shipped.
+`.forkflow.toml` is gone. Settings used to live in that file at the repo root - a tracked file,
+which a sync merges from the original project by design, so the fork's own `gate` and `merge` were
+reachable by the project the fork syncs from. Nothing reads it now. A leftover copy in the working
+tree is *reported*, once per run, and never read for configuration: the notice names the file, says
+what replaced it, and prints the `git config` command for every key it names - quoted, ready to
+paste. For `merge` it reports the value it found and deliberately prints nothing to paste: those
+are a tracked file's bytes, and a pasteable `git config forkflow.merge self` would put the whole
+route back through the user's own hands. The fork decides that one for itself. A name that differs
+only in case, a symlink, a file too large to read and a Python with no TOML parser are each named
+and not read, with the reason; none of them ends a run. Deleting the leftover file is a change to a
+tracked file like any other - commit the deletion on a branch and ship it. The notice goes away at
+`0.4.0`.
 
-The script itself needs only Python 3.9+ and git 2.20+ (the merge simulation wants 2.38+ and is
-skipped with a note on older git). **Reading `.forkflow.toml` needs Python 3.11+** (`tomllib`): a
-config file that is present and configures something is exit 2 for every subcommand on an older
-Python, because it carries the safety-critical branch names and must never be silently defaulted.
-Without a config file, 3.9+ is enough - so on an older Python `setup` writes no template (it says
-so) and a file of nothing but comments is read as no config at all.
+The script needs only Python 3.9+ and git 2.20+ (the merge simulation wants 2.38+ and is skipped
+with a note on older git). Reading the leftover `.forkflow.toml` for the migration notice wants
+`tomllib` (Python 3.11+); without it the notice says so in one sentence and every subcommand runs
+regardless.
 
 ### Exit codes
 
@@ -351,7 +332,7 @@ so) and a file of nothing but comments is read as no config at all.
 |---|---|
 | `0` | done, dry run, or nothing to do (already in sync; nothing to ship). Also `--mr` when the tool is missing or fails, without `--merge` - the branch is pushed and the command is printed |
 | `1` | `--test` had failures |
-| `2` | precondition: dirty tree, detached HEAD, missing remote, unfetched upstream, unreadable `.forkflow.toml`, mirror diverged from upstream, trunk missing on origin, foreign pre-push hook, `--merge` on a fork whose config does not say `merge = "self"` (or whose origin names no project to merge on), `land` with nothing pending or with an MR that is not merged yet, ... |
+| `2` | precondition: dirty tree, detached HEAD, missing remote, unfetched upstream, a `forkflow.*` setting that is not a legal branch name, mirror diverged from upstream, trunk missing on origin, foreign pre-push hook, `--merge` on a clone whose `git config --local forkflow.merge` does not say `self` (or whose origin names no project to merge on), `land` with nothing pending or with an MR that is not merged yet, ... |
 | `3` | invariant checked by `check`: a gate command failed, or the branch is not on the trunk's tip |
 | `4` | conflicts - resolve them, then rerun with `--continue` |
 | `5` | rewrite safety: backup not confirmed on origin, tree hash differs after the squash, push rejected |
@@ -386,7 +367,7 @@ an error: the MR is not merged, run it again once it is. A ship that landed as a
 with a WARNING - rule 5 asks for a fast-forward, and the shape is judged on the trunk's first-parent
 line.
 
-On a solo fork - one whose `.forkflow.toml` says `merge = "self"` - `ship --merge` and `sync
+On a solo fork - one whose `git config --local forkflow.merge` says `self` - `ship --merge` and `sync
 --merge` are the shortcut: open the MR, merge it, land it, in one run. The merge is the method rule
 5 requires - on GitLab the project's own merge method (`glab mr merge ... --auto-merge=false`,
 which `setup`'s report insists is `ff`), on GitHub `gh pr merge --merge` for a sync and `--rebase`
@@ -436,7 +417,9 @@ Maintainer:
 4. Make `main` a pure copy of `upstream/main`: either force-push it with protection temporarily
    allowing force-pushes, or unprotect, delete and recreate `main` from `upstream/main` and
    re-protect it.
-5. Run `/forkflow:setup` and commit `.forkflow.toml`.
+5. Run `/forkflow:setup`. It writes the branch names into this clone's `git config` and prints
+   the `gate` and `merge` lines to add by hand; every other clone of the fork needs the same
+   one command, because these settings are not tracked and do not travel with the repository.
 
 On GitLab there is a variant with no rewrite of your own: once `main` has been reset, configure
 project **pull mirroring** of the upstream repository into `main` and let the platform keep it
@@ -474,6 +457,7 @@ marketplace cache directory is named after it). What each one carries:
 
 | version | what changed |
 |---|---|
+| `0.3.0` | settings move from `.forkflow.toml` to `git config` (`forkflow.upstream`, `forkflow.upstreamBranch`, `forkflow.mirror`, `forkflow.trunk`, `forkflow.syncPrefix`, `forkflow.backupPrefix`, the multi-valued `forkflow.gate` and `forkflow.merge`), which live in `.git/config` - in no tree, so no sync can write them; `forkflow.merge` is read from `--local` scope alone, so a `--global` setting cannot arm unreviewed merging in every fork on the machine; `setup` writes the layout keys and prints the `gate` and `merge` lines rather than setting them; a leftover `.forkflow.toml` is reported once per run with the commands that replace it - and never read for configuration - and the value of `merge` is reported with nothing to paste; the Python floor drops to 3.9 (`tomllib` was imported for the config reader alone); the settings no longer travel with the repository - every clone, machine and teammate configures them again |
 | `0.2.0` | `land` subcommand: once the MR is merged, fetch, verify that the pushed commit is on `origin/<trunk>` (by ancestry, or by patch for a ship whose SHA was rewritten), fast-forward the local trunk, delete the landed branch (only while its tip is still the pushed commit) and leave you on the trunk - the printed shell catch-up line is retired for `next: forkflow land`; `--merge` on `sync` and `ship`, behind `merge = "self"` in `.forkflow.toml`, merges the MR the run opened with the method rule 5 requires and a head-commit guard, then lands it; exit `6` for a merge request not created or not merged; `status` shows every `pending` ship or sync (one record per branch, shared by the worktrees of a clone) and whether it has landed |
 | `0.1.1` | `status` asks the upstream server whether its branch moved instead of trusting the last fetch (`--offline` opts out); `--mr` passes `--yes` to `glab` and runs the tool with stdin closed, so it no longer stops at a confirmation prompt. Earlier fixes that shipped under `0.1.0` and are worth knowing about: every `gh`/`glab` command names the fork with `--repo` rather than resolving to the original project; the sync gate guard compares committed config to committed config; `file://localhost/` spellings of the upstream URL are refused by the hook |
 | `0.1.0` | first release |

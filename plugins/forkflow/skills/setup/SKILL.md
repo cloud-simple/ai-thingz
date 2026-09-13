@@ -37,7 +37,7 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before running it.
 
    Every step that would change something is printed as `would:` - the read-only steps (`remote`,
    `fetch`, `names`, `target`, `mirror`, `trunk`, `platform`) print without it; no config, no hook,
-   no template, no branch, no push. (Nothing is fetched either - a fetch writes `FETCH_HEAD`, the
+   no branch, no push. (Nothing is fetched either - a fetch writes `FETCH_HEAD`, the
    remote-tracking refs and objects - so the preview is built from the refs on disk and the
    `fetch` line says so; the platform report still runs, and every one of its calls is a GET.) A
    dry run that would have to *add* the remote stops there: there is nothing to preview yet.
@@ -48,13 +48,14 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before running it.
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/forkflow.py" setup
    ```
 
-   In order: resolve and fetch both remotes and set their HEADs; write `--trunk` / `--mirror` into
-   `.forkflow.toml` if given; check the mirror is a pure copy of upstream (in a single-branch clone
-   it asks origin with `ls-remote` first, and creates the local branch only when the published
-   mirror is one); bootstrap the trunk if it exists nowhere; disable the upstream push URL;
-   install the pre-push hook; set the ff-only git config; report the platform; write the
-   `.forkflow.toml` template if absent. The trunk step runs **before** the hook, because the hook
-   refuses every push of the trunk, creation included.
+   In order: resolve and fetch both remotes and set their HEADs; check the mirror is a pure copy
+   of upstream (in a single-branch clone it asks origin with `ls-remote` first, and creates the
+   local branch only when the published mirror is one); bootstrap the trunk if it exists nowhere;
+   disable the upstream push URL; install the pre-push hook; write the git config - the ff-only
+   settings and, in the same loop, `forkflow.trunk` / `forkflow.mirror` / `forkflow.upstream`
+   where a flag named one; report the platform; print the `gate` and `merge` lines it will not
+   set. The trunk step runs **before** the hook, because the hook refuses every push of the
+   trunk, creation included.
 
 4. **Walk through the platform report.** It is read-only and each finding that needs action is
    followed by an exact `fix:` command. Show the user the findings and the commands; a Maintainer
@@ -95,24 +96,28 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before running it.
    Pushes to the upstream remote fail even earlier, on the `DISABLED` push URL, before any hook
    runs.
 
-6. **`.forkflow.toml`.** The template is written commented-out and left **untracked**; tell the
-   user to commit it once the branch names, the `gate` list and `merge` are right, so everyone in
-   the fork shares them - on a branch off `origin/<trunk>`, shipped with `--mr` and merged by
-   hand, never on the trunk or the mirror - `merge = "self"` only if whoever opens this fork's
-   merge requests also merges them (it is what lets `--merge` merge; the default `"manual"`
-   refuses it; it is read from the untracked file until one is committed on the trunk, and from
-   the trunk's after that, in both cases only while those bytes are not a `.forkflow.toml` the
-   original project has). Reading it needs Python 3.11+ (`tomllib`); a config that is present but
-   unreadable is exit 2 for every subcommand - it carries the safety-critical branch names.
-   Committing it also matters when the upstream project uses forkflow itself: git refuses a merge
-   that would write over an untracked file, so a `sync` bringing upstream's `.forkflow.toml` in
-   stops (exit 2, nothing pushed) until the template is committed - never removed: it is this
-   fork's config.
+6. **The two settings `setup` will not make for the fork.** It prints them and runs neither.
+   `git config --add forkflow.gate '<command>'` is the check that must pass before a merge
+   request is opened or merged - `--add` appends one more command, plain `git config
+   forkflow.gate ...` REPLACES every command there is, and they run in the order they were added
+   and stop at the first failure. `git config --local forkflow.merge self` makes this fork's
+   merge requests merged by whoever opened them, with no review at all: that is what lets
+   `--merge` merge, it is a deliberate choice for a fork with no second pair of eyes and never a
+   default, and left unset a human merges. Read from `--local` scope alone, so a `--global`
+   setting cannot arm it in every fork on the machine.
 
-7. **Report** what changed in the clone (push URL, hook, config keys, any branch created), what
-   was only reported (the platform findings and their fix commands), and what is left for the
-   user: commit `.forkflow.toml`, run the platform fixes, then `/forkflow:sync` before
-   `/forkflow:ship`.
+   **None of it travels with the repository.** `.git/config` is not tracked and no merge can
+   write it - which is exactly why the settings live there - and by the same token another clone,
+   another machine or a teammate has none of them until `forkflow setup` and these lines are run
+   there too. Say that to the user rather than letting them find it out on a second machine.
+   A leftover `.forkflow.toml` from 0.1.x/0.2.x is reported once per run, with the `git config`
+   command for each key it names, and is never read for configuration; for `merge` the notice
+   reports the value and deliberately prints nothing to paste.
+
+7. **Report** what changed in the clone (push URL, hook, git config keys, any branch created),
+   what was only reported (the platform findings and their fix commands), and what is left for
+   the user: add the `gate` and `merge` settings they want, run the platform fixes, then
+   `/forkflow:sync` before `/forkflow:ship`.
 
 ## Refusals to handle, not work around
 

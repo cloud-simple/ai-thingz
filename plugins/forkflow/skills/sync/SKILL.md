@@ -8,8 +8,8 @@ allowed-tools: Bash, Read, AskUserQuestion
 
 The script never pushes the trunk, never rebases it, and never commits on the mirror - and neither
 may you. The trunk moves only through the merge request this produces; you never merge that MR
-yourself - *unless the fork's `.forkflow.toml` says `merge = "self"` and the user asked for
-`--merge`*, in which case the script merges it, as rule 5 requires and with a head-commit
+yourself - *unless this clone's `git config --local forkflow.merge` says `self` and the user
+asked for `--merge`*, in which case the script merges it, as rule 5 requires and with a head-commit
 guard, and lands it. Rule 5 matters here: a sync MR is merged **as a merge**, never squashed
 and never rebased. The local trunk catches up through `forkflow land`, never by hand.
 
@@ -79,15 +79,10 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    Open every flagged file, decide whether the loss was intended, and say so in your report. If a
    resolution dropped something it should not have, fix it, `git add`, and rerun `--continue`.
 
-   `.forkflow.toml` is one of those files, and the run says so with a `CHECK` line of its own when
-   the merge changes it: it names the branches every safety check depends on and holds `gate`,
-   which forkflow runs with `sh -c`. When *this* merge changed the `gate`, the commands that
-   arrived are printed rather than run (`gate - NOT RUN`) - what is shown is exactly what the
-   `forkflow check` the message names would run. Read the `git diff <merge>^1 HEAD --
-   .forkflow.toml` line the run prints with the user, and treat a `gate` that arrived from the
-   original project as untrusted shell until they have said otherwise - it runs on every later
-   `check`, `sync` and `ship`. A `gate` the merge left alone runs as usual, even when upstream
-   edited another line of the file.
+   No file a merge can carry configures forkflow any more: the settings, `gate` included, live in
+   `git config` - in `.git/config`, which is in no tree. So a sync cannot bring a gate in from
+   the original project, and the gate this run obeys is the one this clone was told to run,
+   whatever the merge brought.
 
 5. **Merge request.** The script prints the command; run it in the same invocation with `--mr`
    (add `--title` to override the default `sync: <upstream>/<branch> <date> (n commits)`). It
@@ -101,19 +96,15 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
    **`--merge`** (implies `--mr`) opens the merge request and merges it in the same run, then
    lands it (step 7). It is refused - exit 2, right after the header and before the fetch, the
    mirror advance, the backup and any push, on a plain run and on `--continue` alike - unless
-   **both** hold: the fork's `.forkflow.toml` says `merge = "self"` (the fork has declared that
-   whoever opens its merge requests merges them; the default is `"manual"`), and the origin URL
-   names a project the merge command can address with `--repo` (`rules.md`). The `merge = "self"`
-   has to be the fork's own: it is read only from the `.forkflow.toml` committed on
-   `origin/<trunk>` (or, while none is, an untracked one), and only while those bytes are not a
-   `.forkflow.toml` the original project has - never from the sync branch, whose tree holds
-   upstream's file. "Not one the original project has" is asked of every remote-tracking ref that
-   is not `origin`'s, and it fails CLOSED: in a clone that cannot answer it - shallow, partial,
-   `refs/replace/*` or grafts, nothing of upstream's fetched, an object that cannot be read -
-   `--merge` alone is exit 2 and the message names the condition and the command that ends it.
+   **both** hold: this clone's `git config --local forkflow.merge` says `self` (the fork has
+   declared that whoever opens its merge requests merges them; unset means `manual`), and the
+   origin URL names a project the merge command can address with `--repo` (`rules.md`). That
+   setting is read from `--local` scope and from nowhere else, so a `--global forkflow.merge
+   self` cannot arm it, and it lives in `.git/config`, which is in no tree - the sync branch
+   carries nothing that can change it.
    Refused on `--continue`, resume with the command it prints (`sync --continue
    --mr`: the MR is opened, not merged) and have the MR merged by hand. It is asked again right
-   before the merge; a fork that stopped saying `"self"` meanwhile is exit 6. Never work around
+   before the merge command runs; a clone that no longer says `self` by then is exit 6. Never work around
    that gate - a reviewed fork is meant to stop here. The merge is the one rule 5 requires, with
    a head-commit guard so only the merge commit this run pushed can be merged: GitLab `glab mr
    merge <sync branch> --repo <fork> --sha <head> --auto-merge=false --remove-source-branch
@@ -157,7 +148,7 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
 | exit | what happened | what to do |
 |---|---|---|
 | 0 | done, dry run, or "already in sync"; also `--mr` when the tool is missing or fails, without `--merge` | after a done run, `forkflow land` once the MR is merged; the mirror may still have been advanced and pushed |
-| 2 | precondition: dirty tree, detached HEAD, sync branch already exists locally or on origin, mirror checked out in another worktree, mirror diverged, untracked file blocking the mirror fast-forward, untracked file the merge would write over (`setup` leaves `.forkflow.toml` untracked - git-ignored or not, since git overwrites an ignored file silently - and an upstream that uses forkflow tracks it - under that name or, on a case-insensitive filesystem, as `.ForkFlow.toml`, the same file there; never delete it: commit it on a branch and ship it with the command printed, then sync again; no backup or sync branch was made), or a `.forkflow.toml` the merge brought in that cannot be read, a case variant of the name included (the merge commit, the sync branch, the mirror push and the backup are already made and the message says so - fix the file on the sync branch with the command it prints - which first copies the file into the git directory and names the copy, and for a variant beside the fork's own config goes through the index only - commit it, then the `sync --continue` it prints; do not edit the file before running it) | fix what the message names; `--force` recreates an existing sync branch, and that is the only thing `--force` does here - when that name is already on origin the rerun publishes the next free `<name>-N` instead (a sync branch is never force-pushed), and the stale merge request is closed by hand |
+| 2 | precondition: dirty tree, detached HEAD, sync branch already exists locally or on origin, mirror checked out in another worktree, mirror diverged, untracked file blocking the mirror fast-forward, untracked file the merge would write over (git-ignored or not, since git overwrites an ignored file silently, and on a case-insensitive filesystem a name git lists can be another spelling of a file of yours - never delete them: move them out of the working tree, or commit them on a branch and ship them into the trunk, then sync again; no backup or sync branch was made) | fix what the message names; `--force` recreates an existing sync branch, and that is the only thing `--force` does here - when that name is already on origin the rerun publishes the next free `<name>-N` instead (a sync branch is never force-pushed), and the stale merge request is closed by hand |
 | 3 | `check` failed after the merge - a `gate` command, or `origin/<trunk>` moved under the branch | read the hint the run printed: a failing gate is fixed with a commit on the sync branch and `sync --continue` (the resume picks up the merge commit, wherever it now sits in the branch); a trunk that moved on means the sync is redone against the new tip with `sync --force` - a sync MR is never rebased |
 | 4 | merge conflicts | resolve, `git add`, `sync --continue` |
 | 5 | rewrite safety: the backup was not confirmed on origin, or a push was rejected | do not work around it; report it - a rejected mirror push usually means the mirror is not a pure copy of upstream |
@@ -173,5 +164,7 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
 - A sync MR that goes stale is redone with `forkflow sync`, not rebased in the web UI.
 - After the push the run records what is waiting to land (`forkflow status` shows it on its
   `pending` line); `forkflow land` reads that record, so it works in a later session too.
-- `.forkflow.toml` (`gate`, `merge`, branch names) needs Python 3.11+; if the config is present
-  but unreadable every subcommand exits 2 rather than guessing branch names.
+- The settings (`forkflow.gate`, `forkflow.merge`, the branch names) come from `git config`, in
+  this clone's own `.git/config` - they are not tracked and do not travel with the repository, so
+  each clone runs `forkflow setup` and adds its own `gate`. A leftover `.forkflow.toml` is
+  reported once per run and never read for configuration.

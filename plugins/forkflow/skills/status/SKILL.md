@@ -12,8 +12,8 @@ It writes nothing. Without `--fetch` the numbers are as of the last fetch, and o
 asks the upstream server whether its branch has moved since - that is the only network call, and
 `--offline` skips it for a clone with no route to the server.
 
-Script: `${CLAUDE_PLUGIN_ROOT}/scripts/forkflow.py` (Python 3.9+, stdlib only; `.forkflow.toml`
-needs 3.11+). The layout and the rules it enforces: `${CLAUDE_PLUGIN_ROOT}/references/rules.md`.
+Script: `${CLAUDE_PLUGIN_ROOT}/scripts/forkflow.py` (Python 3.9+, stdlib only; settings come
+from `git config forkflow.*`). The layout and the rules it enforces: `${CLAUDE_PLUGIN_ROOT}/references/rules.md`.
 
 ## Process
 
