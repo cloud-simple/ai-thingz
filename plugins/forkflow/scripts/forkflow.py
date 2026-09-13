@@ -2245,9 +2245,10 @@ def merge_mr(ctx: Ctx, kind: str, branch: str, url: str) -> None:
         step("land", land_cmd(), "not run (dry run)", dry=True)
         return
     if fork_merge_mode(ctx) != MERGE_SELF:
-        step("merge", shown, "NOT RUN: this fork's config does not say merge = \"self\" now")
-        raise Fail(f"--merge needs `merge = \"self\"` in this fork's own config - "
-                   f"`git config --local forkflow.merge` - and it does not say that "
+        step("merge", shown, "NOT RUN: `git config --local forkflow.merge` does not "
+                             "say `self` now")
+        raise Fail(f"--merge needs this fork's own `git config --local forkflow.merge` "
+                   f"to say `self`, and it does not say that "
                    f"now: the branch is pushed and the merge request is open; have it "
                    f"merged by hand, then: {land_cmd()}", EXIT_NOT_MERGED)
     if not url:
@@ -2946,7 +2947,7 @@ def fork_merge_mode(ctx: Ctx) -> str:
 
 def fork_merge_refusal() -> str:
     """Why `--merge` is refused here and the way back - the rest of `merge_gate`'s message
-    after "--merge needs `merge = "self"` in this fork's own config - ".
+    after "--merge needs this fork's own config to say `self` - ".
 
     One sentence, because there is one state. The setting lives in this clone's own
     `.git/config`, which no merge reaches and no wider scope can set, so there is nothing to
@@ -3032,7 +3033,7 @@ def merge_gate(ctx: Ctx, args: argparse.Namespace, resume_sync: bool = False) ->
         # `--mr` (which `--merge` implies), so it still opens the request the reviewer merges
         by_hand = (f" Resume without it - `{continue_cmd('sync', argparse.Namespace(mr=True))}`"
                    f" - and have the merge request merged by hand." if resume_sync else "")
-        raise Fail(f"--merge needs `merge = \"self\"` in this fork's own config - "
+        raise Fail(f"--merge needs this fork's own config to say `self` - "
                    f"{fork_merge_refusal()}{by_hand}")
     target, reason = mr_target(ctx)
     if not target:

@@ -488,9 +488,67 @@ a dry run, multi-valued with `--add`, run in order to the first failure - and th
 premise is replaced by why it cannot.
 
 ### Task 10: verify
-- [ ] the full suite and the other plugin's 24 tests
-- [ ] an ordinary fork still completes setup, ship, land, sync and land on both platforms
-- [ ] no invariant pinning a dangerous operation was weakened
+- [x] the full suite and the other plugin's 24 tests
+- [x] an ordinary fork still completes setup, ship, land, sync and land on both platforms
+- [x] no invariant pinning a dangerous operation was weakened
+
+**Suites.** `forkflow.py --test`: 500 tests, OK. `python3 -m unittest discover -s tests`: 24
+tests, OK.
+
+**End to end, both platforms** (scratchpad `g5/E1.sh`, on the `e3` fake `gh`/`glab`, with the
+fork's setup converted from the config file to `git config`). setup, `ship --merge`, land,
+upstream moves, `sync --merge`, land - exit 0 throughout on GitLab and on GitHub. The mirror
+ends byte-equal to `upstream/main` on both. The trunk moves only through `git merge --ff-only`
+(GitLab `ac3a8e6 -> 061f370 -> 4bf9110`, GitHub `0dbfb05 -> 589a5c1 -> 2e3038a`), and the
+first-parent line is one squashed ship followed by one sync merge commit. `--merge` really
+merged: `glab mr merge ... --sha <head> --auto-merge=false`, `gh pr merge ... --rebase` for the
+ship and `--merge` for the sync, each with the head-commit guard. Because `--merge` chains the
+landing itself, the `land` that follows it correctly reports nothing pending (exit 2) - the run
+had already left the user on the trunk. Two refusals were checked in the same fixture before the
+setting was made: `--merge` with no `forkflow.merge` at all is exit 2, and `--merge` with
+`git config --global forkflow.merge self` (against a throwaway `GIT_CONFIG_GLOBAL`, never the
+user's own) is exit 2 as well.
+
+**A fork with a leftover `.forkflow.toml`** (scratchpad `g5/E2.sh`): `git config forkflow.trunk
+maintrunk` against a file saying `trunk = "develop"`, `mirror = "not-a-branch-of-ours"`,
+`backup_prefix`, a two-command `gate` starting `exit 2`, and `merge = "self"`. `status` and
+`check` both exit 0 and both report the trunk as `maintrunk` - the git config value, and a name
+that is neither the default nor the file's. `check` says `gate - none configured`: the file's
+`exit 2` never ran. `ship --merge` is exit 2 - the file's `merge = "self"` arms nothing. The
+notice is printed once per run, in full, with a `git config` line for every key but `merge` and
+the value of `merge` reported with nothing to paste.
+
+**Invariant audit.** Every one of them still stands, unweakened: `"push"` to the three push
+helpers; the argv-matcher blind-spot test (single-quoted argv, `'push'`, `-f`, `-u`);
+`--force`/`--no-verify`/`--force-with-lease`; `update-ref` to `advance_mirror`; `merge --ff-only`
+to `advance_mirror` and `land_trunk`; `rebase` to `rebase_onto`; the subprocess owner set; the
+dry-run rule (`merge-tree`, `["fetch"]`, `fetch_preview`); the printed-command helpers
+(`rerun_cmd` for every `forkflow sync`/`ship`, `land_cmd` for every `forkflow land`); and the git
+floor. The merge decision keeps all four of its scoped-read pins - `get("merge")` to
+`parse_config`, `GIT_CONFIG_MERGE` to the module and `git_config_merge`, `git_config_merge(` to
+itself and `fork_merge_mode`, and `"--local"` to `git_config_merge` alone - plus the refusals in
+`merge_gate` and `merge_mr` and the ordering of both. The new
+`test_the_migration_parser_configures_nothing` is in place.
+
+**⚠️ Mutation test: both mutants died, on the tests that are supposed to kill them.**
+(a) The merge reader made unscoped (`git_rc("config", "--get", GIT_CONFIG_MERGE, ...)`): 2
+failures - the BEHAVIOURAL
+`TestGitConfigSettings.test_merge_is_read_from_the_local_scope_and_the_sweep_never_carries_it`
+and the source invariant. (b) The migration parser's result reaching configuration
+(`load_settings` filling unset keys from the file through `parse_config`): 4 - the invariant
+`test_the_migration_parser_configures_nothing`, `test_git_config_is_read_and_the_file_is_not`,
+and two `TestMigrationNotice` tests. Neither central guarantee is untested.
+
+**⚠️ Deviation, task 10: one fixing commit, for a stale string the end-to-end run surfaced.**
+The `--merge` refusals still opened with ``--merge needs `merge = "self"` in this fork's own
+config`` - TOML syntax for a setting that is no longer in a TOML file. Task 9's brief named the
+two `--merge` help strings and not these, but they are the same stale spelling and they are what
+a user actually reads when the gate refuses. `merge_gate` now opens "--merge needs this fork's
+own config to say `self` - " and hands over to `fork_merge_refusal` as before; `merge_mr`'s
+exit-6 message and its `NOT RUN` step line both name `git config --local forkflow.merge`
+directly. The constant `GIT_CONFIG_MERGE` is deliberately NOT used in either: the merge-decision
+invariant pins that name to the module and `git_config_merge`, and spelling it in a message
+would have widened that set. `REFUSED = "--merge needs"`, which the tests match on, is unchanged.
 
 ## Post-Completion
 
