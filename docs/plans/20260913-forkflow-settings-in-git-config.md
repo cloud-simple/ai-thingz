@@ -323,9 +323,58 @@ trunk" tail. Both are covered for ordinary files by
 `test_the_untracked_merge_fallback_names_a_rerun_that_is_not_a_closed_loop`.
 
 ### Task 7: setup writes git config
-- [ ] delete the template writer and the in-place key rewriter; fold the keys into `setup_git_config`
-- [ ] setup prints the `gate` and `merge` lines a fork typically wants, as suggestions
-- [ ] run the suite - must pass before task 8
+- [x] delete the template writer and the in-place key rewriter; fold the keys into `setup_git_config`
+- [x] setup prints the `gate` and `merge` lines a fork typically wants, as suggestions
+- [x] run the suite - must pass before task 8
+
+Deleted: `setup_template`, `template_text`, `config_with_keys` (the in-place key rewriter
+that kept the trailing comments), `toml_string`, `CONFIG_KEY_LINE` and `write_config_keys`.
+`write_git_config_keys` is gone as a separate function and its work is a `pairs` argument
+to `setup_git_config`, which now writes the `--trunk`/`--mirror`/`--upstream` names and the
+four rule settings in ONE loop - one spelling of "already set", of the dry run and of the
+printed command for all of them. `cmd_setup` reads the flags where it read them before and
+passes them down; nothing else in the run changes.
+
+**⚠️ `setup` says the per-clone cost out loud, every run.** The last thing `setup` prints is
+`setup_suggestions`: the `git config --add forkflow.gate '<command>'` line (with `--add`
+appends, plain `git config` replaces, and they run in order and stop at the first failure),
+the `git config --local forkflow.merge self` line (with the sentence that it merges merge
+requests without review and is a deliberate choice, never a default), and then that none of
+it travels with the repository - `.git/config` is not tracked, no merge can write it, and
+another clone, another machine or a teammate has none of it until it is set there too.
+Suggestions and not actions: `setup` runs neither of them, and the idempotency test asserts
+that the run arms no `forkflow.merge` and writes no `forkflow.gate` of its own.
+
+**⚠️ Deviation, task 7: the timing of the flag write moved.** `--upstream`/`--trunk`/
+`--mirror` used to be persisted immediately after the `names` step; they are now written
+where `setup_git_config` runs, after the mirror, trunk, push URL and hook steps. A `setup`
+that fails at one of those no longer leaves the name behind - the rerun needs the flag
+again, as it did before task 3 added the git config writer. One writer for all of git
+config is worth that: two loops setting a `forkflow.*` key is exactly how one of them comes
+to disagree with the other about the dry run.
+
+**⚠️ Deviation, task 7: `gate_commands`'s docstring was corrected.** It said `load_config`
+had already refused every other shape, which stopped being true when the gate moved to git
+config, where every value is a string. It now says the order is the whole of what a gate
+means and why a blank entry is dropped. Prose only.
+
+**⚠️ Task 7 tests: the suite drops from 489 to 486.** The three `config_with_keys` tests go
+with the function. `SetupBase.toml_path` and `untouched`'s assertion that no config file was
+written go with the template. `test_configures_the_clone_and_is_idempotent` swaps its four
+template assertions for the suggestion lines, the two `forkflow.*` settings left unset and
+the absent file. `test_no_template_is_written_on_a_python_that_cannot_read_one` becomes
+`test_a_python_without_tomllib_configures_the_clone_and_runs_every_command`: the subject
+that survives is the Python floor - `setup` configures the clone and every command after it
+works with no `tomllib` at all, and nothing says "Python 3.11" any more.
+`test_the_upstream_flag_is_used_and_written_to_the_config` reads `forkflow.upstream` back
+out of git config, and `test_trunk_and_mirror_flags_are_written_and_other_keys_survive`
+becomes `..._and_other_settings_survive`: a two-command `gate` already in `.git/config` is
+still there in its order after `setup`, and a second run reports the names as already set.
+
+`load_config`, `parse_config`, `configures_nothing`, `have_tomllib` and `CONFIG_FILE` are
+now unreferenced by anything but each other, which is what task 8 wants: the migration
+notice needs a parser. `load_config` no longer refuses a case variant (task 6), so the
+notice will have to treat one as a file to name itself, as the Migration section says.
 
 ### Task 8: the migration notice
 - [ ] the notice in `resolve_ctx`, under every rule above

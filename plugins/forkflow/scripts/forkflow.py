@@ -2222,7 +2222,9 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def gate_commands(ctx: Ctx) -> list:
-    """`gate = [...]` from the config - load_config has already refused every other shape."""
+    """The gate, in the order it was configured - the run stops at the first command that
+    fails, so the order is the whole of what it means. Blank entries are dropped: a git
+    config value is always a string, and an empty one is how a key is unset in effect."""
     return [c for c in (ctx.cfg.get("gate") or []) if c.strip()]
 
 
@@ -3899,112 +3901,6 @@ def cmd_land(args: argparse.Namespace) -> int:
 # setup
 # --------------------------------------------------------------------------- #
 
-# key = value lines of `.forkflow.toml`, commented or not, with whatever trails them
-CONFIG_KEY_LINE = re.compile(r'^\s*#?\s*(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*'
-                             r'(?P<val>"[^"]*"|\[[^\]]*\]|\S*)(?P<rest>.*)$')
-
-
-def toml_string(value: str) -> str:
-    """A TOML basic string. `"` and `\\` are escaped: a name that carries either would
-    otherwise write a `.forkflow.toml` that `load_config` refuses, bricking every subcommand."""
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def template_text(ctx: Ctx) -> str:
-    """The commented `.forkflow.toml` `setup` drops in: every key optional, defaults shown.
-
-    The trailing comments are padded to the longest entry, so the file lines up whatever
-    the resolved names are - a hard-coded column only fits the default lengths."""
-    entries = [
-        (f'upstream = {toml_string(ctx.upstream)}', "remote name of the original project"),
-        (f'upstream_branch = {toml_string(ctx.upstream_branch)}',
-         "its branch we track (default: its HEAD)"),
-        (f'mirror = {toml_string(ctx.mirror)}', "our fast-forward-only copy of it"),
-        (f'trunk = {toml_string(ctx.trunk)}', "protected, MR-only branch with our work"),
-        ("gate = []", 'e.g. ["make test", "terraform fmt"]'),
-        (f'merge = {toml_string(MERGE_MANUAL)}',
-         '"self": this fork\'s MRs are merged by whoever opened them - enables --merge'),
-        (f'sync_prefix = {toml_string(ctx.sync_prefix)}', ""),
-        (f'backup_prefix = {toml_string(ctx.backup_prefix)}', ""),
-    ]
-    width = max(len(entry) for entry, _ in entries)
-    lines = [
-        "# forkflow - every key is optional; the values below are what this clone resolves to.",
-        "# Reading this file needs Python 3.11+ (tomllib); a file that cannot be read is fatal.",
-        "",
-    ]
-    for entry, why in entries:
-        lines.append(f"# {entry.ljust(width)}  # {why}" if why else f"# {entry}")
-    lines.append("")
-    return "\n".join(lines) + "\n"
-
-
-def config_with_keys(text: str, pairs: Sequence[Tuple[str, str]]) -> str:
-    """`text` with each key set: an existing line (commented or not) is rewritten in place,
-    keeping the comment that trails it; every other line is left exactly as it was.
-
-    Only the region above the first `[table]` header is touched, for reading and for writing:
-    `load_config` reads top-level keys, so a `trunk` inside a table is a different setting.
-    Rewriting that one would report a change the branch names never see, and appending below
-    the header would write a key into the table instead of into the config."""
-    lines = text.splitlines()
-    top = next((i for i, ln in enumerate(lines) if ln.lstrip().startswith("[")), len(lines))
-    for key, value in pairs:
-        entry = f'{key} = {toml_string(value)}'
-        for i in range(top):
-            m = CONFIG_KEY_LINE.match(lines[i])
-            if m and m.group("key") == key:
-                lines[i] = entry + m.group("rest")
-                break
-        else:
-            lines.insert(top, entry)
-            top += 1
-    return "\n".join(lines) + "\n"
-
-
-def write_git_config_keys(ctx: Ctx, pairs: Sequence[Tuple[str, str]]) -> None:
-    """--trunk/--mirror/--upstream persisted WHERE FORKFLOW READS THEM, which is git config.
-
-    The names have to outlive the flags that set them: a clone with more than one non-origin
-    remote can infer nothing, so without the `upstream` key every later subcommand would ask
-    for the flag again. `write_config_keys` still writes them into `.forkflow.toml` beside
-    this, for a fork whose teammates are on an older forkflow; nothing reads them there."""
-    names = dict(GIT_CONFIG_SINGLES)
-    for key, value in pairs:
-        cmd = f"git config {sh_arg(names[key])} {sh_arg(value)}"
-        if git("config", "--get", names[key], cwd=ctx.root, check=False) == value:
-            step("config", cmd, f"already {key} = {value}")
-            continue
-        if ctx.dry_run:
-            step("config", cmd, f"would set {key} = {value}", dry=True)
-            continue
-        git("config", names[key], value, cwd=ctx.root)
-        step("config", cmd, f"{key} = {value}")
-
-
-def write_config_keys(ctx: Ctx, pairs: Sequence[Tuple[str, str]]) -> None:
-    """--trunk/--mirror persisted: the branch names must outlive the flags that set them."""
-    path = os.path.join(ctx.root, CONFIG_FILE)
-    exists = os.path.exists(path)
-    if exists:
-        with open(path, "r", errors="replace") as fh:
-            text = fh.read()
-    else:
-        text = template_text(ctx)
-    new = config_with_keys(text, pairs)
-    shown = ", ".join(f'{k} = "{v}"' for k, v in pairs)
-    cmd = f"edit {CONFIG_FILE}"
-    if new == text:
-        step("toml", cmd, f"already {shown}")
-        return
-    if ctx.dry_run:
-        step("toml", cmd, f"would {'update' if exists else 'create'} it with {shown}", dry=True)
-        return
-    with open(path, "w") as fh:
-        fh.write(new)
-    step("toml", cmd, f"{'updated' if exists else 'created'}: {shown}")
-
-
 def setup_upstream_remote(ctx: Ctx, args: argparse.Namespace) -> Optional[str]:
     """The remote of the original project, added from --upstream-url when it is missing.
 
@@ -4468,9 +4364,23 @@ def setup_hook(ctx: Ctx, force: bool) -> None:
           f"so `git fetch {sh_arg(ctx.upstream)}` before pushing the mirror")
 
 
-def setup_git_config(ctx: Ctx) -> None:
-    """ff-only for the two long-lived branches is rule 3 and rule 6 in git's own hands."""
-    settings = [
+def setup_git_config(ctx: Ctx, pairs: Sequence[Tuple[str, str]] = ()) -> None:
+    """Every `git config` this clone is given: the rules git can enforce for itself, and the
+    names `--trunk`, `--mirror` and `--upstream` carried on this run's command line.
+
+    ff-only for the two long-lived branches is rule 3 and rule 6 in git's own hands. The
+    names have to outlive the flags that set them - a clone with more than one non-origin
+    remote can infer nothing, so without `forkflow.upstream` every later subcommand would
+    exit 2 asking for the flag again - and `.git/config` is where forkflow reads them: it is
+    in no tree, so no merge from the original project can reach it. That is also why nothing
+    is written here for anyone else to read: these settings are this clone's alone, which
+    `setup` says out loud at the end of the run.
+
+    One loop for all of them, so a setting added later cannot bring its own spelling of
+    "already set", of the dry run, or of the command it prints."""
+    names = dict(GIT_CONFIG_SINGLES)
+    settings = [(names[key], value, f"the `--{key}` this run was given") for key, value in pairs]
+    settings += [
         (f"branch.{ctx.trunk}.mergeOptions", "--ff-only", "rule: the trunk only fast-forwards"),
         (f"branch.{ctx.mirror}.mergeOptions", "--ff-only", "rule: the mirror only fast-forwards"),
         ("pull.ff", "only", "rule: a pull never creates a merge commit"),
@@ -4864,29 +4774,31 @@ def platform_report(ctx: Ctx) -> None:
              f"merge requests into it fast-forward, and that it is protected")
 
 
-def setup_template(ctx: Ctx) -> None:
-    """A commented `.forkflow.toml`, left untracked: the branch names are the fork's decision."""
-    path = os.path.join(ctx.root, CONFIG_FILE)
-    cmd = f"write {CONFIG_FILE}"
-    if not have_tomllib():
-        # the template is a starting point to edit, and the first uncommented key in it would
-        # make every subcommand exit 2 on this Python. Nothing here needs a config file.
-        step("template", cmd, f"skipped: reading {CONFIG_FILE} needs Python 3.11+ (tomllib) "
-                              f"and this is Python {sys.version_info[0]}."
-                              f"{sys.version_info[1]} - the defaults are in use")
-        return
-    if os.path.exists(path):
-        step("template", cmd, "already there, left as it is")
-    elif ctx.dry_run:
-        step("template", cmd, "would write the commented template", dry=True)
-        return
-    else:
-        with open(path, "w") as fh:
-            fh.write(template_text(ctx))
-        step("template", cmd, "commented template written")
-    print(f"    it is untracked: when you are happy with it, commit it on a branch off "
-          f"{ctx.origin}/{ctx.trunk} and ship that - never on the trunk or the mirror - so "
-          f"the branch names and the gate are the same for everyone")
+def setup_suggestions(ctx: Ctx) -> None:
+    """The two settings a fork usually wants and `setup` will not set for it - PRINTED, not
+    run: a gate is shell this clone goes on to run unattended, and `merge = self` turns off
+    human review of merge requests, so each is the fork's own decision to make deliberately.
+
+    There is no file to open and edit any more, and that is the point: `git config` writes
+    straight into `.git/config`, which is in no tree, so the original project cannot reach
+    these settings through a sync the way it reached a tracked file. The same fact is what
+    they cost, and this is the one place a user learns it from the tool rather than from a
+    surprise - so it is said here, in full, on every run."""
+    print("  settings  forkflow reads its settings from `git config` - `.git/config`, this "
+          "clone's own file. The two a fork usually sets by hand:")
+    print("    a check that must pass before a merge request is opened or merged:")
+    print(f"      git config --add forkflow.gate {sh_arg('make test')}")
+    print("      `--add` appends one more command; plain `git config forkflow.gate ...` "
+          "REPLACES every command there is. They run in the order they were added, and stop "
+          "at the first one that fails.")
+    print("    merge requests merged by whoever opened them, with no review at all:")
+    print("      git config --local forkflow.merge self")
+    print(f"      `ship --merge` and `sync --merge` then merge their own requests, so nobody "
+          f"else ever looks at what lands on `{ctx.trunk}` - a deliberate choice for a fork "
+          f"with no second pair of eyes, never a default. Left unset, a human merges.")
+    print("    None of this travels with the repository: `.git/config` is not tracked and no "
+          "merge can write it - and by the same token another clone, another machine or a "
+          "teammate has none of it until `forkflow setup` and these lines are run there too.")
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
@@ -4905,15 +4817,13 @@ def cmd_setup(args: argparse.Namespace) -> int:
                       strict_mirror=False, upstream=name)
     step("names", "-", f"upstream={ctx.up()}  mirror={ctx.mirror}  trunk={ctx.trunk}")
 
+    # the names this run was given, written with the rest of the git config below
     pairs = [(key, getattr(ctx, key)) for key in ("trunk", "mirror")
              if getattr(args, key, None)]
     if getattr(args, "upstream", None):
         # a repo with more than one non-origin remote cannot infer it: without this every
         # later subcommand would exit 2 asking for the flag again
         pairs.append(("upstream", ctx.upstream))
-    if pairs:
-        write_git_config_keys(ctx, pairs)
-        write_config_keys(ctx, pairs)
 
     target = rev(ctx.root, ctx.up())
     if not target:
@@ -4924,9 +4834,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
     setup_trunk(ctx, target)
     setup_push_url(ctx)
     setup_hook(ctx, bool(getattr(args, "force", False)))
-    setup_git_config(ctx)
+    setup_git_config(ctx, pairs)
     platform_report(ctx)
-    setup_template(ctx)
+    setup_suggestions(ctx)
     return 0
 
 
@@ -5466,7 +5376,6 @@ def run_tests() -> None:
         return resolve_ctx(fork, args, need_upstream=need_upstream,
                            need_trunk=need_trunk, strict_mirror=strict_mirror)
 
-    has_tomllib = sys.version_info >= (3, 11)
     needs_merge_tree = unittest.skipUnless(git_version() >= MERGE_TREE_GIT,
                                            "the merge simulation needs git 2.38+")
 
@@ -9042,7 +8951,7 @@ def run_tests() -> None:
             self.assertEqual(origin_sha(fork, "develop"), before_trunk)
 
     # ------------------------------------------------------------------- #
-    # setup: remotes, names, mirror, trunk bootstrap, config, template
+    # setup: remotes, names, mirror, trunk bootstrap, git config
     # ------------------------------------------------------------------- #
 
     class SetupBase(Base):
@@ -9052,9 +8961,6 @@ def run_tests() -> None:
         def push_url(self, repo: str, remote: str = "upstream") -> str:
             return sh("git", "remote", "get-url", "--push", remote, cwd=repo, check=False)
 
-        def toml_path(self, repo: str) -> str:
-            return os.path.join(repo, CONFIG_FILE)
-
         def untouched(self, repo: str) -> None:
             """What every failing `setup` must leave exactly as it found it."""
             remotes = sh("git", "remote", cwd=repo).split()
@@ -9062,7 +8968,6 @@ def run_tests() -> None:
                 self.assertNotEqual(self.push_url(repo), "DISABLED")
             self.assertEqual(self.cfg(repo, "pull.ff"), "")
             self.assertEqual(self.cfg(repo, "rerere.enabled"), "")
-            self.assertFalse(os.path.exists(self.toml_path(repo)))
 
     class TestSetup(SetupBase):
         def test_configures_the_clone_and_is_idempotent(self):
@@ -9078,14 +8983,15 @@ def run_tests() -> None:
             self.assertEqual(self.cfg(fork, "branch.main.mergeOptions"), "--ff-only")
             self.assertEqual(self.cfg(fork, "pull.ff"), "only")
             self.assertEqual(self.cfg(fork, "rerere.enabled"), "true")
-            with open(self.toml_path(fork)) as fh:
-                template = fh.read()
-            self.assertIn('# trunk = "develop"', template)
-            self.assertIn('# mirror = "main"', template)
-            self.assertIn('# merge = "manual"', template)
-            self.assertIn("enables --merge", template)
-            # committed on a branch and shipped - never on the trunk or the mirror
-            self.assertIn("commit it on a branch off origin/develop", out)
+            # the two a fork decides for itself are PRINTED, not set: this run arms no
+            # `--merge` and runs no gate of anyone's, and it leaves no file of settings at all
+            self.assertIn("git config --add forkflow.gate", out)
+            self.assertIn("git config --local forkflow.merge self", out)
+            self.assertIn("no review at all", out)
+            self.assertIn("None of this travels with the repository", out)   # the per-clone cost
+            self.assertEqual(self.cfg(fork, GIT_CONFIG_MERGE), "")
+            self.assertEqual(self.cfg(fork, GIT_CONFIG_GATE), "")
+            self.assertFalse(os.path.exists(os.path.join(fork, CONFIG_FILE)))
             self.assertNotIn("would:", out)
 
             branches, trunk_sha = local_branches(fork), origin_sha(fork, "develop")
@@ -9093,22 +8999,22 @@ def run_tests() -> None:
             self.assertEqual(code, 0, err + out)
             self.assertIn("already DISABLED", out)
             self.assertIn("already set", out)
-            self.assertIn("already there", out)
             self.assertEqual(local_branches(fork), branches)
             self.assertEqual(origin_sha(fork, "develop"), trunk_sha)
-            with open(self.toml_path(fork)) as fh:
-                self.assertEqual(fh.read(), template)
 
-        def test_no_template_is_written_on_a_python_that_cannot_read_one(self):
-            """`load_config` refuses a config file it cannot parse, so the template `setup`
-            leaves behind would turn every later command - `setup` included - into exit 2 on
-            the 3.9/3.10 the script otherwise supports."""
+        def test_a_python_without_tomllib_configures_the_clone_and_runs_every_command(self):
+            """`tomllib` is 3.11+ and was imported to read `.forkflow.toml`. The settings come
+            from `git config` now, so nothing on the ordinary path needs it: `setup` writes
+            the same configuration and every command after it works, on the 3.9 the README
+            states as the floor. `setup` used to write no template at all on such a Python,
+            and said so."""
             fork = make_fork(self.tmp)
             with mock.patch.dict(sys.modules, {"tomllib": None}):
                 code, out, err = run("-C", fork, "setup")
                 self.assertEqual(code, 0, err + out)
-                self.assertIn("needs Python 3.11+", out)
-                self.assertFalse(os.path.exists(self.toml_path(fork)))
+                self.assertEqual(self.cfg(fork, "pull.ff"), "only")
+                self.assertIn("git config --add forkflow.gate", out)
+                self.assertNotIn("Python 3.11", out)
                 for argv in (("status",), ("check",), ("setup",)):
                     code, out, err = run("-C", fork, *argv)
                     self.assertEqual(code, 0, " ".join(argv) + ": " + err + out)
@@ -9145,7 +9051,7 @@ def run_tests() -> None:
             code, out, err = run("-C", fork, "setup", "--upstream", "up")
             self.assertEqual(code, 0, err + out)
             self.assertIn("upstream=up/main", out)
-            self.assertEqual(load_config(fork)["upstream"], "up")
+            self.assertEqual(self.cfg(fork, "forkflow.upstream"), "up")
             self.assertEqual(self.push_url(fork, "up"), "DISABLED")
             # the next run needs no flag: without the config key it would be exit 2
             code, out, err = run("-C", fork, "status")
@@ -9161,42 +9067,25 @@ def run_tests() -> None:
             self.assertIn("--upstream-url is ignored", out)
             self.assertEqual(sh("git", "remote", "get-url", "upstream", cwd=fork), before)
 
-        def test_trunk_and_mirror_flags_are_written_and_other_keys_survive(self):
+        def test_trunk_and_mirror_flags_are_written_and_other_settings_survive(self):
+            """The flags go where forkflow reads them, and `setup` touches no other
+            `forkflow.*`: a gate this clone already had is still there, in its order."""
             fork = make_fork(self.tmp, trunk="trunk", mirror="upstream-main",
-                             config='gate = ["true"]\n')
+                             settings={"gate": ["true", "true -x"]})
             code, out, err = run("-C", fork, "setup",
                                  "--trunk", "trunk", "--mirror", "upstream-main")
             self.assertEqual(code, 0, err + out)
-            cfg = load_config(fork)
-            self.assertEqual(cfg["trunk"], "trunk")
-            self.assertEqual(cfg["mirror"], "upstream-main")
-            self.assertEqual(cfg["gate"], ["true"])
+            self.assertEqual(self.cfg(fork, "forkflow.trunk"), "trunk")
+            self.assertEqual(self.cfg(fork, "forkflow.mirror"), "upstream-main")
+            self.assertEqual(sh("git", "config", "--get-all", GIT_CONFIG_GATE,
+                                cwd=fork).splitlines(), ["true", "true -x"])
             self.assertEqual(self.cfg(fork, "branch.trunk.mergeOptions"), "--ff-only")
             self.assertEqual(self.cfg(fork, "branch.upstream-main.mergeOptions"), "--ff-only")
-
-        def test_config_with_keys_rewrites_in_place_and_keeps_comments(self):
-            text = ('# forkflow\n'
-                    '# trunk = "develop"    # protected, MR-only\n'
-                    'gate = ["true"]\n')
-            out = config_with_keys(text, [("trunk", "mainline"), ("mirror", "vendor")])
-            self.assertIn('trunk = "mainline"    # protected, MR-only', out)
-            self.assertIn('gate = ["true"]', out)
-            self.assertIn('mirror = "vendor"', out)        # appended: it was not there
-            self.assertNotIn('"develop"', out)
-
-        def test_config_with_keys_leaves_a_key_inside_a_table_alone(self):
-            """`load_config` reads top-level keys only, so `trunk` inside a table is a
-            different setting: rewriting that one would report a persistence no later
-            command ever reads back."""
-            text = 'gate = ["true"]\n\n[extra]\ntrunk = "in-a-table"\n'
-            out = config_with_keys(text, [("trunk", "mainline")])
-            self.assertIn('trunk = "in-a-table"', out)          # left exactly as it was
-            self.assertLess(out.index('trunk = "mainline"'), out.index("[extra]"))
-            if has_tomllib:
-                import tomllib
-                data = tomllib.loads(out)
-                self.assertEqual(data["trunk"], "mainline")
-                self.assertEqual(data["extra"]["trunk"], "in-a-table")
+            # a second run reports them and changes nothing
+            code, out, err = run("-C", fork, "setup", "--trunk", "trunk",
+                                 "--mirror", "upstream-main")
+            self.assertEqual(code, 0, err + out)
+            self.assertIn("already set (the `--trunk` this run was given)", out)
 
         def test_a_trunk_that_cannot_be_confirmed_is_not_bootstrapped(self):
             """`ls-remote` failing is not "the trunk is absent". The remote-tracking refs
@@ -9212,15 +9101,6 @@ def run_tests() -> None:
             self.assertEqual(cm.exception.code, 2)
             self.assertIn("refusing to create the trunk", str(cm.exception))
             self.assertNotIn("refs/heads/develop", local_branches(fork))
-
-        def test_config_with_keys_escapes_and_stays_out_of_a_table(self):
-            text = 'gate = ["true"]\n\n[extra]\nkey = "value"\n'
-            out = config_with_keys(text, [("trunk", 'we"ird\\name')])
-            self.assertIn('trunk = "we\\"ird\\\\name"', out)
-            self.assertLess(out.index("trunk ="), out.index("[extra]"))
-            if has_tomllib:
-                import tomllib
-                self.assertEqual(tomllib.loads(out)["trunk"], 'we"ird\\name')
 
         def test_upstream_url_adds_the_remote_sets_both_heads_and_bootstraps(self):
             fork = make_fresh_fork(self.tmp)
