@@ -209,10 +209,61 @@ configured" line now names `git config forkflow.gate`, and the WARNING about ups
 tracking `.forkflow.toml` went with the rest — the file no longer says what `gate` is.
 
 ### Task 5: delete the provenance apparatus
-- [ ] `fork_merge_mode` becomes a scoped `git config` read; `fork_merge_refusal` becomes one sentence
-- [ ] delete the cluster and its constants
-- [ ] delete the two source invariants that lose their subjects
-- [ ] run the suite - must pass before task 6
+- [x] `fork_merge_mode` becomes a scoped `git config` read; `fork_merge_refusal` becomes one sentence
+- [x] delete the cluster and its constants
+- [x] delete the two source invariants that lose their subjects
+- [x] run the suite - must pass before task 6
+
+**⚠️ Deviation, task 5: three names went beyond the list, and one that should have died
+did not.**
+
+- `merge_mode_in` and `fork_merge_source` are deleted too. Neither is on the list, and
+  both had exactly one caller — the collapsing `fork_merge_mode` and the `--merge`
+  refusals — so both were dead the moment those were rewritten. `merge_mode_in` was the
+  last `parse_config` caller outside `load_config`; the source invariant that pinned
+  `get("merge")` to three owners now pins it to `parse_config` alone.
+- `finish_sync`'s `merge_sha` parameter went in task 4 (see its note).
+- **`state_unreadable` is left unreferenced on purpose.** Its only production caller was
+  `config_memory_unprovable`. It is the read side of `change_state`'s refusal, it has its
+  own tests, and task 9 already owns the wording of that refusal and of `load_state`'s
+  docstring — both of which still name the deleted memory. Deleting it belongs with that
+  rewording, not here. The source-invariant line that pinned its owners is gone, since the
+  one owner it named is gone.
+
+**⚠️ Deviation, task 5: the two deleted source invariants, and what went with them.**
+`test_whose_config_it_is_is_decided_by_its_bytes_in_one_place` and
+`test_every_copy_a_remedy_prints_is_built_here` are both deleted, as planned. The second
+is deleted ONE TASK EARLY relative to its subject: `keep_aside` and `variant_remedy` still
+exist until task 6, so a printed `cp` is momentarily unpinned. **It is worth resurrecting
+verbatim if any remedy ever prints a `cp` again** — it is the only thing that stopped a
+remedy from producing config bytes, twice. The merge invariant
+(`test_every_merge_decision_goes_through_fork_merge_mode`) is untouched apart from the
+`get("merge")` owner set: the scoped-read pins tasks 1-3 added all stand.
+`test_the_state_file_is_written_in_one_place_and_under_its_lock` lost the two writers that
+no longer exist and the `state_unreadable` owner line; everything else in it stands.
+
+**⚠️ Deviation, task 5: `variant_remedy` and `in_the_way_advice` lost their provenance
+sentences here rather than in task 6.** Both called into the deleted cluster (the rename
+remedy promised a sync would still treat a renamed file as upstream's, with its `gate`
+shown rather than run and `--merge` refused; the in-the-way advice asked
+`config_is_upstreams` whose bytes the untracked file was). Neither claim is true any more
+and neither callee exists, so the sentences had to go with the callees. What is left of
+both is task 6's to delete.
+
+**⚠️ Task 5 tests: the suite drops from 566 to 504.** `TestForkMergeMode` (60) and
+`TestMergeModeAskedAgainBeforeTheMerge` (3, the whole class — its subject is a teammate's
+commit flipping the TRACKED file between the gate and the merge, which `.git/config`
+cannot express) are deleted outright. `TestMergeGate` keeps the gate that survives — the
+two conditions, both `--continue` routes, the unnamed origin, the request-number branch,
+the end-to-end pass — and loses the seven fail-closed clone-shape refusals, the
+untracked-file reads and the whose-bytes wording (13). `TestState` loses six memory tests
+and keeps the seventh, rewritten as
+`test_a_state_file_that_cannot_be_read_is_not_written_over` (the half of it that is about
+`change_state`, not about the memory). Two tests are ADDED:
+`TestGitConfigSettings.test_a_config_file_that_says_merge_self_does_not_arm_merge` pins the
+closed route at the reader, and `TestMergeGate`'s two upstream-`merge = "self"`-arrives-
+with-the-sync tests are kept and re-pointed at it end to end — those three together are
+the whole security claim of this change.
 
 ### Task 6: delete the case-variant machinery
 - [ ] `variant_remedy`, `keep_aside`, `no_commit_here`, `tracked_config_names` and friends
