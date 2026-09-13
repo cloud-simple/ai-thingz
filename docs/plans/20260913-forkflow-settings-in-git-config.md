@@ -131,9 +131,30 @@ is every clone before task 7. The provenance apparatus still answers wherever gi
 silent, so its own tests keep exercising it until task 5 deletes it.
 
 ### Task 2: convert the test fixtures
-- [ ] `make_fork(config=...)` and `MergeBase.self_fork()` set git config instead of writing the file
-- [ ] the setup fixture's config helper follows
-- [ ] run the suite - must pass before task 3
+- [x] `make_fork(config=...)` and `MergeBase.self_fork()` set git config instead of writing the file
+- [x] the setup fixture's config helper follows
+- [x] run the suite - must pass before task 3
+
+**⚠️ Deviation, task 2: `make_fork` grew a `settings=` parameter beside `config=` rather than
+changing what `config=` means.** `settings=` is a dict of the file's own key names and goes
+into `git config`; `config=` still writes the tracked file and now belongs only to the tests
+whose SUBJECT is that file - `TestLoadConfig`, `TestForkMergeMode`, `TestMergeGate`,
+`TestConfigNameCase`, `TestCheck.test_gate_of_a_wrong_type_is_exit_2`,
+`TestMergeModeAskedAgainBeforeTheMerge` (which overrides `self_fork` to keep it: its subject
+is a teammate's commit turning the file from "self" to "manual", which `.git/config` cannot
+express) and `TestPendingPerBranch.test_a_state_file_that_cannot_be_read_...` (the provenance
+memory is of file versions). Tasks 4-6 delete those, and `config=` goes with the last of them.
+24 fixtures moved to `settings=`.
+
+**⚠️ Deviation, task 2: one production line changed.** `finish_sync` rebuilt `ctx.cfg` from
+`load_config` alone after the merge it had just made, so a `gate` in git config vanished for
+the rest of a sync. The precedence now lives in one helper, `load_settings`, which
+`resolve_ctx` and `finish_sync` both call - a second spelling in either is exactly how one of
+them came to read half the settings.
+
+**⚠️ Note, task 2: the setup fixture had nothing to convert.** `SetupBase.cfg()` already reads
+`git config`, and `SetupBase.toml_path()`/`untouched()` assert on the template `setup` still
+writes. Task 7 replaces the template; the helper goes with it.
 
 ### Task 3: git config wins, the file is ignored
 - [ ] `resolve_ctx` stops calling `load_config`; drop the `needs_tomllib` decorators

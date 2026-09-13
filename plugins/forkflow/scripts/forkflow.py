@@ -589,6 +589,18 @@ def git_config_settings(root: str) -> dict:
     return cfg
 
 
+def load_settings(root: str) -> dict:
+    """Every setting but `merge`: git config first, then `.forkflow.toml` over it, so THE
+    FILE WINS key by key while both are read.
+
+    The one place the precedence is decided. `resolve_ctx` builds the Ctx from it and
+    `finish_sync` rebuilds `cfg` from it after the merge it just made, and a second spelling
+    in either is how one of them came to read half the settings."""
+    cfg = git_config_settings(root)
+    cfg.update(load_config(root))
+    return cfg
+
+
 def git_config_merge(root: str) -> str:
     """This fork's `merge`, read from `--local` AND FROM NOWHERE ELSE; "" when unset.
 
@@ -894,8 +906,7 @@ def resolve_ctx(cwd: str, args: Optional[argparse.Namespace] = None, need_upstre
     # Both are read and the FILE WINS key by key, so a fork that has not moved yet behaves
     # exactly as it did and one that has is already read from `.git/config`, which is not
     # tracked and which no merge can reach
-    cfg = git_config_settings(root)
-    cfg.update(load_config(root))
+    cfg = load_settings(root)
     remotes = git("remote", cwd=root).split()
     if "origin" not in remotes:
         raise Fail("no `origin` remote: forkflow expects the fork to be `origin`")
@@ -3031,7 +3042,7 @@ def finish_sync(ctx: Ctx, args: argparse.Namespace, name: str, commits: Sequence
     resume = continue_cmd("sync", args)
     if not ctx.dry_run:
         try:
-            ctx = replace(ctx, cfg=load_config(ctx.root))
+            ctx = replace(ctx, cfg=load_settings(ctx.root))
         except Fail as exc:
             # a case variant has its own way out, above, which copies the file aside before
             # it touches it: an invitation to edit the file first is not repeated for it
@@ -7573,7 +7584,7 @@ def run_tests() -> None:
         @needs_tomllib
         def test_names_from_config(self):
             fork = make_fork(self.tmp, trunk="trunk", mirror="upstream-main",
-                             config='trunk = "trunk"\nmirror = "upstream-main"\n')
+                             settings={"trunk": "trunk", "mirror": "upstream-main"})
             ctx = ctx_for(fork)
             self.assertEqual((ctx.trunk, ctx.mirror), ("trunk", "upstream-main"))
             self.assertEqual(ctx.up(), "upstream/main")
@@ -7762,9 +7773,10 @@ def run_tests() -> None:
 
         @needs_tomllib
         def test_the_prefix_and_upstream_keys_come_from_the_config(self):
-            fork = make_fork(self.tmp, config='sync_prefix = "merge-up/"\n'
-                                              'backup_prefix = "safety/"\n'
-                                              'upstream = "up"\nupstream_branch = "main"\n')
+            fork = make_fork(self.tmp, settings={"sync_prefix": "merge-up/",
+                                                 "backup_prefix": "safety/",
+                                                 "upstream": "up",
+                                                 "upstream_branch": "main"})
             sh("git", "remote", "rename", "upstream", "up", cwd=fork)
             ctx = ctx_for(fork)
             self.assertEqual(ctx.sync_prefix, "merge-up/")
@@ -7776,7 +7788,7 @@ def run_tests() -> None:
 
         @needs_tomllib
         def test_upstream_branch_from_the_config_names_the_mirror(self):
-            fork = make_fork(self.tmp, config='upstream_branch = "legacy"\n')
+            fork = make_fork(self.tmp, settings={"upstream_branch": "legacy"})
             sha = rev(fork, "refs/remotes/upstream/main")
             sh("git", "update-ref", "refs/remotes/upstream/legacy", sha, cwd=fork)
             sh("git", "branch", "--no-track", "legacy", sha, cwd=fork)
@@ -7786,7 +7798,7 @@ def run_tests() -> None:
 
         @needs_tomllib
         def test_a_name_git_would_refuse_is_exit_2(self):
-            fork = make_fork(self.tmp, config='trunk = "bad..name"\n')
+            fork = make_fork(self.tmp, settings={"trunk": "bad..name"})
             with self.assertRaises(Fail) as cm:
                 ctx_for(fork)
             self.assertEqual(cm.exception.code, 2)
@@ -7805,7 +7817,7 @@ def run_tests() -> None:
 
         @needs_tomllib
         def test_head_as_the_trunk_is_exit_2(self):
-            fork = make_fork(self.tmp, config='trunk = "HEAD"\n')
+            fork = make_fork(self.tmp, settings={"trunk": "HEAD"})
             with self.assertRaises(Fail) as cm:
                 ctx_for(fork)
             self.assertEqual(cm.exception.code, 2)
@@ -7943,8 +7955,8 @@ def run_tests() -> None:
         @needs_tomllib
         def test_no_command_any_run_prints_carries_a_bare_name(self):
             fork = make_fork(self.tmp, trunk=self.TRUNK,
-                             config='trunk = "%s"\nbackup_prefix = "%s"\n'
-                                    % (self.TRUNK, self.PREFIX))
+                             settings={"trunk": self.TRUNK,
+                                       "backup_prefix": self.PREFIX})
             commit_upstream(self.tmp, "src/app.py", "def main():\n    return 3\n")
             sh("git", "checkout", "-b", "feat/x", self.TRUNK, cwd=fork)
             commit_fork(fork, "ours/f.txt", "ours\n", "ours: step")
@@ -7971,7 +7983,7 @@ def run_tests() -> None:
             checkout, the fast-forward, the branch deletion and, on GitHub, the remote
             delete - with a hostile trunk name and a hostile branch name in them."""
             feature = "feat;touch$(id)"
-            fork = make_fork(self.tmp, trunk=self.TRUNK, config='trunk = "%s"\n' % self.TRUNK)
+            fork = make_fork(self.tmp, trunk=self.TRUNK, settings={"trunk": self.TRUNK})
             sh("git", "checkout", "-b", feature, self.TRUNK, cwd=fork)
             commit = commit_fork(fork, "ours/f.txt", "ours\n", "ours: step")
             sh("git", "push", "origin", "refs/heads/%s:refs/heads/%s" % (feature, feature),
@@ -8950,7 +8962,7 @@ def run_tests() -> None:
 
         @needs_tomllib
         def test_custom_backup_prefix(self):
-            fork = make_fork(self.tmp, config='backup_prefix = "safety/"\n')
+            fork = make_fork(self.tmp, settings={"backup_prefix": "safety/"})
             ctx = ctx_for(fork)
             name, _, _ = capture(backup, ctx, "pre-sync", "origin/develop")
             self.assertTrue(name.startswith("safety/"), name)
@@ -9355,7 +9367,8 @@ def run_tests() -> None:
 
         @needs_tomllib
         def test_passing_gate_runs_in_the_repo_root(self):
-            fork = make_fork(self.tmp, config='gate = ["test -f README.md", "true"]\n')
+            fork = make_fork(self.tmp,
+                             settings={"gate": ["test -f README.md", "true"]})
             self.feature(fork)
             commit_fork(fork, "ours/new.txt", "one\n", "one")
             code, out, err = run("-C", os.path.join(fork, "src"), "check")
@@ -9367,7 +9380,8 @@ def run_tests() -> None:
         def test_failing_gate_is_exit_3_with_its_output_tail(self):
             fork = make_fork(
                 self.tmp,
-                config='gate = ["echo first line; echo boom >&2; exit 2", "touch second-ran"]\n')
+                settings={"gate": ["echo first line; echo boom >&2; exit 2",
+                                   "touch second-ran"]})
             self.feature(fork)
             code, out, err = run("-C", fork, "check")
             self.assertEqual(code, 3)
@@ -9380,7 +9394,8 @@ def run_tests() -> None:
 
         @needs_tomllib
         def test_dry_run_never_executes_a_gate(self):
-            fork = make_fork(self.tmp, config='gate = ["touch gate-ran; exit 2"]\n')
+            fork = make_fork(self.tmp,
+                             settings={"gate": ["touch gate-ran; exit 2"]})
             self.feature(fork)
             code, out, err = run("-C", fork, "check", "--dry-run")
             self.assertEqual(code, 0, err)
@@ -9399,7 +9414,7 @@ def run_tests() -> None:
         @needs_tomllib
         def test_only_the_last_lines_of_a_failing_gate_are_shown(self):
             self.assertEqual(TAIL_LINES, 12)         # pinned: what a failing gate is judged by
-            fork = make_fork(self.tmp, config='gate = ["seq 1 40; exit 2"]\n')
+            fork = make_fork(self.tmp, settings={"gate": ["seq 1 40; exit 2"]})
             self.feature(fork)
             code, out, err = run("-C", fork, "check")
             self.assertEqual(code, 3)
@@ -9473,7 +9488,7 @@ def run_tests() -> None:
         @needs_tomllib
         def test_custom_trunk_name_from_config(self):
             fork = make_fork(self.tmp, trunk="trunk", mirror="upstream-main",
-                             config='trunk = "trunk"\nmirror = "upstream-main"\n')
+                             settings={"trunk": "trunk", "mirror": "upstream-main"})
             self.feature(fork)
             commit_fork(fork, "ours/new.txt", "one\n", "one")
             code, out, err = run("-C", fork, "check")
@@ -9848,7 +9863,7 @@ def run_tests() -> None:
         @needs_tomllib
         def test_custom_names_from_config(self):
             fork = make_fork(self.tmp, trunk="trunk", mirror="upstream-main",
-                             config='trunk = "trunk"\nmirror = "upstream-main"\n')
+                             settings={"trunk": "trunk", "mirror": "upstream-main"})
             self.ahead_upstream(fork)
             before_trunk = origin_sha(fork, "trunk")
             name = self.sync_name()
@@ -10062,7 +10077,7 @@ def run_tests() -> None:
 
         @needs_tomllib
         def test_failing_gate_is_exit_3_with_the_continue_hint(self):
-            fork = make_fork(self.tmp, config='gate = ["exit 2"]\n')
+            fork = make_fork(self.tmp, settings={"gate": ["exit 2"]})
             self.ahead_upstream(fork)
             before_trunk = origin_sha(fork, "develop")
             code, out, err = run("-C", fork, "sync")
@@ -10823,7 +10838,7 @@ def run_tests() -> None:
 
         @needs_tomllib
         def test_custom_trunk_name_is_the_rebase_target(self):
-            fork = make_fork(self.tmp, trunk="trunk", config='trunk = "trunk"\n')
+            fork = make_fork(self.tmp, trunk="trunk", settings={"trunk": "trunk"})
             sh("git", "checkout", "-b", "feat/x", "trunk", cwd=fork)
             commit_fork(fork, "ours/a.txt", "a\n", "ours: first")
             second_clone_commit(self.tmp, branch="trunk")
@@ -11095,7 +11110,8 @@ def run_tests() -> None:
 
         @needs_tomllib
         def test_gate_failure_after_the_squash_is_exit_3_with_the_rollback_line(self):
-            fork = make_fork(self.tmp, config='gate = ["echo gate-said-no; exit 2"]\n')
+            fork = make_fork(self.tmp,
+                             settings={"gate": ["echo gate-said-no; exit 2"]})
             name = self.feature(fork, commits=2)
             second_clone_commit(self.tmp)
             before_trunk = origin_sha(fork, "develop")
@@ -11117,7 +11133,7 @@ def run_tests() -> None:
             branch's own pre-ship state - the old advice was to delete the published branch,
             which closes the open merge request."""
             flag = os.path.join(self.tmp, "gate-ok")
-            fork = make_fork(self.tmp, config='gate = ["test -f %s"]\n' % flag)
+            fork = make_fork(self.tmp, settings={"gate": ["test -f %s" % flag]})
             name = self.feature(fork, commits=2, push=True)
             published = origin_sha(fork, name)
 
@@ -11139,7 +11155,7 @@ def run_tests() -> None:
             is what put `origin/<branch>` outside the branch, so refusing it would make exit 3
             a dead end for every published branch."""
             flag = os.path.join(self.tmp, "gate-ok")
-            fork = make_fork(self.tmp, config='gate = ["test -f %s"]\n' % flag)
+            fork = make_fork(self.tmp, settings={"gate": ["test -f %s" % flag]})
             name = self.feature(fork, commits=2, push=True)
             published = origin_sha(fork, name)
             self.assertEqual(run("-C", fork, "ship")[0], 3)
@@ -11157,7 +11173,7 @@ def run_tests() -> None:
             """Reflogs expire and can be switched off, so the run's own record has to stand
             on its own: the lease the interrupted `ship` fetched is the tip it may replace."""
             flag = os.path.join(self.tmp, "gate-ok")
-            fork = make_fork(self.tmp, config='gate = ["test -f %s"]\n' % flag)
+            fork = make_fork(self.tmp, settings={"gate": ["test -f %s" % flag]})
             name = self.feature(fork, commits=2, push=True)
             published = origin_sha(fork, name)
             self.assertEqual(run("-C", fork, "ship")[0], 3)
@@ -13226,7 +13242,7 @@ def run_tests() -> None:
         TOOLS = {"gitlab": "glab", "github": "gh"}
 
         def self_fork(self) -> str:
-            return make_fork(self.tmp, config='merge = "self"\n')
+            return make_fork(self.tmp, settings={"merge": MERGE_SELF})
 
         def platform(self, name: str) -> str:
             """A merging glab/gh on PATH; answers with the platform it stands for."""
@@ -14634,7 +14650,7 @@ def run_tests() -> None:
             fork = make_fork(self.tmp)
             sh("git", "checkout", "-q", "-b", "scratch", "develop", cwd=fork)   # trunk free
             w1, w2 = self.worktree(fork, "feat/a"), self.worktree(fork, "feat/b")
-            write(w1, CONFIG_FILE, 'merge = "self"\n')                   # untracked, as setup
+            set_config(w1, {"merge": MERGE_SELF})     # `.git/config`, shared by the worktrees
             merging_tool(self.tmp, "glab")
             done, log = os.path.join(self.tmp, "w2-shipped"), os.path.join(self.tmp, "w2.log")
             fake_tool(os.path.join(self.tmp, "wrap"), "glab", (
@@ -14722,7 +14738,7 @@ def run_tests() -> None:
             it lands the entry it holds. Every write of the state file fails here while the
             file stays READABLE, because those are two different facts now: one that cannot
             be read is a memory that has been made to forget, and the test below is that."""
-            fork = make_fork(self.tmp, config='merge = "self"\n')
+            fork = make_fork(self.tmp, settings={"merge": MERGE_SELF})
             name = self.feature(fork)
 
             def dies(data, fh, **kw):
@@ -14743,7 +14759,11 @@ def run_tests() -> None:
             of the original project's configs went, and without it a version the project has
             withdrawn reads as one it never had - so `--merge` is refused, at the gate,
             before anything is pushed, naming the file. A plain `ship` is not refused: it
-            does not depend on that memory."""
+            does not depend on that memory.
+
+            The fixture keeps the tracked file: the memory is of `.forkflow.toml` versions,
+            so only a fork whose `merge` is read from that file has a provenance question to
+            be unable to answer."""
             fork = make_fork(self.tmp, config='merge = "self"\n')
             name = self.feature(fork)
             blocker = os.path.join(fork, ".git", STATE_FILE)        # the main worktree's
@@ -14978,7 +14998,8 @@ def run_tests() -> None:
             """`check` fails on the tip because origin's trunk moved after the merge was made:
             the redo it names (`--force`) must merge. The gate asks for an untracked marker so
             the first stop is the gate's and the second the tip's."""
-            fork = make_fork(self.tmp, config='merge = "self"\ngate = ["test -e .gate-ok"]\n')
+            fork = make_fork(self.tmp, settings={"merge": MERGE_SELF,
+                                                 "gate": ["test -e .gate-ok"]})
             self.upstream_change()
             with on_platform(self.platform("gitlab")):
                 self.assertEqual(run("-C", fork, "sync", "--merge")[0], 3)
@@ -16075,6 +16096,13 @@ def run_tests() -> None:
         turned the fork "manual" is on origin but not fetched yet: the gate passes on the
         stale ref, and the run must end with the request open and nothing merged - exit 6,
         the record kept for `land`."""
+
+        def self_fork(self) -> str:
+            """This class's subject is the TRACKED `.forkflow.toml`: what a teammate's
+            commit on `origin/<trunk>` turns from "self" to "manual" between the gate and
+            the merge. `.git/config` is per clone and no commit can reach it, so the
+            fixture keeps the file that `stale_self_fork` then flips."""
+            return make_fork(self.tmp, config='merge = "self"\n')
 
         def stale_self_fork(self) -> Tuple[str, str]:
             fork = self.self_fork()
