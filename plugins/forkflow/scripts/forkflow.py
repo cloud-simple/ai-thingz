@@ -598,8 +598,7 @@ def load_settings(root: str) -> dict:
     working tree took an apparatus the whole of this change exists to delete. `.git/config`
     is not tracked and no merge reaches it, so the question is not there to ask.
 
-    The one place the settings are read. `resolve_ctx` builds the Ctx from it and
-    `finish_sync` rebuilds `cfg` from it after the merge it just made."""
+    The one place the settings are read: `resolve_ctx` builds the Ctx from it."""
     return git_config_settings(root)
 
 
@@ -2425,90 +2424,17 @@ def config_name_at(ctx: Ctx, revision: str) -> Optional[str]:
     return config_name_in(out.split("\0")) if rc == 0 else CONFIG_FILE
 
 
-def gate_at(ctx: Ctx, revision: str) -> Optional[list]:
-    """The `gate` `.forkflow.toml` carried at `revision`; None when it cannot be read.
-
-    Unreadable is not `[]`: an unknown gate is treated as a changed one, which shows rather
-    than runs - the safe direction for a key that is arbitrary shell."""
-    text = config_text(ctx, revision)
-    if text is None:
-        return []                         # no file there: no gate
-    try:
-        cfg = parse_config(text, f"{revision}:{CONFIG_FILE}")
-    except Fail:
-        return None
-    return [c for c in (cfg.get("gate") or []) if c.strip()]
-
-
-def config_changed_in_merge(ctx: Ctx, merge_sha: str) -> bool:
-    """True when `.forkflow.toml` as it now stands is not what this branch carried before
-    the sync merge - the reviewer of the MR has to see that, whatever key changed.
-
-    The merge is not necessarily at HEAD: fixing what `check` refused means a commit on top
-    of it, so the comparison is `<merge>^1` against `HEAD` rather than `HEAD^1` against
-    `HEAD`. Both sides are commits, because the line this prints names a diff of two commits
-    - and because `setup` leaves the file untracked: an untracked file is in no tree at all,
-    so measuring it against a blob called every ordinary sync a config change and pointed
-    the reviewer at a diff that prints nothing."""
-    if not merge_sha:
-        return False
-    before, now = config_text(ctx, f"{merge_sha}^1"), config_text(ctx, "HEAD")
-    return (before or "").strip() != (now or "").strip()
-
-
-def gate_arrived_in_merge(ctx: Ctx, merge_sha: str) -> bool:
-    """True when the `gate` this run would obey is not the one the branch had before the
-    sync merge.
-
-    A `gate` is arbitrary shell run with `sh -c`, and `.forkflow.toml` is a tracked file a
-    sync is designed to bring in from the original project - so the one run that must not
-    obey it is the one whose own merge changed it. Keyed on the `gate`, not on the file:
-    upstream editing an unrelated line must not suppress this fork's own gate, and a commit
-    made on top of the merge must not hide one that did change.
-
-    Committed to committed. `setup` leaves `.forkflow.toml` untracked and tells the user to
-    edit it, so on the ordinary post-setup path the working tree holds this fork's own gate
-    and no commit holds any: reading one side from the tree and the other from a blob made
-    that read as "the merge changed it" and never ran the fork's own preflight again."""
-    if not merge_sha:
-        return False
-    before, after = gate_at(ctx, f"{merge_sha}^1"), gate_at(ctx, "HEAD")
-    if before is None or after is None or after != before:
-        return True
-    # what actually runs is the working tree's `gate`. Untracked, it is this fork's own and
-    # no merge can have written it; tracked, a clean tree makes it `after` - anything else is
-    # an uncommitted edit, and unreviewed shell is shown rather than run either way
-    return config_text(ctx, "HEAD") is not None and gate_commands(ctx) != before
-
-
-def run_check(ctx: Ctx, touched: Optional[Sequence[str]] = None,
-              config_merged: bool = False) -> int:
+def run_check(ctx: Ctx, touched: Optional[Sequence[str]] = None) -> int:
     """The preflight `sync` and `ship` run, and what `status` surfaces for humans.
 
     Read-only. 0 when every invariant holds, 3 when one does not; the upstream-tracked
-    warning is advisory and never changes the code. `config_merged` says the `gate` this
-    ran with is one the merge this run just made changed - it is then upstream's shell
-    command, not the one this branch started with, and it is shown rather than run.
-    `ctx.cfg` must already be the config of the merged tree: see `finish_sync`."""
+    warning is advisory and never changes the code."""
     failures = []
     warn_upstream_tracked(ctx, touched)
 
     gate = gate_commands(ctx)
-    if gate and upstream_tracked(ctx, [CONFIG_FILE]):
-        # not a failure: a fork whose upstream uses forkflow too inherits the file honestly.
-        # It is said out loud because `gate` is the one key that is run rather than read
-        step("gate", "-", f"WARNING: `{CONFIG_FILE}` is tracked by `{ctx.up()}` too - a sync "
-                          f"can change what these commands are")
-    if gate and config_merged:
-        step("gate", "-", f"NOT RUN: the merge this run made changed the `gate` "
-                          f"in `{CONFIG_FILE}`")
-        for cmd in gate:
-            print(f"      would have run: sh -c '{cmd}'")
-        print(f"      a `gate` is arbitrary shell run by every `check`, `sync` and `ship`: "
-              f"read it, and once it is what you want: forkflow check")
-        gate = []
-    elif not gate:
-        step("gate", "-", f"none configured ({CONFIG_FILE} gate = [...])")
+    if not gate:
+        step("gate", "-", "none configured (git config forkflow.gate)")
     for cmd in gate:
         shown = f"sh -c '{cmd}'"
         if ctx.dry_run:                       # a gate is arbitrary shell: never run in a dry run
@@ -3027,47 +2953,15 @@ def publish(ctx: Ctx, args: argparse.Namespace, kind: str, branch: str, base: st
 
 def finish_sync(ctx: Ctx, args: argparse.Namespace, name: str, commits: Sequence[str],
                 rows: Sequence[Tuple[str, str]], mirror_move: Tuple[str, str],
-                backup_ref: str, merge_sha: str) -> int:
+                backup_ref: str) -> int:
     """check -> push -> merge request: the tail both `sync` and `sync --continue` run."""
-    # `resolve_ctx` read `.forkflow.toml` before the merge this run just made, so on the
-    # clean-merge path `ctx.cfg` is the fork's pre-merge config while the tree `check` runs
-    # against is the merged one. Only `cfg` is refreshed: the branch names this run is
-    # already using must not change under it half way through. A merged config that cannot
-    # be read is exit 2, as it is for every other subcommand - the clone is in that state now.
-    # It is raised with what this run already did and the way out: the merge commit, the sync
-    # branch, the mirror push and the backup are all made by now, and a bare parse error left
-    # the user with a half-done sync and nothing said about either
+    # the settings live in `.git/config`, which no merge reaches, so the merge this run just
+    # made cannot have changed what `check` is about to obey: `ctx` stands as it was built
     resume = continue_cmd("sync", args)
-    if not ctx.dry_run:
-        try:
-            ctx = replace(ctx, cfg=load_settings(ctx.root))
-        except Fail as exc:
-            # a case variant has its own way out, above, which copies the file aside before
-            # it touches it: an invitation to edit the file first is not repeated for it
-            try:
-                variant = config_name_in(os.listdir(ctx.root)) not in (None, CONFIG_FILE)
-            except OSError:
-                variant = False
-            then = (f"follow the step above on `{name}`" if variant else
-                    f"fix `{CONFIG_FILE}` on `{name}` and commit it")
-            raise Fail(f"the merge brought a `{CONFIG_FILE}` that cannot be read: {exc}\n"
-                       f"  the merge commit and `{name}` are made and the backup is on "
-                       f"origin; this run checked nothing and opened no merge request\n"
-                       f"  {then}, then: {resume}", 2)
-
-    # `.forkflow.toml` names the branches every safety check depends on and holds `gate`,
-    # which is run with `sh -c`: a sync that brings it in from the original project is a
-    # change to how this fork is governed, and the reviewer of the MR has to see that
-    config_merged = not ctx.dry_run and config_changed_in_merge(ctx, merge_sha)
-    if config_merged:
-        print(f"  CHECK    this sync changes `{CONFIG_FILE}` - it names the branches and "
-              f"holds `gate`, which forkflow runs with `sh -c`:")
-        print(f"    git diff {short(merge_sha)}^1 HEAD -- {sh_arg(CONFIG_FILE)}")
-    gate_merged = not ctx.dry_run and gate_arrived_in_merge(ctx, merge_sha)
 
     if ctx.dry_run:
         step("check", "forkflow check", "not run (dry run)", dry=True)
-    elif run_check(ctx, config_merged=gate_merged) == EXIT_CHECK:
+    elif run_check(ctx) == EXIT_CHECK:
         print(check_failure_hint(ctx, name, args))
         return EXIT_CHECK
 
@@ -3114,7 +3008,7 @@ def sync_merge_commit(ctx: Ctx) -> str:
     top of it, and that must not turn `--continue` into "nothing to continue". The sync
     merge is the *first* commit on the branch, so it is the last line here - `-n 1` took
     the newest instead, and a `git merge` the user made on the branch afterwards then stood
-    in for it, which handed upstream's unread `gate` to `run_check` as this fork's own.
+    in for it, so `--continue` resumed from the wrong commit and summarised the wrong side.
     `--first-parent` keeps merges carried in on the second-parent side of such a merge out."""
     merges = git("rev-list", "--merges", "--first-parent", "HEAD", "--not",
                  f"{ctx.origin}/{ctx.trunk}", cwd=ctx.root, check=False).split()
@@ -4542,7 +4436,7 @@ def cmd_sync_continue(ctx: Ctx, args: argparse.Namespace) -> int:
 
     mirror_sha = rev(ctx.root, f"refs/heads/{ctx.mirror}")
     return finish_sync(ctx, args, name, commits, rows, (mirror_sha, mirror_sha),
-                       resumable(ctx, "sync", name).get("backup", ""), merge_sha)
+                       resumable(ctx, "sync", name).get("backup", ""))
 
 
 def merge_gate(ctx: Ctx, args: argparse.Namespace, resume_sync: bool = False) -> None:
@@ -4657,11 +4551,10 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
     if ctx.dry_run:
         step("verify", "git diff HEAD^1 / HEAD^2", "not run (dry run)", dry=True)
-        rows, merge_sha = [], ""
+        rows = []
     else:
         rows = both_sides_survived(ctx, "HEAD^1", "HEAD^2")
-        merge_sha = rev(ctx.root, "HEAD")
-    return finish_sync(ctx, args, name, commits, rows, mirror_move, backup_ref, merge_sha)
+    return finish_sync(ctx, args, name, commits, rows, mirror_move, backup_ref)
 
 
 def rebase_in_progress(ctx: Ctx) -> bool:
@@ -9227,7 +9120,7 @@ def run_tests() -> None:
             commit_fork(fork, "ours/new.txt", "one\n", "one")
             code, out, err = run("-C", fork, "check")
             self.assertEqual(code, 0, err)
-            self.assertIn("none configured (.forkflow.toml gate = [...])", out)
+            self.assertIn("none configured (git config forkflow.gate)", out)
             self.assertIn("check    ok", out)
 
         def test_passing_gate_runs_in_the_repo_root(self):

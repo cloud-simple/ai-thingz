@@ -191,10 +191,22 @@ stays in the file, which is their subject): they configure a trunk, mirror or up
 in order to aim the provenance walk, and that has to reach the Ctx to aim anything.
 
 ### Task 4: delete the sync gate guards
-- [ ] `config_changed_in_merge`, `gate_arrived_in_merge`, `gate_at` and their plumbing in
+- [x] `config_changed_in_merge`, `gate_arrived_in_merge`, `gate_at` and their plumbing in
       `finish_sync` and `run_check`; `run_check` loses its `config_merged` parameter
-- [ ] delete the tests that exist only for them
-- [ ] run the suite - must pass before task 5
+- [x] delete the tests that exist only for them — already done in task 3, see its note
+- [x] run the suite - must pass before task 5
+
+**⚠️ Deviation, task 4: `finish_sync` loses its `merge_sha` parameter too, and the
+`cfg` refresh with it.** `merge_sha` reached `finish_sync` for one purpose — feeding
+`config_changed_in_merge` and `gate_arrived_in_merge` — so with those gone it is an
+argument two call sites compute and nothing reads. `cmd_sync_continue` still calls
+`sync_merge_commit` for its own `ours`/`theirs`; `cmd_sync` no longer computes a
+`merge_sha` at all. The `replace(ctx, cfg=load_settings(...))` refresh after the merge
+went with them: `.git/config` is not in any tree, so the settings `check` obeys cannot
+have changed under the merge this run just made, and its exit-2 "the merge brought a
+config that cannot be read" path can no longer be reached. `run_check`'s "none
+configured" line now names `git config forkflow.gate`, and the WARNING about upstream
+tracking `.forkflow.toml` went with the rest — the file no longer says what `gate` is.
 
 ### Task 5: delete the provenance apparatus
 - [ ] `fork_merge_mode` becomes a scoped `git config` read; `fork_merge_refusal` becomes one sentence
