@@ -266,9 +266,61 @@ with-the-sync tests are kept and re-pointed at it end to end — those three tog
 the whole security claim of this change.
 
 ### Task 6: delete the case-variant machinery
-- [ ] `variant_remedy`, `keep_aside`, `no_commit_here`, `tracked_config_names` and friends
-- [ ] shrink `untracked_in_the_way` and `in_the_way_advice` to their file-agnostic parts
-- [ ] run the suite - must pass before task 7
+- [x] `variant_remedy`, `keep_aside`, `no_commit_here`, `tracked_config_names` and friends
+- [x] shrink `untracked_in_the_way` and `in_the_way_advice` to their file-agnostic parts
+- [x] run the suite - must pass before task 7
+
+**⚠️ The `cp` window is closed.** The invariant that pinned `keep_aside` as the sole owner
+of a printed `cp` was deleted in task 5, one task ahead of its subject. With `keep_aside`
+and `variant_remedy` gone, NO string and no comment in the production half of the file
+holds `cp ` at all - checked by reading every string constant and f-string below
+`run_tests` out of the AST, and by a raw count over the same lines: both zero. No remedy
+prints a copy, so there is nothing left to pin, and the deleted invariant stays worth
+resurrecting verbatim the day one does again.
+
+**⚠️ Deviation, task 6: `config_text` and `config_name_at` went too.** Neither is on the
+list. Both answer "what is `.forkflow.toml` in this tree, under any case of its name" -
+`config_name_at` is `config_name_in` over an `ls-tree` - and both lost their last
+production caller in task 4 with the sync gate guards. They were reachable only from
+`TestConfigNameCase`, which this task deletes, so leaving them would have left two
+functions nothing calls and no test covers.
+
+**⚠️ Deviation, task 6: `load_config` was touched, which task 6 was told not to do.** Its
+case-variant refusal was the last caller of both `config_name_in` and `variant_remedy`,
+so the two could not go while it stood. It now opens the exact name and answers `{}` when
+there is no such file; the `os.listdir` sweep, the exit-2 refusal and the remedy are gone,
+and the docstring says why no setting rides on which spelling the filesystem opens any
+more. `parse_config`, `CONFIG_FILE` and `have_tomllib` are untouched, and task 8's notice
+has its parser. Task 8 will want the "a case variant is a file to name, not to read" rule
+in the notice itself, where the plan already puts it.
+
+**⚠️ Deviation, task 6: `setup_template` lost its `tracked_config_names` guard here, not
+in task 7.** The "commit it on a branch and ship it" line was printed only when no config
+was tracked yet; that call was the helper's last one. The line is now unconditional for
+the one commit between this task and task 7, which deletes the whole function.
+
+**⚠️ Task 6 tests: the suite drops from 504 to 489.** `TestConfigNameCase` (14, the whole
+class) goes: seven of its tests were already deleted in task 3, and what was left was the
+remedies, `no_commit_here`'s branch rules, and the two ignored/variant-config
+in-the-way cases. `TestSyncConflicts.test_the_untracked_merge_fallback_for_the_config_keeps_it`
+(1) goes with the config branch of `in_the_way_advice` that was its subject.
+`test_an_untracked_file_upstream_tracks_is_refused_before_the_backup` is KEPT and
+re-pointed at an ordinary `docs/theirs.md`: its subject is the preflight that refuses
+before the backup is pushed, which survives whole, and with the config branch gone the
+advice it now prints is the generic one - so the test also became independent of the
+template `setup` stops writing in task 7. Five test helpers that lost their last caller
+went with the class: `remedy_of`, `no_remedy`, `without_stamp`, `kept_configs`,
+`run_every_printed` (the last three were already unreferenced after task 5) and the
+`SHELL_VERBS` tuple.
+
+**The two survivors are intact.** `untracked_in_the_way` keeps its case-fold collision
+check - a case-insensitive filesystem collides on any name, and the check is what stops a
+sync from refusing after the backup instead of before it - and lost only the block that
+listed the top of the tree to catch a config hidden by `.git/info/exclude`.
+`in_the_way_advice` keeps its "move them out of the working tree, or get them into the
+trunk" tail. Both are covered for ordinary files by
+`test_an_untracked_file_upstream_tracks_is_refused_before_the_backup` and
+`test_the_untracked_merge_fallback_names_a_rerun_that_is_not_a_closed_loop`.
 
 ### Task 7: setup writes git config
 - [ ] delete the template writer and the in-place key rewriter; fold the keys into `setup_git_config`

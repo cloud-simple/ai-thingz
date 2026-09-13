@@ -322,178 +322,18 @@ def parse_config(text: str, where: str) -> dict:
     return cfg
 
 
-def config_name_in(names: Sequence[str]) -> Optional[str]:
-    """The name among `names` that is `.forkflow.toml` under some spelling of its case:
-    the exact name when it is there, else the first variant, else None."""
-    if CONFIG_FILE in names:
-        return CONFIG_FILE
-    variants = sorted(n for n in names if n.casefold() == CONFIG_FILE.casefold())
-    return variants[0] if variants else None
-
-
-def tracked_config_names(root: str) -> list:
-    """Every path in the index that is `.forkflow.toml` under some case of its name (each
-    stage of an unmerged one once). Every tracked path is read and case-folded, rather
-    than asked for with `:(icase)`, which matches ASCII case only."""
-    rc, out, _ = git_rc("ls-files", "-z", cwd=root)
-    fold = CONFIG_FILE.casefold()
-    return sorted({p for p in out.split("\0") if p and p.casefold() == fold}) if rc == 0 else []
-
-
-def remote_trunk(root: str) -> str:
-    """The trunk's name where the config cannot be read to say it: origin's default branch
-    (`origin/HEAD` - `setup`'s report insists it is the trunk), else the default name."""
-    head = git("symbolic-ref", "-q", "refs/remotes/origin/HEAD", cwd=root, check=False)
-    prefix = "refs/remotes/origin/"
-    return head[len(prefix):] if head.startswith(prefix) else DEFAULT_TRUNK
-
-
-def upstream_branch_names(root: str) -> set:
-    """The branch names the original project's remotes have here: `upstream/main` gives
-    `main`. A local branch of that name is this fork's mirror - `setup` bootstraps it by
-    that name - and the config that would say which branch the mirror is is the file that
-    cannot be read when this is asked. A mirror under a name upstream does not use is not
-    recognised here; the pre-push hook and `status` are what catch a commit on it."""
-    names = set()
-    out = git("for-each-ref", "--format=%(refname)", "refs/remotes/", cwd=root, check=False)
-    for ref in out.splitlines():
-        parts = ref.split("/", 4)                     # refs/remotes/<remote>/<branch...>
-        if len(parts) >= 4 and parts[2] != "origin" and parts[3] != "HEAD":
-            names.add("/".join(parts[3:]))
-    return names
-
-
-def no_commit_here(root: str, trunk: str) -> str:
-    """Why nothing may be committed on the checked-out branch, "" when something may.
-
-    Rules 2 and 6, and nothing besides: the trunk, by the name origin gives it and by the
-    default, and the mirror, by its name (`upstream_branch_names`, and the default). A
-    branch mistaken for one of those gets an explanation and no command, the safe
-    direction; the one miss is a trunk or a mirror under a name nothing here gives.
-
-    It used to answer for any branch contained in a remote-tracking ref that is not
-    origin's - "carries nothing but upstream's commits". On a fresh fork every branch is
-    still at upstream's tip, so `forkflow setup` - the first command a fork runs - and the
-    branch this refusal sends the user to both hit that clause, and nothing anywhere named
-    a fix: a dead end out of which only an unrelated commit led. Committing on a branch of
-    one's own is what the workflow is for. Whose a FILE is, which that clause was also
-    standing in for, is nobody's question now: the settings are in `.git/config`."""
-    branch = git("symbolic-ref", "-q", "--short", "HEAD", cwd=root, check=False)
-    if not branch:
-        return "HEAD is detached"
-    if branch == trunk:
-        return f"`{branch}` is origin's default branch"
-    if branch == DEFAULT_TRUNK:
-        return f"`{branch}` is the trunk"
-    if branch == DEFAULT_MIRROR or branch in upstream_branch_names(root):
-        return f"`{branch}` is the mirror of the original project"
-    return ""
-
-
-def keep_aside(root: str, name: str) -> Tuple[str, str]:
-    """(a printable command that copies the working file `name` aside, the path it copies
-    it to) - the one place in this script that builds a copy for a user to run.
-
-    Every remedy that overwrites, moves or deletes a working file begins with this, because
-    a printed command is followed to the letter and the file may hold an edit of the user's
-    that nothing else has. `test ! -e` makes a second run of the same line stop before it
-    could copy a restored file over the saved one, and the timestamp keeps two runs in one
-    second apart from... nothing, which is what `test ! -e` is there for.
-
-    The destination is ALWAYS inside the git directory, and that is the point of having one
-    owner: a remedy must never produce `.forkflow.toml` bytes. Twice now a remedy has ended
-    by copying something back INTO the config's path - the contents a symlink read as, and
-    a file git's own conversion had rewritten - and each time the bytes that landed there
-    were bytes no `.forkflow.toml` blob ever held, so they read as this fork's own and
-    opened `--merge` on the original project's settings. What a remedy may do is take the
-    obstacle away and name where the old file went. What comes back is the user's to write.
-    `test_every_copy_a_remedy_prints_is_built_here` pins both halves."""
-    keep = git_path(root, f"forkflow-config-{utc_stamp('%Y%m%d-%H%M%S')}.toml")
-    return (f"test ! -e {sh_arg(keep)} && cp -p -- {sh_arg(name)} {sh_arg(keep)}", keep)
-
-
-def variant_remedy(root: str, found: str) -> str:
-    """The way from `found`, a case variant of the config, to `.forkflow.toml` that loses
-    nothing - the second half of `load_config`'s refusal. Every printed command is followed
-    to the letter, so each one obeys three rules:
-
-    - it copies the working file aside FIRST (`keep_aside`), to a new path in the git
-      directory it names, whenever it overwrites, moves or deletes the file. On a
-      case-insensitive filesystem
-      the variant and `.forkflow.toml` are ONE file on disk, and the user may have edited it
-      - the outer messages used to invite that. `test ! -e` makes a second run of the same
-      line stop before it could copy the restored file over the saved one;
-    - it never commits on the trunk or the mirror: there the answer is an explanation and
-      no command (`no_commit_here`) - the fix is a branch off `origin/<trunk>`, shipped;
-    - nothing that git refuses and then suggests `-f` for: the index entries go with
-      `update-index --force-remove`, which touches no file and does not refuse in the middle
-      of a merge the way `git rm --cached` does.
-
-    By what git holds, not by the name:
-
-    - git holds no config under any case - untracked, this clone's own file: renamed to the
-      exact name (no commit, on any branch);
-    - `.forkflow.toml` is in HEAD - a sync brought upstream's variant in beside the fork's
-      own, or the file was renamed on disk: both names leave the index and the fork's copy
-      comes back from HEAD (with the index entry gone, checkout writes the file anew - under
-      the exact name - even when the bytes are the same);
-    - only a variant is tracked: `git mv` gives it the exact name, its content kept."""
-    tracked = tracked_config_names(root)
-    variants = [p for p in tracked if p != CONFIG_FILE]
-    rc, out, _ = git_rc("ls-tree", "-z", "--name-only", "HEAD", cwd=root)
-    in_head = config_name_in(out.split("\0")) if rc == 0 else None
-    save, keep = keep_aside(root, found)
-    kept = f"; the file as it is now is copied to `{keep}` first"
-    merging = merge_in_progress(root)               # its file may be upstream's
-    if not tracked and in_head is None and not merging:
-        return (f"git holds no `{CONFIG_FILE}` under any case here, so it is this clone's own: "
-                f"`{save} && mv -- {sh_arg(found)} {CONFIG_FILE}` gives it the exact name{kept}")
-    trunk = remote_trunk(root)
-    why = no_commit_here(root, trunk)
-    if why:
-        return (f"{why}, and nothing is committed on it: run forkflow on a branch off "
-                f"`origin/{trunk}` instead - if this refusal comes there too, commit the fix "
-                f"it names on that branch and ship it")
-    again = "then commit, and run the forkflow command again"
-    if in_head == CONFIG_FILE:
-        names = " ".join(sh_arg(p) for p in variants + [CONFIG_FILE])
-        return (f"This fork's own `{CONFIG_FILE}` is in HEAD: `{save} && git update-index "
-                f"--force-remove -- {names} && git checkout HEAD -- {CONFIG_FILE}` puts it "
-                f"back from there through the index{kept} - carry anything of yours over from "
-                f"that copy - {again}. Do not `rm`, `git rm` or rename `{found}`: on a "
-                f"case-insensitive filesystem it is the same file as `{CONFIG_FILE}`")
-    if variants:
-        return (f"`{save} && git mv -- {sh_arg(variants[0])} {CONFIG_FILE}` gives it the exact "
-                f"name, its content kept{kept} - {again}")
-    return ("No command is safe to name for what git holds of it here - a change staged by "
-            "hand, or a merge in progress whose copy is out of the index; `git status` shows "
-            "which")
-
-
 def load_config(root: str) -> dict:
     """{} when absent. A config that is there but cannot be read is a hard failure.
 
-    Read only from a file listed under exactly its own name. On a case-insensitive
-    filesystem (the macOS and Windows default) opening `.forkflow.toml` opens a
-    `.ForkFlow.toml` just as well, while git matches paths case-exactly: `git show
-    <rev>:.forkflow.toml` and `ls-files` find nothing, so every check of what a sync merge
-    brought in reads "no config on either side" - and `gate`, arbitrary shell, came from
-    upstream. A case variant is refused rather than read or ignored: ignoring it would still
-    leave the file every tool but this one opens as the config."""
-    try:
-        names = os.listdir(root)
-    except OSError as exc:
-        raise Fail(f"{root} cannot be listed to look for {CONFIG_FILE}: {exc}")
-    found = config_name_in(names)
-    if found is None:
-        return {}
-    if found != CONFIG_FILE:
-        raise Fail(f"`{found}` is not `{CONFIG_FILE}`: the names differ only in case, and "
-                   f"forkflow reads its config only from a file named exactly "
-                   f"`{CONFIG_FILE}` - on a case-insensitive filesystem that one name opens "
-                   f"both, while git tells them apart, so no check could see what it holds. "
-                   f"{variant_remedy(root, found)}", 2)
+    Read from a file named exactly `.forkflow.toml`, and nothing is configured from it: it
+    is read to be reported on and for no other purpose. A name that differs from it only in
+    case used to be refused rather than read, because on a case-insensitive filesystem
+    (the macOS and Windows default) the two names open one file while git tells them apart,
+    so upstream's copy could be read as this fork's settings. No setting rides on this file
+    now, so there is nothing for the two spellings to decide between."""
     path = os.path.join(root, CONFIG_FILE)
+    if not os.path.exists(path):
+        return {}
     try:
         with open(path, "r", encoding="utf-8") as fh:
             text = fh.read()
@@ -2386,29 +2226,6 @@ def gate_commands(ctx: Ctx) -> list:
     return [c for c in (ctx.cfg.get("gate") or []) if c.strip()]
 
 
-def config_text(ctx: Ctx, revision: str) -> Optional[str]:
-    """`.forkflow.toml` as of `revision`; None when it is not there at all. (The working
-    tree's is `load_config`'s alone, which refuses a case variant.)
-
-    A committed file whose name differs from `.forkflow.toml` only in case counts as it
-    (the exact name wins where a case-sensitive clone holds both): it is the file a
-    case-insensitive checkout opens under that name, so "what did the merge bring in" has to
-    see it - git's own `<rev>:<path>` matches case-exactly and would read it as absent."""
-    name = config_name_at(ctx, revision)
-    if name is None:
-        return None
-    rc, out, _ = git_rc("show", f"{revision}:{name}", cwd=ctx.root)
-    return out if rc == 0 else None
-
-
-def config_name_at(ctx: Ctx, revision: str) -> Optional[str]:
-    """The name `.forkflow.toml` has in `revision`'s tree under any case of it (see
-    `config_text`), None when the tree holds none - and the exact name when the tree cannot
-    be listed, so the caller's `git show` gives the answer."""
-    rc, out, _ = git_rc("ls-tree", "-z", "--name-only", revision, cwd=ctx.root)
-    return config_name_in(out.split("\0")) if rc == 0 else CONFIG_FILE
-
-
 def run_check(ctx: Ctx, touched: Optional[Sequence[str]] = None) -> int:
     """The preflight `sync` and `ship` run, and what `status` surfaces for humans.
 
@@ -2684,10 +2501,8 @@ def untracked_in_the_way(ctx: Ctx, target: str) -> list:
     """Untracked working-tree files the sync merge would have to write over.
 
     git refuses such a merge outright - "untracked working tree files would be overwritten",
-    whatever the file holds - and `setup` leaves exactly one behind: the commented
-    `.forkflow.toml` template, which a forkflow-using upstream may later start tracking.
-    Answered before the backup is pushed, so a sync that cannot run leaves no orphan
-    `backup/*` on origin.
+    whatever the file holds. Answered before the backup is pushed, so a sync that cannot run
+    leaves no orphan `backup/*` on origin.
 
     Only files the merge really writes count: one that was at the merge base and this fork
     deleted stays deleted, so it is not in the way.
@@ -2697,12 +2512,12 @@ def untracked_in_the_way(ctx: Ctx, target: str) -> list:
     is exactly the collision this answers, and rename detection hid it.
 
     A name the merge writes collides with an untracked file of another case too, when the
-    filesystem makes the two one file (macOS and Windows by default): upstream's
-    `.ForkFlow.toml` lands on this fork's untracked `.forkflow.toml`, and git refuses that
-    merge just the same - after the backup, had only exact names been compared. The
-    filesystem is asked (`samefile`), not `core.ignorecase`: git's own refusal comes from an
-    `lstat` of the path it is about to write. The name reported is the one on disk - the
-    file the user knows as theirs."""
+    filesystem makes the two one file (macOS and Windows by default): an upstream `Readme.md`
+    lands on this fork's untracked `README.md`, and git refuses that merge just the same -
+    after the backup, had only exact names been compared. The filesystem is asked
+    (`samefile`), not `core.ignorecase`: git's own refusal comes from an `lstat` of the path
+    it is about to write. The name reported is the one on disk - the file the user knows as
+    theirs."""
     base = f"{ctx.origin}/{ctx.trunk}"
     added = set(diff_names(ctx, "--no-renames", "--diff-filter=A", base, target))
     merge_base = git("merge-base", base, target, cwd=ctx.root, check=False)
@@ -2712,17 +2527,6 @@ def untracked_in_the_way(ctx: Ctx, target: str) -> list:
         return []
     out = git("ls-files", "--others", "--exclude-standard", "-z", cwd=ctx.root, check=False)
     others = [f for f in out.split("\0") if f]
-    # an IGNORED untracked file is one git writes over without a word - it counts ignored
-    # files as expendable - and a fork keeping setup's `.forkflow.toml` in `info/exclude`
-    # lost its `merge`, `gate` and branch names that way. The config lives at the top of the
-    # tree, so the listing there is asked, whatever the ignore rules say
-    try:
-        names = os.listdir(ctx.root)
-    except OSError:
-        names = []
-    tracked = set(tracked_config_names(ctx.root))
-    others += [n for n in names if n.casefold() == CONFIG_FILE.casefold()
-               and n not in tracked and n not in others]
     blocked = added & set(others)
     by_fold: dict = {}
     for f in others:
@@ -2746,21 +2550,11 @@ def in_the_way_advice(ctx: Ctx, paths: Sequence[str], rerun: str,
                       args: Optional[argparse.Namespace]) -> str:
     """What to do about untracked files a sync merge would write over - never "delete them".
 
-    `.forkflow.toml` is its own answer while a fork still has one: it goes into the trunk
-    the way everything does (a branch, `ship`), and the next sync then meets upstream's copy
-    as a tracked file, where the merge shows the two side by side. Whose copy is in the
-    working tree is nobody's question any more - the settings are in `.git/config`, which no
-    merge reaches. Any other file is moved out of the tree: on a case-insensitive filesystem
+    They are moved out of the working tree, not removed: on a case-insensitive filesystem
     the name git lists may be another spelling of one of the user's own files, so a removal
-    can take a file that was never upstream's."""
+    can take a file that was never upstream's. The other way out is to get them into the
+    trunk, which is a branch and a `ship` like everything else."""
     trunk = f"{ctx.origin}/{ctx.trunk}"
-    if any(p.casefold() == CONFIG_FILE.casefold() for p in paths):
-        ship = rerun_cmd("ship", argparse.Namespace(mr=bool(getattr(args, "mr", False))))
-        return (f"`{CONFIG_FILE}` is in the working tree and untracked here, and upstream "
-                f"tracks a `{CONFIG_FILE}` - under that name or another case of it, which a "
-                f"case-insensitive filesystem makes the same file. Do not delete or rename "
-                f"it: commit it on a branch off `{trunk}` and `{ship}` it, have that merged, "
-                f"so it is on `{trunk}`; then {rerun}.")
     return (f"Move them out of the working tree (they are not deleted that way - on a "
             f"case-insensitive filesystem a name git lists can be another spelling of a file "
             f"of yours), or get them into `{trunk}` first (commit them on a branch and "
@@ -3026,21 +2820,6 @@ def cmd_sync_continue(ctx: Ctx, args: argparse.Namespace) -> int:
                      "file(s) still unmerged")
         raise Fail(f"resolve the conflicts and `git add` them, "
                    f"then run `{continue_cmd('sync', args)}` again")
-
-    # a conflict on upstream's `.ForkFlow.toml` resolved with `git rm` takes the one file a
-    # case-insensitive filesystem holds for both names: the fork's `.forkflow.toml` stays in
-    # the index and is gone from the tree, and this run would go on with no config - no gate
-    staged = config_name_in(tracked_config_names(ctx.root))
-    try:
-        on_disk = config_name_in(os.listdir(ctx.root))
-    except OSError:
-        on_disk = staged
-    if staged and on_disk is None:
-        raise Fail(f"`{staged}` is in the index but not in the working tree - removed by hand, "
-                   f"maybe as another case of its name, which a case-insensitive filesystem "
-                   f"makes the same file - and without it this sync would check nothing. Put "
-                   f"it back from the index with `git checkout -- {sh_arg(staged)}` (nothing is "
-                   f"there for it to overwrite), then run `{continue_cmd('sync', args)}` again")
 
     merging = merge_in_progress(ctx.root)
     merge_sha = sync_merge_commit(ctx)
@@ -5105,10 +4884,9 @@ def setup_template(ctx: Ctx) -> None:
         with open(path, "w") as fh:
             fh.write(template_text(ctx))
         step("template", cmd, "commented template written")
-    if not tracked_config_names(ctx.root):
-        print(f"    it is untracked: when you are happy with it, commit it on a branch off "
-              f"{ctx.origin}/{ctx.trunk} and ship that - never on the trunk or the mirror - so "
-              f"the branch names and the gate are the same for everyone")
+    print(f"    it is untracked: when you are happy with it, commit it on a branch off "
+          f"{ctx.origin}/{ctx.trunk} and ship that - never on the trunk or the mirror - so "
+          f"the branch names and the gate are the same for everyone")
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
@@ -5677,53 +5455,9 @@ def run_tests() -> None:
                 return cmd.strip()
         raise AssertionError("no `%s...` printed in: %s" % (start, text))
 
-    def remedy_of(text: str) -> Tuple[str, str]:
-        """The printed case-variant remedy - (the command as printed, the path it copies the
-        working file to first) - read off the command itself, `test ! -e <path> && cp ...`."""
-        cmd = printed_cmd(text, "test ! -e ")
-        return cmd, shlex.split(cmd)[3]
-
-    def no_remedy(text: str) -> None:
-        """Nothing in `text` to run: no command that touches the file or commits."""
-        for start in ("test ", "cp ", "mv ", "git mv", "git rm", "git checkout", "git update-index",
-                      "git commit"):
-            if any(c.startswith(start) for c in re.findall(r"`([^`]+)`", text)):
-                raise AssertionError("a `%s...` command is printed in: %s" % (start, text))
-
     def run_printed(text: str, start: str, fork: str):
         """Run the printed `forkflow ...` command that begins with `start`, in `fork`."""
         return run("-C", fork, *shlex.split(printed_cmd(text, start))[1:])
-
-    SHELL_VERBS = ("test ", "cp ", "mv ", "rm ", "printf ", "git ")
-
-    def run_every_printed(text: str, fork: str) -> list:
-        """Run EVERY shell command `text` prints, in order, exactly as printed, in `fork`;
-        answer what each one exited with.
-
-        A refusal is read by a person who pastes what it shows them, and twice on this
-        branch a remedy that read well did something else when it was actually run. So the
-        tests that cover a printed remedy run the whole of it, from the state it was printed
-        in, and then look at the fork."""
-        ran = []
-        for cmd in re.findall(r"`([^`]+)`", text):
-            if not cmd.startswith(SHELL_VERBS):
-                continue
-            ran.append((cmd, subprocess.run(["sh", "-c", cmd], cwd=fork,
-                                            capture_output=True).returncode))
-        return ran
-
-    def without_stamp(text: str) -> str:
-        """The same message with `keep_aside`'s `forkflow-config-<UTC>.toml` names taken
-        out. Two calls a second apart word a refusal identically but for that stamp, so a
-        test comparing one refusal with another must not depend on which side of a tick of
-        the clock it landed on."""
-        return re.sub(r"forkflow-config-\d{8}-\d{6}\.toml", "forkflow-config-STAMP.toml", text)
-
-    def kept_configs(fork: str) -> list:
-        """The copies a remedy made, newest name last - `keep_aside`'s destinations."""
-        gitdir = os.path.dirname(git_path(fork, "x"))
-        return sorted(os.path.join(gitdir, n) for n in os.listdir(gitdir)
-                      if n.startswith("forkflow-config-"))
 
     def ctx_for(fork: str, need_upstream: bool = True, need_trunk: bool = True,
                 strict_mirror: bool = True, **ns) -> Ctx:
@@ -8199,21 +7933,19 @@ def run_tests() -> None:
             self.assertEqual(rev(fork, self.sync_name() + "^2"), rev(fork, "upstream/main"))
 
         def test_an_untracked_file_upstream_tracks_is_refused_before_the_backup(self):
-            """`setup` writes `.forkflow.toml` untracked, and an upstream that uses forkflow
-            too tracks it - the case the gate guard exists for. git refuses a merge that
-            would write over an untracked file, so on the default setup path every later
-            sync died on raw git output and left one more orphan backup on origin."""
+            """A file this fork keeps untracked, which upstream then starts tracking. git
+            refuses a merge that would write over an untracked file, so without this
+            preflight the sync died on raw git output and left one more orphan backup on
+            origin - and the file is never deleted or moved for the user."""
             fork = make_fork(self.tmp)
-            self.assertEqual(run("-C", fork, "setup")[0], 0)
-            path = os.path.join(fork, CONFIG_FILE)
-            with open(path) as fh:
-                ours = fh.read()
-            commit_upstream(self.tmp, CONFIG_FILE, "gate = []\n", "theirs: forkflow too")
+            ours = "# ours, untracked\n"
+            path = write(fork, "docs/theirs.md", ours)
+            commit_upstream(self.tmp, "docs/theirs.md", "theirs\n", "theirs: docs")
             before_trunk = origin_sha(fork, "develop")
 
             code, out, err = run("-C", fork, "sync")
             self.assertEqual(code, 2, err + out)
-            self.assertIn(CONFIG_FILE, out + err)
+            self.assertIn("docs/theirs.md", out + err)
             self.assertIn("untracked", out + err)
             self.assertNotIn("backup/", local_branches(fork))          # nothing to clean up
             self.assertEqual(sh("git", "ls-remote", "origin", "refs/heads/backup/*",
@@ -8222,14 +7954,14 @@ def run_tests() -> None:
             self.assertEqual(origin_sha(fork, "develop"), before_trunk)
             with open(path) as fh:
                 self.assertEqual(fh.read(), ours)
-            self.assertNotIn("Move them out", err)          # the config is never moved away
+            self.assertIn("Move them out of the working tree", err)    # never "delete them"
 
-            # the remedy it names, run literally: the config committed on a branch off the
-            # trunk and shipped, the merge request merged, landed - then the sync again. It
-            # used to say "remove the file", which deleted this fork's config for good
+            # the other half of the advice, run literally: the file committed on a branch off
+            # the trunk and shipped, the merge request merged, landed - then the sync again.
+            # It used to say "remove the file", which deleted the user's copy for good
             sh("git", "checkout", "-q", "-b", "cfg", "origin/develop", cwd=fork)
-            sh("git", "add", CONFIG_FILE, cwd=fork)
-            sh("git", "commit", "-q", "-m", "ours: forkflow config", cwd=fork)
+            sh("git", "add", "docs/theirs.md", cwd=fork)
+            sh("git", "commit", "-q", "-m", "ours: docs", cwd=fork)
             code, out, err2 = run_printed(err, "forkflow ship", fork)
             self.assertEqual(code, 0, err2 + out)
             sh("git", "--git-dir=" + os.path.join(self.tmp, "origin.git"), "update-ref",
@@ -8238,11 +7970,11 @@ def run_tests() -> None:
             self.assertEqual(code, 0, err2 + out)
             code, out, err2 = run_printed(err, "forkflow sync", fork)
             # both sides track the file now: an add/add conflict the user resolves in the
-            # open, with this fork's config committed on the trunk - nothing lost
+            # open, with this fork's copy committed on the trunk - nothing lost
             self.assertEqual(code, 4, err2 + out)
-            self.assertIn(CONFIG_FILE, sh("git", "diff", "--name-only", "--diff-filter=U",
-                                          cwd=fork))
-            self.assertEqual(sh("git", "show", "HEAD:" + CONFIG_FILE, cwd=fork), ours.strip())
+            self.assertIn("docs/theirs.md", sh("git", "diff", "--name-only",
+                                               "--diff-filter=U", cwd=fork))
+            self.assertEqual(sh("git", "show", "HEAD:docs/theirs.md", cwd=fork), ours.strip())
 
         def test_the_untracked_merge_fallback_names_a_rerun_that_is_not_a_closed_loop(self):
             """`cmd_sync`'s preflight answers this before the backup; the fallback in
@@ -8278,38 +8010,6 @@ def run_tests() -> None:
             self.assertEqual(rev(fork, self.sync_name() + "^2"), rev(fork, "upstream/main"))
             with open(kept) as fh:
                 self.assertEqual(fh.read(), "ours, untracked\n")
-
-        def test_the_untracked_merge_fallback_for_the_config_keeps_it(self):
-            """The fallback meeting the untracked config gives the config's own answer -
-            ship it, then `--force` - and followed to the letter it loses nothing: the next
-            sync meets upstream's copy as a tracked file, in a conflict the user resolves."""
-            fork = make_fork(self.tmp)
-            ours = "# ours, untracked\n"
-            path = write(fork, CONFIG_FILE, ours)
-            commit_upstream(self.tmp, CONFIG_FILE, "gate = []\n", "theirs: forkflow too")
-            with mock.patch.object(sys.modules[__name__], "untracked_in_the_way",
-                                   lambda ctx, target: []):
-                code, out, err = run("-C", fork, "sync")
-            self.assertEqual(code, 2, out + err)
-            with open(path) as fh:
-                self.assertEqual(fh.read(), ours)
-            self.assertNotIn("Move them out", err)          # the config is never moved away
-
-            sh("git", "checkout", "-q", "-b", "cfg", "origin/develop", cwd=fork)
-            sh("git", "add", CONFIG_FILE, cwd=fork)
-            sh("git", "commit", "-q", "-m", "ours: forkflow config", cwd=fork)
-            next_utc_second()
-            code, out, err2 = run_printed(err, "forkflow ship", fork)
-            self.assertEqual(code, 0, err2 + out)
-            sh("git", "--git-dir=" + os.path.join(self.tmp, "origin.git"), "update-ref",
-               "refs/heads/develop", origin_sha(fork, "cfg"))
-            self.assertEqual(run("-C", fork, "land")[0], 0)
-            next_utc_second()
-            code, out, err2 = run_printed(err, "forkflow sync --force", fork)
-            self.assertEqual(code, 4, err2 + out)
-            self.assertIn(CONFIG_FILE, sh("git", "diff", "--name-only", "--diff-filter=U",
-                                          cwd=fork))
-            self.assertEqual(sh("git", "show", "HEAD:" + CONFIG_FILE, cwd=fork), ours.strip())
 
         def test_a_file_upstream_renamed_onto_an_untracked_path_is_refused(self):
             """git detects renames by default (2.9+), so an upstream `git mv` onto a path
@@ -13309,291 +13009,6 @@ def run_tests() -> None:
                              ["mr", "merge", sync_branch_name()])
             self.assertEqual(origin_sha(fork, "develop"), rev(fork, "refs/heads/develop"))
             self.assertEqual(self.pending_of(fork), {})
-    class TestConfigNameCase(ShipBase):
-        """`.forkflow.toml` under another case of its name.
-
-        On a case-insensitive filesystem (the macOS and Windows default) an upstream that
-        commits `.ForkFlow.toml` puts a file in the tree that `open(".forkflow.toml")` reads
-        and git's case-exact `<rev>:.forkflow.toml` and `ls-files` do not see: every check of
-        what the sync merge brought in read "no config on either side", and upstream's `gate`
-        ran with `sh -c` and its `merge = "self"` merged the sync MR. The first two cases hold
-        on any filesystem; the end-to-end ones need a case-insensitive one and skip
-        elsewhere."""
-
-        VARIANT = ".ForkFlow.toml"
-
-        def upstream_variant(self, flag: str) -> None:
-            commit_upstream(self.tmp, self.VARIANT,
-                            'merge = "self"\ngate = ["touch %s"]\n' % flag,
-                            "theirs: forkflow, spelled differently")
-
-        def test_a_committed_variant_counts_as_the_config(self):
-            """What "is the config tracked" and "what did this revision carry" answer for a
-            variant - built with plumbing, so no working-tree file is involved and it holds on
-            any filesystem. The exact name wins where a tree holds both."""
-            fork = make_fork(self.tmp)
-            ctx = ctx_for(fork)
-            self.assertFalse(tracked_config_names(fork))
-            self.assertIsNone(config_text(ctx, "HEAD"))
-
-            def blob(text: str) -> str:
-                path = write(self.tmp, "blob.txt", text)
-                return sh("git", "hash-object", "-w", path, cwd=fork)
-
-            sh("git", "update-index", "--add", "--cacheinfo",
-               "100644,%s,%s" % (blob("theirs\n"), self.VARIANT), cwd=fork)
-            self.assertTrue(tracked_config_names(fork))
-            one = sh("git", "commit-tree", sh("git", "write-tree", cwd=fork), "-p", "HEAD",
-                     "-m", "variant only", cwd=fork)
-            self.assertEqual(config_text(ctx, one), "theirs\n")
-            sh("git", "update-index", "--add", "--cacheinfo",
-               "100644,%s,%s" % (blob("ours\n"), CONFIG_FILE), cwd=fork)
-            both = sh("git", "commit-tree", sh("git", "write-tree", cwd=fork), "-p", "HEAD",
-                      "-m", "both", cwd=fork)
-            self.assertEqual(config_text(ctx, both), "ours\n")
-            self.assertIsNone(config_text(ctx, "HEAD"))                   # still none there
-
-        # -- the remedies: on a case-insensitive filesystem the variant and `.forkflow.toml`
-        # -- are ONE file, so a remedy that deletes or renames "the variant" takes the fork's
-        # -- own config with it. Each is run here exactly as printed, and each must leave the
-        # -- fork's config in place and the file as it was in the copy the message names.
-        # -- On the trunk, the mirror or a detached HEAD nothing is printed to run at all.
-
-        OURS = 'trunk = "develop"\ngate = ["true"]\n'
-
-        def refusal(self, fork: str) -> str:
-            with self.assertRaises(Fail) as cm:
-                load_config(fork)
-            self.assertEqual(cm.exception.code, 2)
-            return str(cm.exception)
-
-        def variant_beside_ours(self, variant_text: str, branch: Optional[str] = "feat/cfg",
-                                on_disk: Optional[str] = None) -> str:
-            """The state a sync leaves on a case-insensitive filesystem, built on any: the
-            fork's `.forkflow.toml` committed, a variant staged beside it, and on disk only
-            the variant's name, holding `on_disk` (`variant_text`, unless the user has edited
-            it since). On `branch` - None stays on the trunk. The index is refreshed (`git
-            status`), as any status the user runs does."""
-            fork = make_fork(self.tmp, config=self.OURS)
-            if branch:
-                sh("git", "checkout", "-q", "-b", branch, cwd=fork)
-            blob = sh("git", "hash-object", "-w", write(self.tmp, "blob.txt", variant_text),
-                      cwd=fork)
-            sh("git", "update-index", "--add", "--cacheinfo",
-               "100644,%s,%s" % (blob, self.VARIANT), cwd=fork)
-            os.unlink(os.path.join(fork, CONFIG_FILE))
-            write(fork, self.VARIANT, variant_text if on_disk is None else on_disk)
-            self.assertNotIn(CONFIG_FILE, os.listdir(fork))
-            sh("git", "status", "--porcelain", cwd=fork)
-            return fork
-
-        def assert_ours_back(self, fork: str) -> None:
-            """The fork's own config back under its exact name, content and index alike, and
-            the variant out of the index."""
-            self.assertIn(CONFIG_FILE, os.listdir(fork))
-            with open(os.path.join(fork, CONFIG_FILE)) as fh:
-                self.assertEqual(fh.read(), self.OURS)
-            self.assertEqual(load_config(fork), {"trunk": "develop", "gate": ["true"]})
-            self.assertEqual(sh("git", "show", ":" + CONFIG_FILE, cwd=fork), self.OURS.strip())
-            self.assertNotIn(self.VARIANT, sh("git", "ls-files", cwd=fork).splitlines())
-
-        def run_remedy(self, fork: str, was: str) -> None:
-            """The printed remedy, run as printed: it succeeds, and the copy it names holds
-            `was` - what the working file held before it ran."""
-            cmd, kept = remedy_of(self.refusal(fork))
-            sh("sh", "-c", cmd, cwd=fork)
-            self.assertEqual(os.path.dirname(kept), os.path.dirname(git_path(fork, "x")))
-            with open(kept) as fh:
-                self.assertEqual(fh.read(), was)
-
-        def test_the_index_only_remedy_brings_the_forks_config_back(self):
-            fork = self.variant_beside_ours('gate = ["touch theirs"]\n')
-            self.run_remedy(fork, 'gate = ["touch theirs"]\n')
-            self.assert_ours_back(fork)
-
-        def test_the_index_only_remedy_holds_when_the_two_hold_the_same_bytes(self):
-            """`git rm --cached <variant> && git checkout -- .forkflow.toml` leaves the file
-            under the variant's name when the bytes match and the index is fresh: checkout
-            sees an up-to-date entry and writes nothing, and the refusal comes straight back.
-            Both names leave the index, so the checkout from HEAD writes the file anew."""
-            fork = self.variant_beside_ours(self.OURS)
-            self.run_remedy(fork, self.OURS)
-            self.assert_ours_back(fork)
-
-        def test_an_edit_made_before_the_remedy_is_in_the_copy(self):
-            """The refusal used to invite an edit of the file, and the checkout from HEAD
-            then overwrote it with no copy anywhere: the copy is made first."""
-            fork = self.variant_beside_ours(self.OURS, on_disk=self.OURS + "# mine\n")
-            self.run_remedy(fork, self.OURS + "# mine\n")
-            self.assert_ours_back(fork)
-
-        def test_the_remedy_goes_through_where_git_rm_cached_refuses(self):
-            """The staged variant differs from both the file and HEAD - the middle of a merge
-            with the file edited since: `git rm --cached` refuses and suggests `-f`, which
-            the user would follow. The remedy asks neither."""
-            fork = self.variant_beside_ours('gate = ["touch theirs"]\n', on_disk="# mine\n")
-            p = subprocess.run(["git", "rm", "--cached", "-q", "--", self.VARIANT], cwd=fork,
-                               capture_output=True)
-            self.assertNotEqual(p.returncode, 0)                           # the refusing state
-            self.run_remedy(fork, "# mine\n")
-            self.assert_ours_back(fork)
-
-        def test_a_tracked_variant_alone_is_renamed_with_its_content(self):
-            """No `.forkflow.toml` is tracked: the variant is the only config there is, and
-            `git mv` gives it the exact name - nothing deleted."""
-            fork = make_fork(self.tmp)
-            sh("git", "checkout", "-q", "-b", "feat/cfg", cwd=fork)
-            write(fork, self.VARIANT, 'trunk = "develop"\n')
-            sh("git", "add", self.VARIANT, cwd=fork)
-            sh("git", "commit", "-q", "-m", "a config, spelled differently", cwd=fork)
-            self.run_remedy(fork, 'trunk = "develop"\n')
-            self.assertIn(CONFIG_FILE, os.listdir(fork))
-            self.assertNotIn(self.VARIANT, os.listdir(fork))
-            self.assertEqual(load_config(fork), {"trunk": "develop"})
-            self.assertEqual(sh("git", "ls-files", CONFIG_FILE, cwd=fork), CONFIG_FILE)
-
-        def test_on_the_trunk_nothing_is_run_and_the_fix_goes_on_a_branch(self):
-            """The fork's config committed on its trunk under a variant name - which worked
-            before variants were refused. On `develop`, and on a detached HEAD, the refusal
-            names nothing to run: a commit there never reaches origin and every later `land`
-            refuses the trunk. On a branch off `origin/develop` it names the rename, which run
-            as printed and committed leaves the trunk, local and on origin, as it was."""
-            fork = make_fork(self.tmp)
-            write(fork, self.VARIANT, 'trunk = "develop"\n')
-            sh("git", "add", self.VARIANT, cwd=fork)
-            sh("git", "commit", "-q", "-m", "fork: config, spelled differently", cwd=fork)
-            sh("git", "push", "-q", "origin", "develop", cwd=fork)
-            sh("git", "fetch", "-q", "origin", cwd=fork)
-            trunk = rev(fork, "refs/heads/develop")
-            no_remedy(self.refusal(fork))
-            sh("git", "checkout", "-q", "--detach", cwd=fork)
-            no_remedy(self.refusal(fork))
-            sh("git", "checkout", "-q", "-b", "fix/config", "origin/develop", cwd=fork)
-            self.run_remedy(fork, 'trunk = "develop"\n')
-            sh("git", "commit", "-q", "-m", "the config under its exact name", cwd=fork)
-            self.assertEqual(load_config(fork), {"trunk": "develop"})
-            self.assertEqual(rev(fork, "refs/heads/develop"), trunk)
-            self.assertEqual(origin_sha(fork, "develop"), trunk)
-            self.assertEqual(sh("git", "ls-files", "--", CONFIG_FILE, cwd=fork), CONFIG_FILE)
-
-        def test_the_index_state_on_the_trunk_names_nothing_to_run(self):
-            fork = self.variant_beside_ours('gate = ["touch theirs"]\n', branch=None)
-            no_remedy(self.refusal(fork))
-
-        def test_a_trunk_of_another_name_is_known_by_origins_default_branch(self):
-            """The config naming the trunk is the file that cannot be read: `origin/HEAD`
-            (which `setup` sets, and whose platform default its report insists on) says it."""
-            fork = make_fork(self.tmp, trunk="trunk")
-            self.assertEqual(checked_out(fork), "trunk")
-            write(fork, self.VARIANT, 'trunk = "trunk"\n')
-            sh("git", "add", self.VARIANT, cwd=fork)
-            sh("git", "commit", "-q", "-m", "fork: config, spelled differently", cwd=fork)
-            no_remedy(self.refusal(fork))
-
-        def test_the_trunk_and_the_mirror_are_the_only_branches_that_refuse_a_commit(self):
-            """`no_commit_here` encodes rules 2 and 6 and nothing besides. The mirror is
-            known by its name, the config that would name it being the file that cannot be
-            read: the default, and any name the original project's remote has a branch of
-            (`main` beside `upstream/main`, which is what `setup` bootstraps). A branch of
-            the fork's own refuses nothing, however little of its own it carries - it used
-            to refuse whenever it held only upstream's commits, which on a fresh fork is
-            every branch there is."""
-            fork = make_fork(self.tmp)
-            sh("git", "push", "-q", "origin", "main:refs/heads/release",
-               cwd=os.path.join(self.tmp, "seed"))              # another upstream branch
-            sh("git", "fetch", "-q", "upstream", cwd=fork)
-            sh("git", "branch", "release", "develop", cwd=fork)
-            sh("git", "branch", "feat/x", "develop", cwd=fork)
-            for branch, why in (("develop", "origin's default branch"),
-                                ("main", "is the mirror"), ("release", "is the mirror"),
-                                ("feat/x", "")):
-                sh("git", "checkout", "-q", branch, cwd=fork)
-                answer = no_commit_here(fork, "develop")
-                if why:
-                    self.assertIn(why, answer, branch)
-                else:
-                    self.assertEqual(answer, "", branch)
-            sh("git", "checkout", "-q", "--detach", cwd=fork)
-            self.assertEqual(no_commit_here(fork, "develop"), "HEAD is detached")
-
-        def test_on_the_mirror_nothing_is_run(self):
-            """Upstream tracks a variant and the mirror is checked out: the file is upstream's,
-            and a commit on the mirror breaks every later sync and setup - nothing to run."""
-            fork = make_fork(self.tmp)
-            commit_upstream(self.tmp, self.VARIANT, 'gate = ["true"]\n', "theirs: variant")
-            sh("git", "fetch", "-q", "upstream", cwd=fork)
-            sh("git", "checkout", "-q", "main", cwd=fork)
-            sh("git", "merge", "-q", "--ff-only", "upstream/main", cwd=fork)
-            mirror = rev(fork, "refs/heads/main")
-            no_remedy(self.refusal(fork))
-            self.assertEqual(rev(fork, "refs/heads/main"), mirror)
-
-        def test_a_merge_whose_copy_left_the_index_names_nothing_to_run(self):
-            """Mid-merge, upstream's variant taken out of the index by hand: the file on disk
-            is upstream's, untracked. Renamed to the exact name it would be read as this
-            fork's config - its `gate` run - so nothing is named."""
-            fork = make_fork(self.tmp)
-            sh("git", "checkout", "-q", "-b", "side", cwd=fork)
-            write(fork, self.VARIANT, 'gate = ["touch theirs"]\n')
-            commit_fork(fork, "src/app.py", "side\n", "side: variant and app")
-            sh("git", "checkout", "-q", "-b", "sync/upstream-x", "develop", cwd=fork)
-            commit_fork(fork, "src/app.py", "ours\n", "ours: app")
-            sh("git", "merge", "side", cwd=fork, check=False)
-            sh("git", "rm", "-q", "--cached", self.VARIANT, cwd=fork)
-            self.assertIn(self.VARIANT, os.listdir(fork))
-            no_remedy(self.refusal(fork))
-
-        def test_a_variant_upstream_adds_is_in_the_way_where_the_filesystem_folds_case(self):
-            """The collision check before the backup, on any filesystem: an upstream
-            `.ForkFlow.toml` is in the way of this fork's untracked `.forkflow.toml` exactly
-            when the two names open one file - asked of the filesystem, and answered here by a
-            stand-in for each kind. The name reported is the one on disk."""
-            fork = make_fork(self.tmp)
-            write(fork, CONFIG_FILE, "# ours, untracked\n")
-            target = commit_upstream(self.tmp, self.VARIANT, "gate = []\n", "theirs: forkflow")
-            sh("git", "fetch", "upstream", cwd=fork)
-            ctx = ctx_for(fork)
-
-            def one_file(a: str, b: str) -> bool:
-                return a.casefold() == b.casefold()
-
-            with mock.patch.object(os.path, "samefile", side_effect=one_file):
-                self.assertEqual(untracked_in_the_way(ctx, target), [CONFIG_FILE])
-            with mock.patch.object(os.path, "samefile", return_value=False):
-                self.assertEqual(untracked_in_the_way(ctx, target), [])
-            # git-ignored, the file is one git would write over without a word: still in the way
-            with open(os.path.join(fork, ".git", "info", "exclude"), "a") as fh:
-                fh.write(CONFIG_FILE + "\n")
-            self.assertNotIn(CONFIG_FILE, sh("git", "status", "--porcelain", cwd=fork))
-            with mock.patch.object(os.path, "samefile", side_effect=one_file):
-                self.assertEqual(untracked_in_the_way(ctx, target), [CONFIG_FILE])
-
-        def test_an_ignored_untracked_config_is_in_the_way_before_the_backup(self):
-            """setup's `.forkflow.toml`, kept out of `git status` with `info/exclude`, and
-            upstream starts tracking one: git writes over an ignored file without a word, and
-            `sync --merge` merged and landed upstream's config - this fork's `merge`, `gate`
-            and settings gone. Refused before the backup, the file untouched."""
-            fork = make_fork(self.tmp)
-            ours = 'merge = "self"\ngate = ["true"]\n# my settings\n'
-            path = write(fork, CONFIG_FILE, ours)
-            with open(os.path.join(fork, ".git", "info", "exclude"), "a") as fh:
-                fh.write(CONFIG_FILE + "\n")
-            self.assertEqual(sh("git", "status", "--porcelain", cwd=fork), "")
-            commit_upstream(self.tmp, CONFIG_FILE, 'gate = ["true"]\n', "theirs: forkflow")
-            merging_tool(self.tmp, "glab")
-            trunk = origin_sha(fork, "develop")
-            with on_platform("gitlab"):
-                code, out, err = run("-C", fork, "sync", "--merge")
-            self.assertEqual(code, 2, err + out)
-            self.assertEqual(sh("git", "ls-remote", "origin", "refs/heads/backup/*", cwd=fork),
-                             "")
-            self.assertNotIn(sync_branch_name(), local_branches(fork))
-            self.assertEqual(checked_out(fork), "develop")
-            self.assertEqual(origin_sha(fork, "develop"), trunk)
-            self.assertEqual(tool_argv(self.tmp, "glab", "merge"), [])
-            with open(path) as fh:
-                self.assertEqual(fh.read(), ours)
-
     class TestParseArgs(unittest.TestCase):
         def test_common_flags_before_or_after_the_subcommand(self):
             for argv in (["--dry-run", "sync"], ["sync", "--dry-run"]):
