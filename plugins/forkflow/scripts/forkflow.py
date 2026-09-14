@@ -2109,7 +2109,16 @@ def mr_command(ctx: Ctx, branch: str, title: str, body_file: str) -> list:
     """The platform's MR command, or [] when the fork cannot be named (see `mr_target`).
 
     `--repo` is not optional and not a nicety: without it both tools aim at the original
-    project. Anything that edits this command keeps it."""
+    project. Anything that edits this command keeps it.
+
+    On GitLab `--repo` is not enough on its own. glab opens the request on the HEAD project,
+    the one the source branch lives in (`CreateMergeRequest(headRepo.FullName(), ...)`), and
+    without `--head` it works that project out from the remotes - which answered with
+    `upstream` on the first real GitLab fork: the request was posted to the original project's
+    API and refused with a 403, after glab had printed the fork as its target. So glab is given
+    the fork twice, as target and as head, parsed by the same reader (`glrepo.FromFullName`),
+    which keeps a URL's host and every subgroup. `glab mr merge` looks its request up in
+    `--repo` alone and needs nothing more."""
     target, _ = mr_target(ctx)
     if not target:
         return []
@@ -2118,7 +2127,7 @@ def mr_command(ctx: Ctx, branch: str, title: str, body_file: str) -> list:
         # no terminal to answer it, and on the first real fork the printed command was run
         # by hand every time for exactly that reason. gh needs nothing: --title and
         # --body-file already make it non-interactive, and it has no --yes to give.
-        return ["glab", "mr", "create", "--repo", target,
+        return ["glab", "mr", "create", "--repo", target, "--head", target,
                 "--source-branch", branch, "--target-branch", ctx.trunk,
                 "--title", title, "--description-file", body_file, "--remove-source-branch",
                 "--yes"]
@@ -10546,6 +10555,7 @@ def run_tests() -> None:
                 mr_command(ctx, "sync/upstream-20260101", "sync: title", "/tmp/body.md"),
                 ["glab", "mr", "create",
                  "--repo", "ssh://gitlab.com/group/proj",
+                 "--head", "ssh://gitlab.com/group/proj",
                  "--source-branch", "sync/upstream-20260101",
                  "--target-branch", "develop",
                  "--title", "sync: title",
@@ -10669,6 +10679,22 @@ def run_tests() -> None:
                      "https://gitlab.example.com/acme/team/widget")):
                 cmd = self.command(origin)
                 self.assertEqual(self.target_of(cmd), target, origin)
+
+        def test_glab_is_told_the_source_project_is_the_fork_too(self):
+            """`glab mr create` opens the request on its HEAD project, the one the source
+            branch lives in, and `--repo` sets only the target. Without `--head` glab works the
+            head out from the remotes and answers with `upstream`: on the first real GitLab fork
+            it printed the fork as the target and posted the request to the original project,
+            which refused it with a 403 (glab 1.116). Only the glab command carries it - gh's
+            own `--head` takes the branch."""
+            for origin in ("git@gitlab.example.com:acme/team/widget.git",
+                           "https://gitlab.example.com/acme/team/widget.git",
+                           "ssh://git@gitlab.example.com:2222/acme/team/widget.git"):
+                cmd = self.command(origin, "gitlab",
+                                   upstream="https://gitlab.example.com/original/widget.git")
+                self.assertIn("--head", cmd, origin)
+                self.assertEqual(cmd[cmd.index("--head") + 1], self.target_of(cmd), origin)
+                self.assertNotIn("original/widget", " ".join(cmd), origin)
 
         def test_it_is_the_fork_and_never_the_project_it_was_forked_from(self):
             """What both tools would have answered with, and the whole point of the flag."""
