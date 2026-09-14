@@ -85,7 +85,9 @@ The merge request command that `sync` and `ship` print names the fork the same w
 `--repo <the fork's URL>`. Without it `gh pr create` and `glab mr create` work the repository out
 from the remotes and answer with `upstream` as well - so a command missing the flag opens the merge
 request **on the original project**, and `--mr` opens it there itself rather than merely advising
-it. The URL carries the host as well as the project, because a bare `owner/repo` is resolved
+it. `glab mr create` also carries `--head <the fork's URL>`: glab opens the request on the project
+the source branch lives in and works that one out from the remotes too, so `--repo` alone still
+posted it to the original project on a real fork. The URL carries the host as well as the project, because a bare `owner/repo` is resolved
 against the tool's own default host (github.com, gitlab.com) and not the one the fork is on. Pass
 the command on exactly as printed. When the origin URL names no project at all, forkflow prints no
 command and says which URL it could not address: open that merge request in the web UI.

@@ -79,8 +79,8 @@ Read `${CLAUDE_PLUGIN_ROOT}/references/rules.md` before the first run in a sessi
 7. **Merge request.** `--mr` runs the printed command. The body is the squashed commit message
    plus the WARNING list and the merge-button note. Tool missing or failing -> the command and its
    stderr are printed, exit stays 0; hand the user the command exactly as printed - its
-   `--repo <the fork's URL>` is what keeps the merge request off the original project
-   (`rules.md`).
+   `--repo <the fork's URL>`, with `--head <the fork's URL>` beside it on GitLab, is what keeps
+   the merge request off the original project (`rules.md`).
 
    **`--merge`** (implies `--mr`) opens the merge request and merges it in the same run, then
    lands it (step 9). It is refused - exit 2, before the fetch, the backup and any push, on a
